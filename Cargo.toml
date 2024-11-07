@@ -5,9 +5,12 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5.20", features = ["derive"] }
+indexmap = "2.2.3"
 log = "0.4.22"
-lopdf = { version = "0.34.0", features = ["async", "nom_parser", "serde"] }
+lopdf = { version = "0.34.0", features = ["nom_parser", "serde"] }
 nom = "7.1.3"
+pest = "2.7.14"
+pest_derive = "2.7.14"
 rayon = "1.10.0"
 regex = "1.11.0"
 serde = { version = "1.0.213", features = ["derive"] }

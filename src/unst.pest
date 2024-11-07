@@ -1,0 +1,27 @@
+WHITESPACE          = _{ " " | "\t" | NEWLINE }
+NEWLINE             = _{ "\r\n" | "\n" }
+
+template            =  { SOI ~ expression+ ~ EOI }
+
+expression          =  { element }
+
+element             =  { identifier ~ attributes? ~ element_body? }
+
+attributes          =  { "(" ~ (attribute_list)? ~ ")" }
+
+attribute_list      =  { attribute ~ ("," ~ attribute)* }
+
+attribute           =  { identifier ~ "=" ~ value }
+
+value               =  { string | number | array | identifier | boolean }
+
+array               =  { "[" ~ (array_values)? ~ "]" }
+array_values        =  { value ~ ("," ~ value)* }
+
+element_body        =  { "{" ~ expression* ~ "}" }
+
+identifier          =  @{ (ASCII_ALPHANUMERIC | "_")+ }
+
+string              = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+number              = @{ ASCII_DIGIT+ }
+boolean             = @{ "true" | "false" }
