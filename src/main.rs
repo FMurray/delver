@@ -13,15 +13,7 @@ use crate::dom::*;
 use crate::layout::*;
 use crate::parse::*;
 
-use pest::iterators::Pair;
-use pest::Parser as PestParser;
-use pest_derive::Parser as PestParserDerive;
-
 use log::{debug, error, warn};
-
-#[derive(PestParserDerive)]
-#[grammar = "unst.pest"]
-pub struct UnstParser;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -56,9 +48,13 @@ impl Args {
 fn main() -> Result<(), lopdf::Error> {
     println!("Starting PDF processing");
 
+    // Read and parse the template file
+    let template_str = std::fs::read_to_string("10k.tmpl").expect("Failed to read template file");
+
+    let dom = parse_template(&template_str);
+    println!("Parsed template: {:?}", dom);
+
     let pdf_path = "tests/3M_2015_10k.pdf";
-    let doc = load_pdf(pdf_path)?;
-    // Load the PDF
     let doc = Document::load(pdf_path)?;
 
     // Extract text elements with metadata
@@ -86,100 +82,4 @@ fn main() -> Result<(), lopdf::Error> {
     }
 
     Ok(())
-}
-
-fn parse_template(pair: Pair<Rule>) -> Root {
-    let mut elements = Vec::new();
-
-    match pair.as_rule() {
-        Rule::template => {
-            for inner_pair in pair.into_inner() {
-                match inner_pair.as_rule() {
-                    Rule::expression => {
-                        let element = process_element(inner_pair);
-                        elements.push(element);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {
-            eprintln!("Expected a template root node");
-        }
-    }
-
-    Root { elements }
-}
-
-fn process_element(pair: Pair<Rule>) -> Element {
-    let mut inner_rules = pair.into_inner();
-    let identifier_pair = inner_rules.next().unwrap(); // Should always be present
-    let element_name = identifier_pair.as_str().to_string();
-
-    let mut attributes = HashMap::new();
-    let mut children = Vec::new();
-
-    // Iterate over the remaining pairs
-    for inner_pair in inner_rules {
-        match inner_pair.as_rule() {
-            Rule::attributes => {
-                attributes = process_attributes(inner_pair);
-            }
-            Rule::element_body => {
-                for expr in inner_pair.into_inner() {
-                    let child_element = process_element(expr);
-                    children.push(child_element);
-                }
-            }
-            _ => {
-                // Handle any unexpected rules if necessary
-            }
-        }
-    }
-
-    Element {
-        name: element_name,
-        attributes,
-        children,
-    }
-}
-
-fn process_attributes(pair: Pair<Rule>) -> HashMap<String, Value> {
-    let mut attributes = HashMap::new();
-    for inner_pair in pair.into_inner() {
-        if inner_pair.as_rule() == Rule::attribute_list {
-            for attr_pair in inner_pair.into_inner() {
-                if attr_pair.as_rule() == Rule::attribute {
-                    let mut attr_inner = attr_pair.into_inner();
-                    let key = attr_inner.next().unwrap().as_str().to_string();
-                    let value = process_value(attr_inner.next().unwrap());
-                    attributes.insert(key, value);
-                }
-            }
-        }
-    }
-    attributes
-}
-
-fn process_value(pair: Pair<Rule>) -> Value {
-    match pair.as_rule() {
-        Rule::string => {
-            let s = pair.as_str();
-            Value::String(s[1..s.len() - 1].to_string()) // Remove quotes
-        }
-        Rule::number => {
-            let n = pair.as_str().parse::<i64>().unwrap();
-            Value::Number(n)
-        }
-        Rule::boolean => {
-            let b = pair.as_str().parse::<bool>().unwrap();
-            Value::Boolean(b)
-        }
-        Rule::identifier => Value::Identifier(pair.as_str().to_string()),
-        Rule::array => {
-            let values: Vec<Value> = pair.into_inner().map(process_value).collect();
-            Value::Array(values)
-        }
-        _ => unreachable!(),
-    }
 }

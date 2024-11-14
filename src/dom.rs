@@ -1,4 +1,15 @@
-use std::collections::HashMap;
+use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
+use pest::iterators::Pair;
+use pest::Parser as PestParser;
+use pest_derive::Parser as PestParserDerive;
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Error,
+};
+
+#[derive(PestParserDerive)]
+#[grammar = "template.pest"]
+pub struct TemplateParser;
 
 #[derive(Debug)]
 pub struct Root {
@@ -43,6 +54,125 @@ pub struct MatchedElement {
     pub document_element: DocumentElement,
     pub children: Vec<MatchedElement>,
     pub metadata: HashMap<String, Value>,
+}
+
+pub fn parse_template(template_str: &str) -> Result<Root, Error> {
+    let pairs = TemplateParser::parse(Rule::template, template_str)
+        .expect("Failed to parse template")
+        .next()
+        .unwrap();
+    Ok(_parse_template(pairs))
+}
+
+fn _parse_template(pair: Pair<Rule>) -> Root {
+    let mut elements = Vec::new();
+
+    match pair.as_rule() {
+        Rule::template => {
+            for inner_pair in pair.into_inner() {
+                match inner_pair.as_rule() {
+                    Rule::expression => {
+                        let element = process_element(inner_pair);
+                        elements.push(element);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {
+            eprintln!("Expected a template root node");
+        }
+    }
+
+    Root { elements }
+}
+
+fn process_element(pair: Pair<Rule>) -> Element {
+    // If we receive an expression, get the element inside it
+    let element_pair = if pair.as_rule() == Rule::expression {
+        pair.into_inner().next().unwrap()
+    } else {
+        pair
+    };
+
+    let mut inner_rules = element_pair.into_inner();
+    let identifier = inner_rules.next().unwrap().as_str().to_string();
+
+    let mut attributes = HashMap::new();
+    let mut children = Vec::new();
+
+    // Process remaining rules
+    for inner_pair in inner_rules {
+        match inner_pair.as_rule() {
+            Rule::attributes => {
+                attributes = process_attributes(inner_pair);
+            }
+            Rule::element_body => {
+                for expr in inner_pair.into_inner() {
+                    if expr.as_rule() == Rule::expression {
+                        children.push(process_element(expr));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Element {
+        name: identifier,
+        attributes,
+        children,
+    }
+}
+
+fn process_attributes(pair: Pair<Rule>) -> HashMap<String, Value> {
+    let mut attributes = HashMap::new();
+
+    for inner_pair in pair.into_inner() {
+        if inner_pair.as_rule() == Rule::attribute_list {
+            for attr_pair in inner_pair.into_inner() {
+                if attr_pair.as_rule() == Rule::attribute {
+                    let mut attr_inner = attr_pair.into_inner();
+                    let key = attr_inner.next().unwrap().as_str().to_string();
+                    let value = process_value(attr_inner.next().unwrap());
+                    attributes.insert(key, value);
+                }
+            }
+        }
+    }
+    attributes
+}
+
+fn process_value(pair: Pair<Rule>) -> Value {
+    println!(
+        "Processing value rule: {:?}, text: {}",
+        pair.as_rule(),
+        pair.as_str()
+    );
+    match pair.as_rule() {
+        Rule::string => {
+            let s = pair.as_str();
+            // Remove the surrounding quotes
+            Value::String(s[1..s.len() - 1].to_string())
+        }
+        Rule::number => {
+            let n = pair.as_str().parse::<i64>().unwrap();
+            Value::Number(n)
+        }
+        Rule::boolean => {
+            let b = pair.as_str().parse::<bool>().unwrap();
+            Value::Boolean(b)
+        }
+        Rule::identifier => Value::Identifier(pair.as_str().to_string()),
+        Rule::array => {
+            let values: Vec<Value> = pair.into_inner().map(process_value).collect();
+            Value::Array(values)
+        }
+        rule => {
+            println!("Unexpected value rule: {:?}", rule);
+            Value::String(pair.as_str().to_string())
+        }
+    }
 }
 
 // fn match_element(
