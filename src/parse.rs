@@ -6,8 +6,12 @@ use std::io::{Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use clap::Parser;
-use lopdf::{Dictionary, Document, Object, Outline, Toc};
+use log::{debug, error, warn};
+
+use lopdf::{
+    Dictionary, Document, Encoding, Error as LopdfError, Object, Outline, Result as LopdfResult,
+    Toc,
+};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -41,42 +45,6 @@ static IGNORE: &[&str] = &[
     "Annot",
 ];
 
-#[derive(Debug, Deserialize, Serialize)]
-struct PdfText {
-    text: BTreeMap<u32, Vec<String>>, // Key is page number
-    errors: Vec<String>,
-}
-
-#[derive(Parser, Debug)]
-#[clap(
-    author,
-    version,
-    about,
-    long_about = "Extract TOC and write to file.",
-    arg_required_else_help = true
-)]
-pub struct Args {
-    pub pdf_path: PathBuf,
-
-    /// Optional output directory. If omitted the directory of the PDF file will be used.
-    #[clap(short, long)]
-    pub output: Option<PathBuf>,
-
-    /// Optional pretty print output.
-    #[clap(short, long)]
-    pub pretty: bool,
-
-    /// Optional password for encrypted PDFs
-    #[clap(long, default_value_t = String::from(""))]
-    pub password: String,
-}
-
-impl Args {
-    pub fn parse_args() -> Self {
-        Args::parse()
-    }
-}
-
 fn filter_func(object_id: (u32, u16), object: &mut Object) -> Option<((u32, u16), Object)> {
     if IGNORE.contains(&object.type_name().unwrap_or_default()) {
         return None;
@@ -97,8 +65,14 @@ fn filter_func(object_id: (u32, u16), object: &mut Object) -> Option<((u32, u16)
     Some((object_id, object.to_owned()))
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PdfText {
+    pub text: BTreeMap<u32, Vec<String>>, // Key is page number
+    pub errors: Vec<String>,
+}
+
 #[cfg(not(feature = "async"))]
-fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
+pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
     Document::load_filtered(path, filter_func)
         .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
 }
@@ -115,71 +89,253 @@ fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
         })?)
 }
 
-fn get_pdf_text(doc: &Document) -> Result<PdfText, Error> {
-    let mut pdf_text: PdfText = PdfText {
-        text: BTreeMap::new(),
-        errors: Vec::new(),
+/// Struct for how the text is tokenized
+/// Defaults to lines for now
+#[derive(Debug)]
+pub struct DocumentLine {
+    pub line: String,
+    pub page: u32,
+}
+
+#[derive(Clone, Debug)]
+struct TextState {
+    font_name: Option<String>,
+    font_size: f32,
+    text_matrix: [f32; 6],
+    text_line_matrix: [f32; 6],
+    position: (f32, f32),
+    text_buffer: String,
+}
+
+impl Default for TextState {
+    fn default() -> Self {
+        TextState {
+            font_name: None,
+            font_size: 0.0,
+            text_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            text_line_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            position: (0.0, 0.0),
+            text_buffer: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TextElement {
+    pub text: String,
+    pub page_number: u32,
+    pub font_size: f32,
+    pub font_name: Option<String>,
+    pub position: (f32, f32), // (x, y) coordinates
+}
+
+impl PartialEq for TextElement {
+    fn eq(&self, other: &Self) -> bool {
+        self.font_size == other.font_size && self.font_name == other.font_name
+    }
+}
+
+fn collect_text(
+    text_buffer: &mut String,
+    encoding: &Encoding,
+    operands: &[Object],
+    page_number: u32,
+) -> LopdfResult<()> {
+    for operand in operands.iter() {
+        match operand {
+            Object::String(bytes, _) => {
+                let decoded_text = Document::decode_text(encoding, bytes)?;
+                text_buffer.push_str(&decoded_text);
+            }
+            Object::Array(arr) => {
+                collect_text(text_buffer, encoding, arr, page_number)?;
+            }
+            Object::Integer(i) => {
+                // Handle text positioning adjustments if necessary
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn get_page_text_elements(
+    doc: &Document,
+    page_number: u32,
+    page_id: (u32, u16),
+) -> Result<Vec<TextElement>, LopdfError> {
+    let mut text_elements = Vec::new();
+    let mut text_state = TextState::default();
+
+    let content_data = match doc.get_and_decode_page_content(page_id) {
+        Ok(content) => content,
+        Err(e) => {
+            error!("Failed to decode content for page {}: {}", page_number, e);
+            panic!("Failed to decode content for page {}", e);
+        }
     };
-    let pages: Vec<Result<(u32, Vec<String>), Error>> = doc
+
+    // Map of font resources
+    let fonts = match doc.get_page_fonts(page_id) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to get fonts for page {}: {}", page_number, e);
+            return Err(e);
+        }
+    };
+
+    let encodings: BTreeMap<Vec<u8>, Encoding> = fonts
+        .into_iter()
+        .map(|(name, font)| font.get_font_encoding(doc).map(|it| (name, it)))
+        .collect::<LopdfResult<BTreeMap<Vec<u8>, Encoding>>>()?;
+
+    let mut current_encoding: Option<&Encoding> = None;
+
+    for (i, op) in content_data.operations.iter().enumerate() {
+        match op.operator.as_ref() {
+            "BT" => {
+                text_state = TextState::default();
+                text_state.text_buffer = String::new();
+                text_state.position = (0.0, 0.0);
+            }
+            "Tf" => {
+                if let (Some(Object::Name(font_name)), Some(font_size_obj)) =
+                    (op.operands.get(0), op.operands.get(1))
+                {
+                    let font_size = match font_size_obj {
+                        Object::Integer(i) => *i as f32,
+                        Object::Real(f) => *f,
+                        _ => {
+                            warn!("Unexpected font size type: {:?}", font_size_obj);
+                            0.0
+                        }
+                    };
+                    text_state.font_name = Some(String::from_utf8_lossy(font_name).into_owned());
+                    text_state.font_size = font_size;
+                    current_encoding = encodings.get(font_name);
+                }
+            }
+            "Tj" | "TJ" | "'" | "\"" => {
+                if let Some(encoding) = current_encoding {
+                    collect_text(
+                        &mut text_state.text_buffer,
+                        encoding,
+                        &op.operands,
+                        page_number,
+                    )?;
+                } else {
+                    warn!("No current encoding for text extraction at operation {}", i);
+                }
+            }
+            "ET" => {
+                if !text_state.text_buffer.is_empty() {
+                    let text_element = TextElement {
+                        text: text_state.text_buffer.clone(),
+                        page_number,
+                        font_size: text_state.font_size,
+                        font_name: text_state.font_name.clone(),
+                        position: text_state.position,
+                    };
+                    text_elements.push(text_element);
+                }
+                // Reset text buffer
+                text_state.text_buffer.clear();
+            }
+            "Td" | "TD" => {
+                let args = &op.operands;
+                if args.len() == 2 {
+                    // Handle both Integer and Real PDF objects
+                    let tx = match &args[0] {
+                        Object::Integer(i) => *i as f32,
+                        Object::Real(f) => *f,
+                        _ => 0.0,
+                    };
+                    let ty = match &args[1] {
+                        Object::Integer(i) => *i as f32,
+                        Object::Real(f) => *f,
+                        _ => 0.0,
+                    };
+
+                    text_state.position.0 += tx;
+                    text_state.position.1 += ty;
+                }
+            }
+            "Tm" => {
+                let args = &op.operands;
+                if args.len() == 6 {
+                    // Convert all matrix values handling both Integer and Real
+                    let matrix: Vec<f32> = args
+                        .iter()
+                        .map(|arg| match arg {
+                            Object::Integer(i) => *i as f32,
+                            Object::Real(f) => *f,
+                            _ => 0.0,
+                        })
+                        .collect();
+
+                    text_state.text_matrix = [
+                        matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5],
+                    ];
+                    // The last two elements of the matrix are the translation
+                    text_state.position = (matrix[4], matrix[5]);
+                }
+            }
+            _ => {
+                // Handle other operators if needed
+            }
+        }
+    }
+
+    if !text_state.text_buffer.is_empty() {
+        let text_element = TextElement {
+            text: text_state.text_buffer.clone(),
+            page_number,
+            font_size: text_state.font_size,
+            font_name: text_state.font_name.clone(),
+            position: text_state.position,
+        };
+        text_elements.push(text_element);
+    }
+
+    Ok(text_elements)
+}
+
+pub fn get_pdf_text(doc: &Document) -> Result<Vec<TextElement>, LopdfError> {
+    let mut all_text_elements = Vec::new();
+
+    let page_matches: Vec<Result<(u32, Vec<TextElement>), Error>> = doc
         .get_pages()
         .into_par_iter()
         .map(
-            |(page_num, page_id): (u32, (u32, u16))| -> Result<(u32, Vec<String>), Error> {
-                let text = doc.extract_text(&[page_num]).map_err(|e| {
-                    Error::new(
-                        ErrorKind::Other,
-                        format!("Failed to extract text from page {page_num} id={page_id:?}: {e:}"),
-                    )
-                })?;
-                Ok((
-                    page_num,
-                    text.split('\n')
-                        .map(|s| s.trim_end().to_string())
-                        .collect::<Vec<String>>(),
-                ))
+            |(page_num, page_id): (u32, (u32, u16))| -> Result<(u32, Vec<TextElement>), Error> {
+                let text_elements =
+                    get_page_text_elements(doc, page_num, page_id).map_err(|e| {
+                        Error::new(
+                            ErrorKind::Other,
+                            format!(
+                                "Failed to extract text from page {page_num} id={page_id:?}: {e:?}"
+                            ),
+                        )
+                    })?;
+                Ok((page_num, text_elements))
             },
         )
         .collect();
-    for page in pages {
-        match page {
-            Ok((page_num, lines)) => {
-                pdf_text.text.insert(page_num, lines);
-            }
-            Err(e) => {
-                pdf_text.errors.push(e.to_string());
-            }
-        }
-    }
-    Ok(pdf_text)
-}
 
-pub fn pdf2text<P: AsRef<Path> + Debug>(
-    path: P,
-    output: P,
-    pretty: bool,
-    password: &str,
-) -> Result<(), Error> {
-    println!("Load {path:?}");
-    let mut doc = load_pdf(&path)?;
-    if doc.is_encrypted() {
-        doc.decrypt(password)
-            .map_err(|_err| Error::new(ErrorKind::InvalidInput, "Failed to decrypt"))?;
+    // for (page_number, page_id) in pages.into_par_iter() {
+    //     let page_number = page_number; // Ensure the page number is the actual number
+
+    //     // Parse the content stream
+    //     let text_elements = get_page_text_elements(doc, page_number, page_id)?;
+
+    //     all_text_elements.extend(text_elements);
+    // }
+
+    for page_match in page_matches {
+        all_text_elements.extend(page_match?.1);
     }
-    let text = get_pdf_text(&doc)?;
-    if !text.errors.is_empty() {
-        eprintln!("{path:?} has {} errors:", text.errors.len());
-        for error in &text.errors[..10] {
-            eprintln!("{error:?}");
-        }
-    }
-    let data = match pretty {
-        true => serde_json::to_string_pretty(&text).unwrap(),
-        false => serde_json::to_string(&text).unwrap(),
-    };
-    println!("Write {output:?}");
-    let mut f = File::create(output)?;
-    f.write_all(data.as_bytes())?;
-    Ok(())
+
+    Ok(all_text_elements)
 }
 
 pub fn pdf2toc<P: AsRef<Path> + Debug>(path: P, output: P, pretty: bool) -> Result<(), Error> {

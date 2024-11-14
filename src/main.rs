@@ -1,19 +1,23 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-use std::fs::File;
-use std::io::{Error, ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+
+use std::path::PathBuf;
 
 use clap::Parser;
+
+use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
 pub mod dom;
+pub mod layout;
 pub mod parse;
 use crate::dom::*;
+use crate::layout::*;
 use crate::parse::*;
 
-use pest::iterators::{Pair, Pairs};
+use pest::iterators::Pair;
 use pest::Parser as PestParser;
 use pest_derive::Parser as PestParserDerive;
+
+use log::{debug, error, warn};
 
 #[derive(PestParserDerive)]
 #[grammar = "unst.pest"]
@@ -49,57 +53,38 @@ impl Args {
     }
 }
 
-fn main() -> Result<(), Error> {
-    let unparsed_file = std::fs::read_to_string("10k.tmpl").expect("cannot read file");
+fn main() -> Result<(), lopdf::Error> {
+    println!("Starting PDF processing");
 
-    let parse_result = UnstParser::parse(Rule::template, &unparsed_file);
-    match parse_result {
-        Ok(mut pairs) => {
-            // Extract the root Pair<Rule>
-            let pair = pairs.next().unwrap(); // Should be Rule::template
-            let template = parse_template(pair);
-            println!("{:?}", template);
-            // traverse_template(&template);
-        }
-        Err(e) => {
-            eprintln!("Error parsing template: {}", e);
-        }
+    let pdf_path = "tests/3M_2015_10k.pdf";
+    let doc = load_pdf(pdf_path)?;
+    // Load the PDF
+    let doc = Document::load(pdf_path)?;
+
+    // Extract text elements with metadata
+    let text_elements = get_pdf_text(&doc)?;
+
+    // Define the search string from your template
+    let search_string = "Discussion and Analysis of Financial Condition and Results of Operations";
+
+    // Perform matching
+    let matched_elements = perform_matching(text_elements, search_string);
+
+    // Apply heuristics to select the best match
+    if let Some(best_match) = select_best_match(matched_elements) {
+        println!(
+            "Best match found on page {}: {}",
+            best_match.page_number, best_match.text
+        );
+        println!("Font size: {}", best_match.font_size);
+        println!("Position: {:?}", best_match.position);
+
+        // Proceed to extract the section content starting from this match
+        // You may need to implement additional logic to collect the section content
+    } else {
+        println!("No matching section found.");
     }
-    // let args = Args::parse_args();
 
-    // let start_time = Instant::now();
-    // let pdf_path = PathBuf::from(
-    //     shellexpand::full(args.pdf_path.to_str().unwrap())
-    //         .unwrap()
-    //         .to_string(),
-    // );
-
-    // // Create two different output paths for text and toc
-    // let output_base = match args.output {
-    //     Some(o) => o.join(pdf_path.file_name().unwrap()),
-    //     None => args.pdf_path.clone(),
-    // };
-    // let output_base = PathBuf::from(
-    //     shellexpand::full(output_base.to_str().unwrap())
-    //         .unwrap()
-    //         .to_string(),
-    // );
-
-    // // Create separate paths for text and toc outputs
-    // let mut text_output = output_base.clone();
-    // text_output.set_extension("text.json");
-
-    // let mut toc_output = output_base;
-    // toc_output.set_extension("toc.json");
-
-    // // Process both text and TOC
-    // // pdf2text(&pdf_path, &text_output, args.pretty, &args.password)?;
-    // pdf2toc(&pdf_path, &toc_output, args.pretty)?;
-
-    // println!(
-    //     "Done after {:.1} seconds.",
-    //     Instant::now().duration_since(start_time).as_secs_f64()
-    // );
     Ok(())
 }
 

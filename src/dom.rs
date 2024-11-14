@@ -20,6 +20,110 @@ pub enum Value {
     Array(Vec<Value>),
     Identifier(String),
 }
+
+#[derive(Debug)]
+pub struct DocumentElement {
+    pub element_type: ElementType,
+    pub text: Option<String>,
+    pub children: Vec<DocumentElement>,
+    pub metadata: HashMap<String, String>, // Additional info like font size, position
+}
+
+#[derive(Debug)]
+pub enum ElementType {
+    Section,
+    Paragraph,
+    TextChunk,
+    // Add other types as needed
+}
+
+#[derive(Debug)]
+pub struct MatchedElement {
+    pub template_element: Element,
+    pub document_element: DocumentElement,
+    pub children: Vec<MatchedElement>,
+    pub metadata: HashMap<String, Value>,
+}
+
+// fn match_element(
+//     template_element: &Element,
+//     document_elements: &[DocumentElement],
+//     parent_metadata: &HashMap<String, Value>,
+// ) -> Vec<MatchedElement> {
+//     let mut matched_elements = Vec::new();
+
+//     // Get matching criteria from template attributes
+//     let match_criteria = template_element
+//         .attributes
+//         .get("match")
+//         .and_then(|v| match v {
+//             Value::String(s) => Some(s.clone()),
+//             _ => None,
+//         });
+
+//     // Merge parent metadata with current element's metadata
+//     let mut current_metadata = parent_metadata.clone();
+//     if let Some(Value::String(alias)) = template_element.attributes.get("as") {
+//         // Store the alias in metadata
+//         current_metadata.insert(alias.clone(), Value::String(alias.clone()));
+//     }
+
+//     // Find matching document elements
+//     for doc_element in document_elements {
+//         if let Some(criteria) = &match_criteria {
+//             if element_matches(doc_element, criteria) {
+//                 // Element matches the criteria
+//                 let mut children = Vec::new();
+//                 for child_template in &template_element.children {
+//                     let child_matches =
+//                         match_element(child_template, &doc_element.children, &current_metadata);
+//                     children.extend(child_matches);
+//                 }
+
+//                 let matched_element = MatchedElement {
+//                     template_element: template_element.clone(),
+//                     document_element: doc_element.clone(),
+//                     children,
+//                     metadata: current_metadata.clone(),
+//                 };
+//                 matched_elements.push(matched_element);
+//             }
+//         } else {
+//             // No match criteria specified; proceed to match children
+//             let mut children = Vec::new();
+//             for child_template in &template_element.children {
+//                 let child_matches =
+//                     match_element(child_template, &doc_element.children, &current_metadata);
+//                 children.extend(child_matches);
+//             }
+
+//             if !children.is_empty() {
+//                 let matched_element = MatchedElement {
+//                     template_element: template_element.clone(),
+//                     document_element: doc_element.clone(),
+//                     children,
+//                     metadata: current_metadata.clone(),
+//                 };
+//                 matched_elements.push(matched_element);
+//             }
+//         }
+//     }
+
+//     matched_elements
+// }
+
+// fn element_matches(doc_element: &DocumentElement, criteria: &str) -> bool {
+//     // Implement your matching logic here
+//     // For example, exact match:
+//     if let Some(text) = &doc_element.text {
+//         text == criteria
+//     } else {
+//         false
+//     }
+
+//     // For regex or fuzzy matching, you'd implement those methods here
+// }
+
 // #[derive(Debug, Clone)]
 // struct DocumentNode {
 //     text: String,
