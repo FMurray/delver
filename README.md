@@ -79,11 +79,14 @@ The template uses a simple and expressive syntax where each rule is enclosed in 
 Section(match="Section 1: Management Discussion & Analysis", as="section1") {
   Section(match="Section 1.1: Risks", as="section1_1") {
     Section(match="Section 1.1b: Fiscal Risks", as="section1_1b") {
+      Summarize(model="some_vlm")
       TextChunk(
         chunkSize=500,
         chunkOverlap=150,
         addMeta=[section1, section1_1, section1_1b]
       )
+
+      Table(model="some_vlm")
     }
   }
 }

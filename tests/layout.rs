@@ -1,29 +1,113 @@
 use lopdf::Document;
-use std::path::Path;
 
-use crate::{extract_text_fragments, identify_headings};
+pub mod setup;
+use crate::setup::{create_test_pdf_with_config, PdfConfig, Section};
+use delver::layout::*;
+use delver::parse::{get_pdf_text, get_refs, TextElement};
 
 #[test]
 fn test_detect_headings() {
-    // Create the test PDF
-    assert!(create_test_pdf().is_ok());
+    // Create a PDF with specific headings
+    let config = PdfConfig {
+        title: "Test Heading Detection".to_string(),
+        sections: vec![
+            Section {
+                heading: "First Heading".to_string(),
+                content: "This is content under the first heading.".to_string(),
+            },
+            Section {
+                heading: "Second Heading".to_string(),
+                content: "This is content under the second heading.".to_string(),
+            },
+            Section {
+                heading: "Third Heading".to_string(),
+                content: "This is content under the third heading.".to_string(),
+            },
+        ],
+        font_name: "Helvetica".to_string(),
+        title_font_size: 48.0,
+        heading_font_size: 24.0,
+        body_font_size: 12.0,
+        output_path: "tests/heading_test.pdf".to_string(),
+    };
 
-    // Load the PDF document
-    let doc = Document::load("tests/example.pdf").unwrap();
+    create_test_pdf_with_config(config).expect("Failed to create test PDF");
 
-    // Extract text fragments
-    let fragments = extract_text_fragments(&doc);
+    // Load the PDF and extract text elements
+    let doc = Document::load("tests/heading_test.pdf").unwrap();
+    let text_elements = get_pdf_text(&doc).unwrap().clone();
 
-    // Identify headings
-    let nodes = identify_headings(&fragments);
+    // Create a match context
+    let context = get_refs(&doc).unwrap();
 
-    // Check for expected headings
-    let expected_headings = vec!["Hello World!", "Subheading 1", "Subheading 2"];
-    let detected_headings: Vec<&str> = nodes
-        .iter()
-        .filter(|node| node.is_heading)
-        .map(|node| node.text.as_str())
-        .collect();
+    // Test finding the title
+    let title_matches = perform_matching(&text_elements, "Test Heading Detection", 0.9);
+    let title = select_best_match(title_matches, &context, None);
+    assert!(title.is_some());
+    assert_eq!(title.unwrap().font_size, 48.0);
 
-    assert_eq!(expected_headings, detected_headings);
+    // Test finding each heading sequentially
+    let expected_headings = vec!["First Heading", "Second Heading", "Third Heading"];
+
+    let mut last_match = None;
+    for expected_heading in expected_headings {
+        let matches = perform_matching(&text_elements, expected_heading, 0.9);
+        println!("Found {} matches for '{}'", matches.len(), expected_heading);
+
+        for m in &matches {
+            println!(
+                "Match: '{}' at y={}, font={}",
+                m.text, m.position.1, m.font_size
+            );
+        }
+
+        let heading = select_best_match(matches, &context, last_match.as_ref());
+
+        if heading.is_none() {
+            println!(
+                "No heading found after {:?}",
+                last_match.map(|m: TextElement| m.text)
+            );
+        }
+
+        assert!(
+            heading.is_some(),
+            "Failed to find heading: {}",
+            expected_heading
+        );
+        let heading = heading.unwrap();
+
+        // Verify heading properties
+        assert_eq!(heading.text, expected_heading);
+        assert_eq!(heading.font_size, 24.0);
+        assert!(
+            heading.position.0 <= 100.0,
+            "Heading should be left-aligned"
+        );
+
+        last_match = Some(heading);
+    }
+
+    // Test extracting content between headings
+    if let (Some(first_heading), Some(second_heading)) = (
+        perform_matching(&text_elements, "First Heading", 0.9)
+            .first()
+            .cloned(),
+        perform_matching(&text_elements, "Second Heading", 0.9)
+            .first()
+            .cloned(),
+    ) {
+        let content =
+            extract_section_content(&text_elements, &first_heading, Some(&second_heading));
+
+        // Should find the content text
+        assert!(content
+            .iter()
+            .any(|e| e.text == "This is content under the first heading."));
+
+        // Should have correct font size
+        for element in content {
+            assert_eq!(element.font_size, 12.0, "Content should use body font size");
+        }
+    }
 }

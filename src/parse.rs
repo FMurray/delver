@@ -1,21 +1,16 @@
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fmt::Debug;
-use std::fs::File;
-use std::io::{Error, ErrorKind, Write};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::io::{Error, ErrorKind};
+use std::path::Path;
 
-use log::{debug, error, warn};
+use log::{error, warn};
 
-use lopdf::{
-    Dictionary, Document, Encoding, Error as LopdfError, Object, Outline, Result as LopdfResult,
-    Toc,
-};
+use crate::layout::MatchContext;
+use lopdf::{Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
-use serde_json;
-use shellexpand;
 
 #[cfg(feature = "async")]
 use tokio::runtime::Builder;
@@ -39,7 +34,7 @@ static IGNORE: &[&str] = &[
     "PTEX.FileName",
     "PTEX.PageNumber",
     "PTEX.InfoDict",
-    "FontDescriptor",
+    // "FontDescriptor",
     "ExtGState",
     "MediaBox",
     "Annot",
@@ -102,7 +97,7 @@ struct TextState {
     font_name: Option<String>,
     font_size: f32,
     text_matrix: [f32; 6],
-    text_line_matrix: [f32; 6],
+    // text_line_matrix: [f32; 6],
     position: (f32, f32),
     text_buffer: String,
 }
@@ -113,25 +108,40 @@ impl Default for TextState {
             font_name: None,
             font_size: 0.0,
             text_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            text_line_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            // text_line_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             position: (0.0, 0.0),
             text_buffer: String::new(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextElement {
     pub text: String,
     pub page_number: u32,
+    pub page_id: (u32, u16),
     pub font_size: f32,
     pub font_name: Option<String>,
     pub position: (f32, f32), // (x, y) coordinates
 }
 
-impl PartialEq for TextElement {
-    fn eq(&self, other: &Self) -> bool {
-        self.font_size == other.font_size && self.font_name == other.font_name
+impl fmt::Display for TextElement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Text Element:\n\
+            \tText: \"{}\"\n\
+            \tPage Number: {}\n\
+            \tFont Size: {:.2}\n\
+            \tFont Name: {:?}\n\
+            \tPosition: ({:.2}, {:.2})\n",
+            self.text,
+            self.page_number,
+            self.font_size,
+            self.font_name,
+            self.position.0,
+            self.position.1
+        )
     }
 }
 
@@ -150,7 +160,7 @@ fn collect_text(
             Object::Array(arr) => {
                 collect_text(text_buffer, encoding, arr, page_number)?;
             }
-            Object::Integer(i) => {
+            Object::Integer(_i) => {
                 // Handle text positioning adjustments if necessary
             }
             _ => {}
@@ -232,6 +242,7 @@ fn get_page_text_elements(
                     let text_element = TextElement {
                         text: text_state.text_buffer.clone(),
                         page_number,
+                        page_id,
                         font_size: text_state.font_size,
                         font_name: text_state.font_name.clone(),
                         position: text_state.position,
@@ -290,6 +301,7 @@ fn get_page_text_elements(
         let text_element = TextElement {
             text: text_state.text_buffer.clone(),
             page_number,
+            page_id,
             font_size: text_state.font_size,
             font_name: text_state.font_name.clone(),
             position: text_state.position,
@@ -338,47 +350,109 @@ pub fn get_pdf_text(doc: &Document) -> Result<Vec<TextElement>, LopdfError> {
     Ok(all_text_elements)
 }
 
-pub fn pdf2toc<P: AsRef<Path> + Debug>(path: P, output: P, pretty: bool) -> Result<(), Error> {
-    println!("Load {path:?}");
-    let doc = load_pdf(&path)?;
+pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
+    let mut destinations: IndexMap<String, Object> = IndexMap::new();
 
-    doc.get_toc()
-        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+    if let Ok(catalog) = doc.catalog() {
+        if let Ok(dests_ref) = catalog.get(b"Dests") {
+            if let Ok(ref_id) = dests_ref.as_reference() {
+                if let Ok(dests_dict) = doc.get_object(ref_id) {
+                    if let Ok(dict) = dests_dict.as_dict() {
+                        for (key, value) in dict.iter() {
+                            let dest_name = String::from_utf8_lossy(key).to_string();
 
-    // TODO: Support documents without Outlines
-    // let mut destinations: IndexMap<String, Object> = IndexMap::new();
+                            // Resolve the destination reference if it exists
+                            let dest_obj = if let Ok(dest_ref) = value.as_reference() {
+                                doc.get_object(dest_ref).unwrap_or(value)
+                            } else {
+                                value
+                            };
 
-    // if let Ok(catalog) = doc.catalog() {
-    //     if let Ok(dests_ref) = catalog.get(b"Dests") {
-    //         println!("\nFound Dests in catalog");
-    //         if let Ok(ref_id) = dests_ref.as_reference() {
-    //             if let Ok(dests_dict) = doc.get_object(ref_id) {
-    //                 if let Ok(dict) = dests_dict.as_dict() {
-    //                     for (key, value) in dict.iter() {
-    //                         let dest_name = String::from_utf8_lossy(key).to_string();
+                            destinations.insert(dest_name, dest_obj.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    //                         // Resolve the destination reference if it exists
-    //                         let dest_obj = if let Ok(dest_ref) = value.as_reference() {
-    //                             doc.get_object(dest_ref).unwrap_or(value)
-    //                         } else {
-    //                             value
-    //                         };
+    // Create the match context with owned destinations
+    let context = MatchContext {
+        destinations, // Transfer ownership instead of taking reference
+        fonts: None,
+    };
 
-    //                         destinations.insert(dest_name, dest_obj.to_owned());
-    //                     }
-
-    //                     println!("Found {} destinations", destinations.len());
-    //                     // Print first few destinations as sample
-    //                     for (i, (name, dest)) in destinations.iter().enumerate() {
-    //                         println!("{}. {} -> {:?}", i + 1, name, dest);
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     } else {
-    //         println!("No Dests dictionary found in catalog");
-    //     }
-    // }
-
-    Ok(())
+    Ok(context)
 }
+
+// pub fn pdf2toc<P: AsRef<Path> + Debug>(path: P, output: P, pretty: bool) -> Result<(), Error> {
+//     let mut destinations: IndexMap<String, Object> = IndexMap::new();
+
+//     if let Ok(catalog) = doc.catalog() {
+//         if let Ok(dests_ref) = catalog.get(b"Dests") {
+//             println!("\nFound Dests in catalog");
+//             if let Ok(ref_id) = dests_ref.as_reference() {
+//                 if let Ok(dests_dict) = doc.get_object(ref_id) {
+//                     if let Ok(dict) = dests_dict.as_dict() {
+//                         for (key, value) in dict.iter() {
+//                             let dest_name = String::from_utf8_lossy(key).to_string();
+
+//                             // Resolve the destination reference if it exists
+//                             let dest_obj = if let Ok(dest_ref) = value.as_reference() {
+//                                 doc.get_object(dest_ref).unwrap_or(value)
+//                             } else {
+//                                 value
+//                             };
+
+//                             destinations.insert(dest_name, dest_obj.to_owned());
+//                         }
+
+//                         println!("Found {} destinations", destinations.len());
+//                     }
+//                 }
+//             }
+//         }
+//     }
+
+//     // Create the match context
+//     let context = MatchContext {
+//         destinations: &destinations,
+//     };
+
+// TODO: Support documents without Outlines
+// let mut destinations: IndexMap<String, Object> = IndexMap::new();
+
+// if let Ok(catalog) = doc.catalog() {
+//     if let Ok(dests_ref) = catalog.get(b"Dests") {
+//         println!("\nFound Dests in catalog");
+//         if let Ok(ref_id) = dests_ref.as_reference() {
+//             if let Ok(dests_dict) = doc.get_object(ref_id) {
+//                 if let Ok(dict) = dests_dict.as_dict() {
+//                     for (key, value) in dict.iter() {
+//                         let dest_name = String::from_utf8_lossy(key).to_string();
+
+//                         // Resolve the destination reference if it exists
+//                         let dest_obj = if let Ok(dest_ref) = value.as_reference() {
+//                             doc.get_object(dest_ref).unwrap_or(value)
+//                         } else {
+//                             value
+//                         };
+
+//                         destinations.insert(dest_name, dest_obj.to_owned());
+//                     }
+
+//                     println!("Found {} destinations", destinations.len());
+//                     // Print first few destinations as sample
+//                     for (i, (name, dest)) in destinations.iter().enumerate() {
+//                         println!("{}. {} -> {:?}", i + 1, name, dest);
+//                     }
+//                 }
+//             }
+//         }
+//     } else {
+//         println!("No Dests dictionary found in catalog");
+//     }
+// }
+
+//     Ok(())
+// }

@@ -1,19 +1,18 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt::Debug;
-
 use std::path::PathBuf;
 
 use clap::Parser;
-
-use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
+use lopdf::Document;
+pub mod chunker;
 pub mod dom;
 pub mod layout;
 pub mod parse;
+use crate::dom::process_template_element;
 use crate::dom::*;
-use crate::layout::*;
-use crate::parse::*;
+use crate::parse::get_pdf_text;
 
-use log::{debug, error, warn};
+use serde_json;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -45,41 +44,31 @@ impl Args {
     }
 }
 
-fn main() -> Result<(), lopdf::Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting PDF processing");
 
-    // Read and parse the template file
-    let template_str = std::fs::read_to_string("10k.tmpl").expect("Failed to read template file");
-
-    let dom = parse_template(&template_str);
-    println!("Parsed template: {:?}", dom);
-
+    let template_str = std::fs::read_to_string("10k.tmpl")?;
+    let dom = parse_template(&template_str)?;
     let pdf_path = "tests/3M_2015_10k.pdf";
     let doc = Document::load(pdf_path)?;
-
-    // Extract text elements with metadata
     let text_elements = get_pdf_text(&doc)?;
 
-    // Define the search string from your template
-    let search_string = "Discussion and Analysis of Financial Condition and Results of Operations";
+    let mut all_chunks = Vec::new();
 
-    // Perform matching
-    let matched_elements = perform_matching(text_elements, search_string);
-
-    // Apply heuristics to select the best match
-    if let Some(best_match) = select_best_match(matched_elements) {
-        println!(
-            "Best match found on page {}: {}",
-            best_match.page_number, best_match.text
-        );
-        println!("Font size: {}", best_match.font_size);
-        println!("Position: {:?}", best_match.position);
-
-        // Proceed to extract the section content starting from this match
-        // You may need to implement additional logic to collect the section content
-    } else {
-        println!("No matching section found.");
+    // Process the template DOM recursively and collect chunks
+    for element in dom.elements {
+        let mut metadata = HashMap::new();
+        all_chunks.extend(process_template_element(
+            &element,
+            &text_elements,
+            &doc,
+            &mut metadata,
+        ));
     }
+
+    // Write chunks to JSON file
+    let json = serde_json::to_string_pretty(&all_chunks)?;
+    std::fs::write("chunks.json", json)?;
 
     Ok(())
 }
