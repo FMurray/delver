@@ -1,7 +1,7 @@
 use lopdf::content::{Content, Operation};
 use lopdf::dictionary;
 use lopdf::{Document, Object, Stream};
-
+use std::path::Path;
 pub struct PdfConfig {
     pub title: String,
     pub sections: Vec<Section>,

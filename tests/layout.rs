@@ -5,8 +5,12 @@ use crate::setup::{create_test_pdf_with_config, PdfConfig, Section};
 use delver::layout::*;
 use delver::parse::{get_pdf_text, get_refs, TextElement};
 
+mod common;
+
 #[test]
 fn test_detect_headings() {
+    common::setup();
+
     // Create a PDF with specific headings
     let config = PdfConfig {
         title: "Test Heading Detection".to_string(),
@@ -42,7 +46,7 @@ fn test_detect_headings() {
 
     // Test finding the title
     let title_matches = perform_matching(&text_elements, "Test Heading Detection", 0.9);
-    let title = select_best_match(title_matches, &context, None);
+    let title = select_best_match(title_matches, &context);
     assert!(title.is_some());
     assert_eq!(title.unwrap().font_size, 48.0);
 
@@ -61,7 +65,7 @@ fn test_detect_headings() {
             );
         }
 
-        let heading = select_best_match(matches, &context, last_match.as_ref());
+        let heading = select_best_match(matches, &context);
 
         if heading.is_none() {
             println!(
@@ -110,4 +114,6 @@ fn test_detect_headings() {
             assert_eq!(element.font_size, 12.0, "Content should use body font size");
         }
     }
+
+    common::cleanup_all();
 }

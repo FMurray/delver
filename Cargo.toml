@@ -20,3 +20,6 @@ strsim = "0.11.1"
 tokenizers = "0.20.3"
 tokio = "1.41.0"
 unicode-normalization = "0.1.24"
+
+[dev-dependencies]
+pretty_assertions = "1.3"

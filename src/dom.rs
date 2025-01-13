@@ -1,4 +1,4 @@
-use crate::chunker::chunk_text_elements;
+use crate::chunker::{chunk_text_elements, ChunkingStrategy};
 use crate::layout::{extract_section_content, perform_matching, select_best_match};
 use crate::parse::{get_refs, TextElement};
 use lopdf::Document;
@@ -264,8 +264,7 @@ pub fn process_template_element(
 
         let matched_elements = perform_matching(&text_elements, match_str, threshold);
 
-        if let Some(best_match) = select_best_match(matched_elements.clone(), &match_context, None)
-        {
+        if let Some(best_match) = select_best_match(matched_elements.clone(), &match_context) {
             println!(
                 "Best match found on page {}: '{}'",
                 best_match.page_number, best_match.text
@@ -317,7 +316,7 @@ pub fn process_template_element(
 
             let end_element = if let Some(end_str) = end_match_str {
                 let end_matched_elements = perform_matching(&text_elements, end_str, threshold);
-                select_best_match(end_matched_elements, &match_context, Some(&best_match))
+                select_best_match(end_matched_elements, &match_context)
             } else {
                 None
             };
@@ -383,7 +382,12 @@ fn process_text_chunk(
             150
         };
 
-    let chunks = chunk_text_elements(section_text_elements, chunk_size, chunk_overlap);
+    // Default to character-based chunking
+    let strategy = ChunkingStrategy::Characters {
+        max_chars: chunk_size,
+    };
+
+    let chunks = chunk_text_elements(section_text_elements, &strategy, chunk_overlap);
 
     chunks
         .iter()

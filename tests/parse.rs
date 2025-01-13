@@ -4,21 +4,30 @@ pub mod setup;
 use crate::setup::create_test_pdf;
 use delver::parse::{get_pdf_text, get_refs, load_pdf, TextElement};
 
+mod common;
+
 #[test]
 fn test_load_pdf() {
+    common::setup();
+
     // Create the test PDF
     create_test_pdf().expect("Failed to create test PDF");
 
     let test_pdf_path = PathBuf::from("tests/example.pdf");
     let result = load_pdf(&test_pdf_path);
     assert!(result.is_ok(), "Should successfully load the test PDF");
+    common::cleanup_all();
 }
 
 #[test]
 fn test_get_pdf_text() {
-    create_test_pdf().expect("Failed to create test PDF");
-    let doc = load_pdf("tests/example.pdf").unwrap();
+    common::setup();
 
+    // Create new test PDF
+    create_test_pdf().expect("Failed to create test PDF");
+
+    // Run test
+    let doc = load_pdf("tests/example.pdf").unwrap();
     let text_elements = get_pdf_text(&doc).unwrap();
 
     assert!(
@@ -48,7 +57,7 @@ fn test_get_pdf_text() {
         );
     }
 
-    // Test font properties - note that we're not checking font_name as it might vary
+    // Test font properties
     for element in text_elements {
         match element.text.as_str() {
             "Hello World!" => assert_eq!(element.font_size, 48.0),
@@ -56,11 +65,14 @@ fn test_get_pdf_text() {
             _ => assert_eq!(element.font_size, 12.0),
         }
     }
+
+    // Clean up after test
+    common::cleanup_all();
 }
 
 #[test]
 fn test_get_refs() {
-    // Create a fresh PDF for this test
+    common::setup();
     create_test_pdf().expect("Failed to create test PDF");
 
     // Now load and test it
@@ -73,6 +85,8 @@ fn test_get_refs() {
 
     // The test PDF created in setup.rs doesn't have any destinations
     assert!(context.destinations.is_empty());
+
+    common::cleanup_all();
 }
 
 #[test]
