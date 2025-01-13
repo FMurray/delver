@@ -1,18 +1,13 @@
-use std::collections::HashMap;
 use std::fmt::Debug;
+use std::fs;
+use std::io::stderr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use lopdf::Document;
-pub mod chunker;
-pub mod dom;
-pub mod layout;
-pub mod parse;
-use crate::dom::process_template_element;
-use crate::dom::*;
-use crate::parse::get_pdf_text;
+use env_logger;
+use log::{error, info};
 
-use serde_json;
+use delver_pdf::process_pdf;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -23,9 +18,14 @@ use serde_json;
     arg_required_else_help = true
 )]
 pub struct Args {
+    /// Path to the PDF file to process
     pub pdf_path: PathBuf,
 
-    /// Optional output directory. If omitted the directory of the PDF file will be used.
+    /// Path to the template file
+    #[clap(short, long)]
+    pub template: PathBuf,
+
+    /// Optional output file path. If omitted, writes to stdout.
     #[clap(short, long)]
     pub output: Option<PathBuf>,
 
@@ -45,30 +45,31 @@ impl Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting PDF processing");
+    // Initialize logger to write to stderr
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stderr)
+        .init();
 
-    let template_str = std::fs::read_to_string("10k.tmpl")?;
-    let dom = parse_template(&template_str)?;
-    let pdf_path = "tests/3M_2015_10k.pdf";
-    let doc = Document::load(pdf_path)?;
-    let text_elements = get_pdf_text(&doc)?;
+    let args = Args::parse_args();
+    info!("Processing PDF: {:?}", args.pdf_path);
 
-    let mut all_chunks = Vec::new();
+    // Read the PDF file
+    let pdf_bytes = fs::read(&args.pdf_path)?;
 
-    // Process the template DOM recursively and collect chunks
-    for element in dom.elements {
-        let mut metadata = HashMap::new();
-        all_chunks.extend(process_template_element(
-            &element,
-            &text_elements,
-            &doc,
-            &mut metadata,
-        ));
+    // Read the template file
+    let template_str = fs::read_to_string(&args.template)?;
+
+    // Process the PDF
+    let json = process_pdf(&pdf_bytes, &template_str)?;
+
+    // Output the results
+    match args.output {
+        Some(path) => {
+            fs::write(&path, json)?;
+            info!("Output written to: {:?}", path);
+        }
+        None => println!("{}", json),
     }
-
-    // Write chunks to JSON file
-    let json = serde_json::to_string_pretty(&all_chunks)?;
-    std::fs::write("chunks.json", json)?;
 
     Ok(())
 }

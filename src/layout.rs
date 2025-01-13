@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use log::info;
 use lopdf::Dictionary;
 use lopdf::Object;
 use rayon::prelude::*;
@@ -145,7 +146,7 @@ fn score_match(mi: &TextElement, context: &MatchContext) -> f32 {
     score += reference_score * 0.2; // 20% weight
 
     // Debug logging with improved formatting
-    println!(
+    info!(
         "Debug - Text Element:\n\
         \tText: \"{}\"\n\
         \tPage Number: {}\n\
@@ -198,7 +199,7 @@ pub fn extract_section_content(
 
         // Ensure end_index is after start_index
         if idx <= start_index {
-            println!("End element occurs before start element or not found. Using end of document as end index.");
+            info!("End element occurs before start element or not found. Using end of document as end index.");
             all_text_elements.len()
         } else {
             idx

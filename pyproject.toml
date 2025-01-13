@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.8.1"]
+build-backend = "maturin"
+
+[project]
+name = "delver_pdf"
+version = "0.1.0"
+description = "Delver is a tool for declarative PDF extraction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "maturin[zig]>=1.8.1",
+]

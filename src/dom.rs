@@ -1,6 +1,7 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
 use crate::layout::{extract_section_content, perform_matching, select_best_match};
 use crate::parse::{get_refs, TextElement};
+use log::{error, info};
 use lopdf::Document;
 use pest::iterators::Pair;
 use pest::Parser as PestParser;
@@ -80,11 +81,11 @@ pub struct ChunkOutput {
 }
 
 pub fn parse_template(template_str: &str) -> Result<Root, Error> {
-    println!("Parsing template: {}", template_str);
+    info!("Parsing template: {}", template_str);
     let pairs = match TemplateParser::parse(Rule::template, template_str) {
         Ok(mut pairs) => pairs.next().unwrap(),
         Err(e) => {
-            eprintln!("Failed to parse template: {}", e);
+            error!("Failed to parse template: {}", e);
             return Err(Error::new(ErrorKind::InvalidData, e.to_string()));
         }
     };
@@ -104,13 +105,13 @@ fn _parse_template(pair: Pair<Rule>) -> Root {
                     }
                     Rule::EOI => {}
                     rule => {
-                        eprintln!("Unexpected rule in template: {:?}", rule);
+                        error!("Unexpected rule in template: {:?}", rule);
                     }
                 }
             }
         }
         rule => {
-            eprintln!("Expected template rule, got: {:?}", rule);
+            error!("Expected template rule, got: {:?}", rule);
         }
     }
 
@@ -213,7 +214,7 @@ fn process_value(pair: Pair<Rule>) -> Value {
             Value::Array(values)
         }
         rule => {
-            eprintln!("Unexpected value rule: {:?}", rule);
+            error!("Unexpected value rule: {:?}", rule);
             Value::String(inner_pair.as_str().to_string())
         }
     }
@@ -225,7 +226,7 @@ pub fn process_template_element(
     doc: &Document,
     inherited_metadata: &HashMap<String, Value>,
 ) -> Vec<ChunkOutput> {
-    println!("\n=== Processing {} ===", template_element.name);
+    info!("\n=== Processing {} ===", template_element.name);
     let context = get_refs(doc).unwrap();
     let mut all_chunks = Vec::new();
 
@@ -249,7 +250,7 @@ pub fn process_template_element(
 
     // For Section elements, look for matches
     if let Some(Value::String(match_str)) = template_element.attributes.get("match") {
-        println!(
+        info!(
             "Looking for match: '{}' in {} elements",
             match_str,
             text_elements.len()
@@ -265,7 +266,7 @@ pub fn process_template_element(
         let matched_elements = perform_matching(&text_elements, match_str, threshold);
 
         if let Some(best_match) = select_best_match(matched_elements.clone(), &match_context) {
-            println!(
+            info!(
                 "Best match found on page {}: '{}'",
                 best_match.page_number, best_match.text
             );
@@ -286,7 +287,7 @@ pub fn process_template_element(
             // Only chunk pre-section content if there's a TextChunk sibling before this Section
             if let Some(prev_sibling) = template_element.previous_sibling() {
                 if prev_sibling.as_ref().name == "TextChunk" {
-                    println!(
+                    info!(
                         "Chunking pre-section content ({} elements) up to '{}' on page {}",
                         pre_section_elements.len(),
                         best_match.text,

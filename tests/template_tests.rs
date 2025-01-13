@@ -5,7 +5,6 @@ use delver::{
 use lopdf::Document;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
-use std::path::PathBuf;
 
 mod common;
 
