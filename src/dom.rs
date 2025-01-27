@@ -232,12 +232,7 @@ pub fn process_template_element(
 
     // Create MatchContext with fonts
     let mut match_context = context;
-    if let Some(first_element) = text_elements.first() {
-        if let Ok(font_dict) = doc.get_page_fonts(first_element.page_id) {
-            match_context.fonts =
-                Some(font_dict.into_iter().map(|(k, v)| (k, v.clone())).collect());
-        }
-    }
+    // match_context.fonts = Some(text_elements.first().unwrap().font_name.clone());
 
     // Handle standalone TextChunk elements (not siblings of Section)
     if template_element.name == "TextChunk" {
@@ -278,7 +273,7 @@ pub fn process_template_element(
                     // Stop at the exact position of the section header
                     e.page_number < best_match.page_number
                         || (e.page_number == best_match.page_number
-                            && e.position.1 <= best_match.position.1 - best_match.font_size)
+                            && e.bbox.1 <= best_match.bbox.1 - best_match.font_size)
                     // Subtract font size to avoid including the header
                 })
                 .cloned()
@@ -345,7 +340,7 @@ pub fn process_template_element(
                             .skip_while(|e| {
                                 e.page_number < end_elem.page_number
                                     || (e.page_number == end_elem.page_number
-                                        && e.position.1 <= end_elem.position.1)
+                                        && e.bbox.1 <= end_elem.bbox.1)
                             })
                             .cloned()
                             .collect::<Vec<_>>();

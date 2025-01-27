@@ -1,2 +1,5 @@
 /target
 /tests/Felix.pdf
+/deps
+/logs/*
+.DS_Store

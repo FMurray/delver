@@ -96,7 +96,7 @@ fn score_match(mi: &TextElement, context: &MatchContext) -> f32 {
     score += font_score * 0.2; // 20% weight
 
     // Vertical position score (normalize based on typical page height ~842pt)
-    let position_score = if mi.position.1 > 700.0 || mi.position.1 < 200.0 {
+    let position_score = if mi.bbox.1 > 700.0 || mi.bbox.1 < 200.0 {
         1.0
     } else {
         0.0
@@ -104,7 +104,7 @@ fn score_match(mi: &TextElement, context: &MatchContext) -> f32 {
     score += position_score * 0.1; // 10% weight
 
     // Left alignment score (normalize based on typical page width ~595pt)
-    let left_align_score = if mi.position.0 < 100.0 { 1.0 } else { 0.0 };
+    let left_align_score = if mi.bbox.0 < 100.0 { 1.0 } else { 0.0 };
     score += left_align_score * 0.1; // 10% weight
 
     // Text case score
@@ -135,7 +135,7 @@ fn score_match(mi: &TextElement, context: &MatchContext) -> f32 {
                     };
 
                     // Tighter vertical position matching
-                    if (dest_y - mi.position.1).abs() < 20.0 {
+                    if (dest_y - mi.bbox.1).abs() < 20.0 {
                         reference_count += 1;
                     }
                 }
@@ -165,8 +165,8 @@ fn score_match(mi: &TextElement, context: &MatchContext) -> f32 {
         mi.page_number,
         mi.font_size,
         mi.font_name,
-        mi.position.0,
-        mi.position.1,
+        mi.bbox.0,
+        mi.bbox.1,
         font_size_score,
         font_score,
         position_score,

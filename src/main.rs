@@ -1,11 +1,7 @@
-use std::fmt::Debug;
 use std::fs;
-use std::io::stderr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use env_logger;
-use log::{error, info};
 
 use delver_pdf::process_pdf;
 
@@ -36,6 +32,14 @@ pub struct Args {
     /// Optional password for encrypted PDFs
     #[clap(long, default_value_t = String::from(""))]
     pub password: String,
+
+    /// Enable detailed logging of PDF content stream operations
+    #[clap(long)]
+    pub debug_ops: bool,
+
+    /// Directory for debug operation logs
+    #[clap(long)]
+    pub log_dir: Option<PathBuf>,
 }
 
 impl Args {
@@ -45,13 +49,14 @@ impl Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logger to write to stderr
-    env_logger::Builder::from_default_env()
-        .target(env_logger::Target::Stderr)
-        .init();
-
     let args = Args::parse_args();
-    info!("Processing PDF: {:?}", args.pdf_path);
+
+    // Initialize logging with optional custom directory and keep the guard alive
+    let _guard = if let Some(log_dir) = args.log_dir {
+        delver_pdf::logging::init_logging_with_dir(args.debug_ops, log_dir)
+    } else {
+        delver_pdf::logging::init_logging(args.debug_ops)
+    };
 
     // Read the PDF file
     let pdf_bytes = fs::read(&args.pdf_path)?;
@@ -62,14 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Process the PDF
     let json = process_pdf(&pdf_bytes, &template_str)?;
 
-    // Output the results
-    match args.output {
-        Some(path) => {
-            fs::write(&path, json)?;
-            info!("Output written to: {:?}", path);
-        }
-        None => println!("{}", json),
-    }
+    // // Output the results
+    // match args.output {
+    //     Some(path) => {
+    //         fs::write(&path, json)?;
+    //         info!("Output written to: {:?}", path);
+    //     }
+    //     None => println!("{}", json),
+    // }
 
     Ok(())
 }
