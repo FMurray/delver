@@ -12,7 +12,6 @@ mod viewer {
         current_page: usize,
         textures: Vec<egui::TextureHandle>,
         pdf_dimensions: Vec<(f32, f32)>,
-        transform_matrix: [f32; 6],
         scale_x: f32,
         scale_y: f32,
         x_offset: f32,
@@ -20,6 +19,8 @@ mod viewer {
         show_text: bool,
         show_lines: bool,
         show_blocks: bool,
+        zoom: f32,
+        pan: egui::Vec2,
     }
 
     impl DebugViewer {
@@ -31,8 +32,6 @@ mod viewer {
             // Get all pages' MediaBoxes
             let pages = doc.get_pages();
             let mut page_dimensions = Vec::new();
-            let mut m_cumulative_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-            let mut matrix_stack: Vec<[f32; 6]> = Vec::new();
 
             for (page_num, page_id) in pages.iter().take(1) {
                 let page_dict = doc.get_object(*page_id)?.as_dict()?;
@@ -110,21 +109,11 @@ mod viewer {
                 textures.push(texture);
             }
 
-            let mut initial_ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
-            for (page_num, page_id) in doc.get_pages().iter().take(1) {
-                let page_dict = doc.get_object(*page_id)?.as_dict()?;
-                initial_ctm = get_page_matrix(page_dict)?;
-            }
-
-            println!("initial_ctm: {:?}", initial_ctm);
-
             Ok(Self {
                 blocks: blocks.to_vec(),
                 current_page: 0,
                 textures,
                 pdf_dimensions: page_dimensions,
-                transform_matrix: initial_ctm, // Store the initial CTM
                 scale_x: 1.0,
                 scale_y: 1.0,
                 x_offset: 0.0,
@@ -132,6 +121,8 @@ mod viewer {
                 show_text: false,
                 show_lines: true,
                 show_blocks: true,
+                zoom: 1.0,
+                pan: egui::Vec2::ZERO,
             })
         }
     }
@@ -160,69 +151,119 @@ mod viewer {
                     ui.add(egui::Checkbox::new(&mut self.show_text, "Show Text"));
                     ui.add(egui::Checkbox::new(&mut self.show_lines, "Show Lines"));
                     ui.add(egui::Checkbox::new(&mut self.show_blocks, "Show Blocks"));
+                    if ui.button("Reset View").clicked() {
+                        self.zoom = 1.0;
+                        self.pan = egui::Vec2::ZERO;
+                    }
+                    ui.label(format!("Zoom: {:.2}x", self.zoom));
                 });
 
                 egui::ScrollArea::both().show(ui, |ui| {
                     if let Some(texture) = self.textures.get(self.current_page) {
                         let (pdf_width, pdf_height) = self.pdf_dimensions[self.current_page];
-                        println!("pdf_width: {}, pdf_height: {}", pdf_width, pdf_height);
-                        let size = egui::vec2(pdf_width, pdf_height);
+                        let size = egui::vec2(pdf_width, pdf_height) * self.zoom;
 
-                        let image = egui::Image::new(texture)
-                            .fit_to_exact_size(size)
-                            .sense(egui::Sense::click_and_drag());
-                        // .maintain_aspect_ratio(true);
+                        // Handle zoom and pan
+                        if ui.rect_contains_pointer(ui.max_rect()) {
+                            ui.input(|i| {
+                                // Handle zoom
+                                let zoom_factor = i.zoom_delta();
+                                if zoom_factor != 1.0 {
+                                    // Get mouse position relative to the image for zoom centering
+                                    if let Some(pointer_pos) = i.pointer.hover_pos() {
+                                        let old_zoom = self.zoom;
+                                        self.zoom = (self.zoom * zoom_factor).max(0.1).min(10.0);
 
-                        let response = ui.add(image);
+                                        // Adjust pan to keep the point under cursor fixed
+                                        if self.zoom != old_zoom {
+                                            let zoom_factor = self.zoom / old_zoom;
+                                            let pointer_delta = pointer_pos - self.pan;
+                                            self.pan = pointer_pos - pointer_delta * zoom_factor;
+                                        }
+                                    }
+                                }
 
-                        // Draw bounding boxes with different scale factors for debugging
+                                // Handle smooth scrolling for pan
+                                let scroll_delta = i.smooth_scroll_delta;
+                                if scroll_delta != egui::Vec2::ZERO {
+                                    self.pan += scroll_delta;
+                                }
+                            });
+                        }
+
+                        // Handle panning with mouse drag
+                        let response = ui.allocate_response(size, egui::Sense::drag());
+                        if response.dragged() {
+                            self.pan += response.drag_delta();
+                        }
+
+                        // Apply pan and zoom to the image position
+                        let image_rect =
+                            egui::Rect::from_min_size(response.rect.min + self.pan, size);
+
+                        // Draw the image
+                        let im_response = ui.painter().image(
+                            texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+
+                        let y_offset = image_rect.min.y;
+                        let x_offset = image_rect.min.x;
+
+                        // Draw bounding boxes
                         let painter = ui.painter();
-
                         for block in self.blocks.iter() {
                             if block.page_number as usize == self.current_page + 1 {
                                 for line in block.lines.iter() {
-                                    let displayed_rect = response.rect;
-
-                                    let rect = egui::Rect::from_points(&[
-                                        egui::pos2(line.bbox.0, line.bbox.1),
-                                        egui::pos2(line.bbox.2, line.bbox.3),
-                                    ]);
-                                    painter.rect_stroke(
-                                        rect,
-                                        0.0,
-                                        egui::Stroke::new(1.0, egui::Color32::RED),
-                                    );
-
                                     if self.show_lines {
+                                        let rect = egui::Rect {
+                                            min: egui::pos2(
+                                                x_offset + line.bbox.0 * self.zoom,
+                                                y_offset + line.bbox.1 * self.zoom,
+                                            ),
+                                            max: egui::pos2(
+                                                x_offset + line.bbox.2 * self.zoom,
+                                                y_offset + line.bbox.3 * self.zoom,
+                                            ),
+                                        };
+
                                         painter.rect_stroke(
                                             rect,
                                             0.0,
                                             egui::Stroke::new(1.0, egui::Color32::RED),
                                         );
-                                    }
 
-                                    let x1 = egui::pos2(block.bbox.0, block.bbox.1);
-                                    let x2 = egui::pos2(block.bbox.2, block.bbox.3);
-                                    let rect = egui::Rect::from_points(&[x1, x2]);
-
-                                    if self.show_blocks {
-                                        painter.rect_stroke(
-                                            rect,
-                                            0.0,
-                                            egui::Stroke::new(1.0, egui::Color32::BLUE),
-                                        );
+                                        if self.show_text {
+                                            painter.text(
+                                                rect.min,
+                                                egui::Align2::LEFT_TOP,
+                                                &line.text,
+                                                egui::FontId::monospace(8.0 * self.zoom),
+                                                egui::Color32::RED,
+                                            );
+                                        }
                                     }
+                                }
 
-                                    if self.show_text {
-                                        // Draw the text for debugging
-                                        painter.text(
-                                            rect.min,
-                                            egui::Align2::LEFT_TOP,
-                                            &format!("{} ({:.1}, {:.1})", &line.text, x1, x2),
-                                            egui::FontId::monospace(8.0),
-                                            egui::Color32::RED,
-                                        );
-                                    }
+                                if self.show_blocks {
+                                    let block_rect = egui::Rect {
+                                        min: egui::pos2(
+                                            x_offset + block.bbox.0 * self.zoom,
+                                            y_offset + block.bbox.1 * self.zoom,
+                                        ),
+                                        max: egui::pos2(
+                                            x_offset + block.bbox.2 * self.zoom,
+                                            y_offset + block.bbox.3 * self.zoom,
+                                        ),
+                                    };
+
+                                    painter.rect_stroke(
+                                        block_rect,
+                                        0.0,
+                                        egui::Stroke::new(1.0, egui::Color32::BLUE),
+                                    );
                                 }
                             }
                         }
@@ -253,94 +294,6 @@ mod viewer {
         )?;
 
         Ok(())
-    }
-
-    fn get_page_matrix(page_dict: &lopdf::Dictionary) -> Result<[f32; 6], Box<dyn Error>> {
-        let media_box = match page_dict.get(b"MediaBox") {
-            Ok(Object::Array(array)) => {
-                let values: Vec<f32> = array
-                    .iter()
-                    .map(|obj| match obj {
-                        Object::Integer(i) => *i as f32,
-                        Object::Real(f) => *f,
-                        _ => 0.0,
-                    })
-                    .collect();
-                if values.len() == 4 {
-                    (values[0], values[1], values[2], values[3])
-                } else {
-                    (0.0, 0.0, 612.0, 792.0) // Default Letter size
-                }
-            }
-            _ => (0.0, 0.0, 612.0, 792.0), // Default Letter size
-        };
-
-        // Get actual MediaBox dimensions including origin
-        let mb0 = media_box.0;
-        let mb1 = media_box.1;
-        let mb2 = media_box.2;
-        let mb3 = media_box.3;
-
-        let crop_box = match page_dict.get(b"CropBox") {
-            Ok(Object::Array(array)) => {
-                let values: Vec<f32> = array
-                    .iter()
-                    .map(|obj| match obj {
-                        Object::Integer(i) => *i as f32,
-                        Object::Real(f) => *f,
-                        _ => 0.0,
-                    })
-                    .collect();
-                if values.len() == 4 {
-                    (values[0], values[1], values[2], values[3])
-                } else {
-                    (0.0, 0.0, 612.0, 792.0) // Default Letter size
-                }
-            }
-            _ => (0.0, 0.0, 612.0, 792.0), // Default Letter size
-        };
-
-        // Get actual MediaBox dimensions including origin
-        let cb0 = crop_box.0;
-        let cb1 = crop_box.1;
-        let cb2 = crop_box.2;
-        let cb3 = crop_box.3;
-
-        let crop_rect = [cb0, cb1, cb2, cb3];
-
-        // Calculate transformation matrix that maps crop box to media box
-        let scale_x = (mb2 - mb0) / (cb2 - cb0);
-        let scale_y = (mb3 - mb1) / (cb3 - cb1);
-        let tx = mb0 - cb0 * scale_x;
-        let ty = mb1 - cb1 * scale_y;
-
-        Ok([scale_x, 0.0, 0.0, scale_y, tx, ty])
-    }
-
-    fn pdf_to_gui(
-        (pdf_x, pdf_y): (f32, f32),
-        pdf_width: f32,
-        pdf_height: f32,
-        scale_x: f32,
-        scale_y: f32,
-        offset_x: f32,
-        offset_y: f32,
-        initial_ctm: [f32; 6], // Add initial CTM parameter
-    ) -> (f32, f32) {
-        // Apply initial transformation matrix
-        let (x, y) = apply_transform_matrix(&initial_ctm, &[pdf_x, pdf_y]);
-
-        // Convert to GUI coordinates
-        let gui_x = offset_x + x * scale_x;
-        let gui_y = offset_y + (pdf_height - y) * scale_y;
-        (gui_x, gui_y)
-    }
-
-    pub fn apply_transform_matrix(matrix: &[f32; 6], point: &[f32; 2]) -> (f32, f32) {
-        // Apply the transformation matrix to the point
-        let x = matrix[0] * point[0] + matrix[1] * point[1] + matrix[4];
-        let y = matrix[2] * point[0] + matrix[3] * point[1] + matrix[5];
-        (x, y)
     }
 }
 

@@ -239,13 +239,27 @@ fn collect_text_glyphs(
                         0.0
                     };
 
-                    let transform = multiply_matrices(&ctm, &text_state.text_matrix);
+                    let ascent = if let Some(metrics) = text_state.current_font_metrics {
+                        (metrics.ascent as f32 / 1000.0) * text_state.font_size
+                    } else {
+                        0.0
+                    };
+
+                    println!("ascent: {}", ascent);
+
+                    println!("ctm: {:?}", ctm);
+                    println!("text_matrix: {:?}", text_state.text_matrix);
+                    println!("current_pos: {:?}", text_state.current_pos);
+
                     let (user_x, user_y) = transform_point(
                         &ctm,
                         &text_state.text_matrix,
                         text_state.current_pos.0,
                         text_state.current_pos.1 + text_state.rise,
                     );
+
+                    println!("user_x: {}", user_x);
+                    println!("user_y: {}", user_y);
 
                     if let Some(last_char) = text_state.text_buffer.chars().last() {
                         if !(last_char == ' ' && ch == ' ') {
@@ -260,12 +274,17 @@ fn collect_text_glyphs(
                     let glyph_w = advance;
                     let glyph_h = text_state.font_size;
 
+                    println!("glyph_w: {}", glyph_w);
+                    println!("glyph_h: {}", glyph_h);
+
                     text_state.glyphs.push(PositionedGlyph {
                         x_min: user_x,
-                        y_min: user_y - glyph_h,
+                        y_min: user_y + glyph_h,
                         x_max: user_x + glyph_w,
-                        y_max: user_y,
+                        y_max: user_y + glyph_h + ascent,
                     });
+
+                    println!("text state glyphs: {:?}", text_state.glyphs);
                 }
             }
             Object::Integer(i) => {
@@ -543,6 +562,7 @@ fn get_page_text_elements(
         }
     };
     let page_dict = doc.get_dictionary(page_id).unwrap();
+    println!("page_dict: {:?}", page_dict);
     let media_box = page_dict
         .get(b"MediaBox")
         .and_then(|obj| obj.as_array())
@@ -564,6 +584,9 @@ fn get_page_text_elements(
         .get(b"Rotate")
         .and_then(|obj| obj.as_i64())
         .unwrap_or(0);
+
+    println!("media_box: {:?}", media_box);
+    println!("page_rotation: {}", page_rotation);
 
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -592,6 +615,7 @@ fn get_page_text_elements(
         })
         .enumerate()
     {
+        // println!("op: {:?}", op);
         handle_operator(
             &mut gs_stack,
             &op,
@@ -727,9 +751,9 @@ pub fn group_text_into_lines_and_blocks(
     for (page_number, elements) in pages_map.into_iter() {
         let mut elements = elements.clone();
         elements.sort_by(|a, b| {
-            a.bbox
+            b.bbox
                 .1
-                .partial_cmp(&b.bbox.1)
+                .partial_cmp(&a.bbox.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
                     a.bbox
@@ -809,9 +833,8 @@ fn transform_point(ctm: &[f32; 6], text_matrix: &[f32; 6], x: f32, y: f32) -> (f
     let px = ctm[0] * tx + ctm[2] * ty + ctm[4];
     let py = ctm[1] * tx + ctm[3] * ty; // Note: omitting ctm[5] (772.5)
 
-    // Convert to device space by subtracting from CTM's Y translation and flip y axis
     let user_y = -(ctm[5] - (py + ctm[5]));
-
+    // Convert to device space by subtracting from CTM's Y translation
     (px, user_y)
 }
 
