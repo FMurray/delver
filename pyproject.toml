@@ -10,4 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "maturin[zig]>=1.8.1",
+    "pymupdf>=1.25.2",
 ]
+
+[tool.maturin]
+bindings = "cffi"

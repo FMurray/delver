@@ -1,11 +1,13 @@
 pub mod chunker;
 pub mod debug_viewer;
 pub mod dom;
+pub mod fonts;
 pub mod layout;
 pub mod logging;
 pub mod parse;
 
 use crate::dom::{parse_template, process_template_element};
+use crate::fonts::FontMetrics;
 use crate::parse::{get_pdf_text, group_text_into_lines_and_blocks};
 use logging::{PDF_TEXT_BLOCK, PDF_TEXT_OBJECT};
 use lopdf::Document;
@@ -36,11 +38,12 @@ pub fn process_pdf(
     let blocks =
         group_text_into_lines_and_blocks(&text_elements, line_join_threshold, block_join_threshold);
 
-    // Now `blocks` is a Vec<TextBlock> with grouped lines.
-    for block in blocks.iter().take(5) {
-        tracing::info!(target: PDF_TEXT_BLOCK, "Block bbox: {:?}", block.bbox);
+    // // Now `blocks` is a Vec<TextBlock> with grouped lines.
+    for block in blocks.iter() {
+        // tracing::info!(target: PDF_TEXT_BLOCK, "Block bbox: {:?}", block.bbox);
+        println!("Block bbox: {:?}", block.bbox);
         for line in &block.lines {
-            tracing::info!(target: PDF_TEXT_BLOCK, "Line bbox: {:?} text: {}", line.bbox, line.text);
+            println!("Line bbox: {:?} text: {}", line.bbox, line.text);
         }
     }
 

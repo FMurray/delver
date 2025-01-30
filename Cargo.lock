@@ -1071,6 +1071,7 @@ dependencies = [
  "egui_extras",
  "env_logger",
  "indexmap",
+ "lazy_static",
  "log",
  "lopdf",
  "nom",

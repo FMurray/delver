@@ -182,31 +182,11 @@ mod viewer {
                             if block.page_number as usize == self.current_page + 1 {
                                 for line in block.lines.iter() {
                                     let displayed_rect = response.rect;
-                                    let (x1, y1) = pdf_to_gui(
-                                        (line.bbox.0, line.bbox.1),
-                                        pdf_width,
-                                        pdf_height,
-                                        self.scale_x,
-                                        self.scale_y,
-                                        self.x_offset,
-                                        self.y_offset,
-                                        self.transform_matrix,
-                                    );
-                                    let (x2, y2) = pdf_to_gui(
-                                        (line.bbox.2, line.bbox.3),
-                                        pdf_width,
-                                        pdf_height,
-                                        self.scale_x,
-                                        self.scale_y,
-                                        self.x_offset,
-                                        self.y_offset,
-                                        self.transform_matrix,
-                                    );
-                                    println!("gui coords: {:?}", (x1, y1, x2, y2));
-                                    let rect = egui::Rect::from_min_max(
-                                        egui::pos2(x1, y1),
-                                        egui::pos2(x2, y2),
-                                    );
+
+                                    let rect = egui::Rect::from_points(&[
+                                        egui::pos2(line.bbox.0, line.bbox.1),
+                                        egui::pos2(line.bbox.2, line.bbox.3),
+                                    ]);
                                     painter.rect_stroke(
                                         rect,
                                         0.0,
@@ -221,32 +201,9 @@ mod viewer {
                                         );
                                     }
 
-                                    // draw block bounding box
-                                    let (x1, y1) = pdf_to_gui(
-                                        (block.bbox.0, block.bbox.1),
-                                        pdf_width,
-                                        pdf_height,
-                                        self.scale_x,
-                                        self.scale_y,
-                                        self.x_offset,
-                                        self.y_offset,
-                                        self.transform_matrix,
-                                    );
-                                    let (x2, y2) = pdf_to_gui(
-                                        (block.bbox.2, block.bbox.3),
-                                        pdf_width,
-                                        pdf_height,
-                                        self.scale_x,
-                                        self.scale_y,
-                                        self.x_offset,
-                                        self.y_offset,
-                                        self.transform_matrix,
-                                    );
-
-                                    let rect = egui::Rect::from_points(&[
-                                        egui::pos2(x1, y1),
-                                        egui::pos2(x2, y2),
-                                    ]);
+                                    let x1 = egui::pos2(block.bbox.0, block.bbox.1);
+                                    let x2 = egui::pos2(block.bbox.2, block.bbox.3);
+                                    let rect = egui::Rect::from_points(&[x1, x2]);
 
                                     if self.show_blocks {
                                         painter.rect_stroke(
@@ -261,7 +218,7 @@ mod viewer {
                                         painter.text(
                                             rect.min,
                                             egui::Align2::LEFT_TOP,
-                                            &format!("{} ({:.1}, {:.1})", &line.text, x1, y1),
+                                            &format!("{} ({:.1}, {:.1})", &line.text, x1, x2),
                                             egui::FontId::monospace(8.0),
                                             egui::Color32::RED,
                                         );
