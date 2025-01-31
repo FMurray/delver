@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::thread::current;
+use uuid::Uuid;
 
 use crate::layout::MatchContext;
 // use crate::layout::MatchContext;
@@ -13,7 +14,7 @@ use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
-use tracing::{error, event, trace, warn, Span};
+use tracing::{error, event, instrument, trace, warn, Span};
 
 #[cfg(feature = "async")]
 use tokio::runtime::Builder;
@@ -186,11 +187,25 @@ struct PositionedGlyph {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextElement {
+    pub id: Uuid,
     pub text: String,
     pub font_size: f32,
     pub font_name: Option<String>,
     pub bbox: (f32, f32, f32, f32),
     pub page_number: u32,
+}
+
+impl TextElement {
+    pub fn new(text: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            text,
+            font_size: 0.0,
+            font_name: None,
+            bbox: (0.0, 0.0, 0.0, 0.0),
+            page_number: 0,
+        }
+    }
 }
 
 impl fmt::Display for TextElement {
@@ -245,21 +260,12 @@ fn collect_text_glyphs(
                         0.0
                     };
 
-                    println!("ascent: {}", ascent);
-
-                    println!("ctm: {:?}", ctm);
-                    println!("text_matrix: {:?}", text_state.text_matrix);
-                    println!("current_pos: {:?}", text_state.current_pos);
-
                     let (user_x, user_y) = transform_point(
                         &ctm,
                         &text_state.text_matrix,
                         text_state.current_pos.0,
                         text_state.current_pos.1 + text_state.rise,
                     );
-
-                    println!("user_x: {}", user_x);
-                    println!("user_y: {}", user_y);
 
                     if let Some(last_char) = text_state.text_buffer.chars().last() {
                         if !(last_char == ' ' && ch == ' ') {
@@ -274,17 +280,12 @@ fn collect_text_glyphs(
                     let glyph_w = advance;
                     let glyph_h = text_state.font_size;
 
-                    println!("glyph_w: {}", glyph_w);
-                    println!("glyph_h: {}", glyph_h);
-
                     text_state.glyphs.push(PositionedGlyph {
                         x_min: user_x,
                         y_min: user_y + glyph_h,
                         x_max: user_x + glyph_w,
                         y_max: user_y + glyph_h + ascent,
                     });
-
-                    println!("text state glyphs: {:?}", text_state.glyphs);
                 }
             }
             Object::Integer(i) => {
@@ -310,9 +311,11 @@ fn collect_text_glyphs(
     Ok(())
 }
 
+#[tracing::instrument()]
 fn finalize_text_run(state: &TextState, page_number: u32) -> TextElement {
     if state.glyphs.is_empty() {
         return TextElement {
+            id: Uuid::new_v4(),
             text: String::new(),
             font_size: state.font_size,
             font_name: state.font_name.clone(),
@@ -335,13 +338,23 @@ fn finalize_text_run(state: &TextState, page_number: u32) -> TextElement {
 
     let text_run = state.text_buffer.clone();
 
-    TextElement {
+    let text_element = TextElement {
+        id: Uuid::new_v4(),
         text: text_run,
         font_size: state.font_size,
         font_name: state.font_name.clone(),
         bbox: (x_min, y_min, x_max, y_max),
         page_number,
-    }
+    };
+
+    tracing::debug!(
+        element_id = %text_element.id,
+        line_id = tracing::field::Empty,  // Will be filled when line is created
+        block_id = tracing::field::Empty, // Will be filled when block is created
+        "Created text element"
+    );
+
+    text_element
 }
 
 pub fn get_pdf_text(doc: &Document) -> Result<BTreeMap<u32, Vec<TextElement>>, Error> {
@@ -401,11 +414,19 @@ fn operand_as_u8(obj: &Object) -> u8 {
     }
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        operator = %op.operator,
+        params = ?op.operands,
+        in_text_object 
+    )
+)]
 fn handle_operator<'a>(
     gs_stack: &mut Vec<GraphicsState<'a>>,
     op: &lopdf::content::Operation,
     mut in_text_object: bool,
-    collected_text: &mut Vec<TextElement>,
+    text_elements: &mut Vec<TextElement>,
     page_number: u32,
     fonts: &BTreeMap<Vec<u8>, &Dictionary>,
     encodings: &'a BTreeMap<Vec<u8>, Encoding<'a>>,
@@ -418,7 +439,7 @@ fn handle_operator<'a>(
         "Q" => pop_graphics_state(gs_stack),
         "cm" => {
             let matrix = matrix_from_operands(op);
-            gs_stack.last_mut().unwrap().ctm = multiply_matrices(&matrix, &current_gs.ctm);
+            current_gs.ctm = multiply_matrices(&matrix, &current_gs.ctm);
         }
         "BT" => {
             in_text_object = true;
@@ -535,7 +556,7 @@ fn handle_operator<'a>(
                 )?;
 
                 let text_element = finalize_text_run(&current_gs.text_state, page_number);
-                collected_text.push(text_element);
+                text_elements.push(text_element);
 
                 current_gs.text_state.glyphs.clear();
                 current_gs.text_state.text_buffer.clear();
@@ -562,12 +583,11 @@ fn get_page_text_elements(
         }
     };
     let page_dict = doc.get_dictionary(page_id).unwrap();
-    println!("page_dict: {:?}", page_dict);
+
     let media_box = page_dict
         .get(b"MediaBox")
         .and_then(|obj| obj.as_array())
         .map(|arr| {
-            println!("arr: {:?}", arr);
             let mut media_box = [0.0; 4];
             for (i, obj) in arr.iter().take(4).enumerate() {
                 media_box[i] = match obj {
@@ -584,9 +604,6 @@ fn get_page_text_elements(
         .get(b"Rotate")
         .and_then(|obj| obj.as_i64())
         .unwrap_or(0);
-
-    println!("media_box: {:?}", media_box);
-    println!("page_rotation: {}", page_rotation);
 
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -615,7 +632,6 @@ fn get_page_text_elements(
         })
         .enumerate()
     {
-        // println!("op: {:?}", op);
         handle_operator(
             &mut gs_stack,
             &op,
@@ -667,6 +683,7 @@ pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
 /// Represents a single line of text on the page after grouping TextElements.
 #[derive(Debug, Clone)]
 pub struct TextLine {
+    pub id: Uuid,
     pub text: String,
     pub page_number: u32,
     pub elements: Vec<TextElement>,
@@ -675,8 +692,9 @@ pub struct TextLine {
 }
 
 impl TextLine {
-    /// Construct a TextLine from a set of TextElement-sorted by their x position.
+    #[instrument(skip_all)]
     pub fn from_elements(page_number: u32, items: Vec<TextElement>) -> Self {
+        let id = Uuid::new_v4();
         let mut line_min_x = f32::MAX;
         let mut line_min_y = f32::MAX;
         let mut line_max_x = f32::MIN;
@@ -696,18 +714,38 @@ impl TextLine {
             combined_text.push_str(&it.text);
         }
 
-        TextLine {
+        let line = TextLine {
+            id,
             text: combined_text,
-            bbox: (line_min_x, line_min_y, line_max_x, line_max_y),
-            elements: items,
             page_number,
+            elements: items,
+            bbox: (line_min_x, line_min_y, line_max_x, line_max_y),
+        };
+
+        tracing::debug!(
+            line_id = %line.id,
+            block_id = tracing::field::Empty,
+            "Created text line with {} elements",
+            line.elements.len()
+        );
+        
+        // After creating the line, log each element with line context
+        for element in &line.elements {
+            tracing::debug!(
+                element_id = %element.id,
+                line_id = %line.id,
+                "Element added to line"
+            );
         }
+        
+        line
     }
 }
 
 /// Represents a "block" of consecutive lines that are close in vertical spacing.
 #[derive(Debug, Clone)]
 pub struct TextBlock {
+    pub id: Uuid,
     pub page_number: u32,
     pub lines: Vec<TextLine>,
     /// A bounding box for the entire block (x_min, y_min, x_max, y_max).
@@ -716,6 +754,7 @@ pub struct TextBlock {
 
 impl TextBlock {
     pub fn from_lines(page_number: u32, lines: Vec<TextLine>) -> Self {
+        let id = Uuid::new_v4();
         let (x_min, y_min, x_max, y_max) = lines.iter().fold(
             (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
             |(xmin, ymin, xmax, ymax), line| {
@@ -728,13 +767,23 @@ impl TextBlock {
             },
         );
 
-        TextBlock {
+        let block = Self {
+            id: id,
             page_number,
             lines,
             bbox: (x_min, y_min, x_max, y_max),
-        }
+        };
+        
+        tracing::debug!(
+            block_id = %block.id,
+            "Created text block with {} lines",
+            block.lines.len()
+        );
+
+        block
     }
 }
+
 
 /// Example grouping function that demonstrates how to:
 /// 1) Separate text by page

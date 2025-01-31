@@ -1,26 +1,29 @@
 #[cfg(feature = "debug-viewer")]
 mod viewer {
     use super::*;
-    use crate::parse::{multiply_matrices, TextBlock};
+    use crate::{
+        logging::DebugDataStore,
+        parse::{multiply_matrices, TextBlock, TextLine},
+    };
     use eframe::egui;
     use lopdf::{Document, Object};
     use pdfium_render::prelude::*;
     use std::error::Error;
+    use uuid::Uuid;
 
     pub struct DebugViewer {
         blocks: Vec<TextBlock>,
         current_page: usize,
         textures: Vec<egui::TextureHandle>,
         pdf_dimensions: Vec<(f32, f32)>,
-        scale_x: f32,
-        scale_y: f32,
-        x_offset: f32,
-        y_offset: f32,
         show_text: bool,
         show_lines: bool,
         show_blocks: bool,
         zoom: f32,
         pan: egui::Vec2,
+        debug_data: crate::logging::DebugDataStore,
+        selected_bbox: Option<(f32, f32, f32, f32)>,
+        selected_line: Option<Uuid>,
     }
 
     impl DebugViewer {
@@ -28,6 +31,7 @@ mod viewer {
             ctx: &eframe::egui::Context,
             doc: &Document,
             blocks: &[TextBlock],
+            debug_store: crate::logging::DebugDataStore,
         ) -> Result<Self, Box<dyn Error>> {
             // Get all pages' MediaBoxes
             let pages = doc.get_pages();
@@ -114,15 +118,14 @@ mod viewer {
                 current_page: 0,
                 textures,
                 pdf_dimensions: page_dimensions,
-                scale_x: 1.0,
-                scale_y: 1.0,
-                x_offset: 0.0,
-                y_offset: 0.0,
                 show_text: false,
                 show_lines: true,
                 show_blocks: true,
                 zoom: 1.0,
                 pan: egui::Vec2::ZERO,
+                debug_data: debug_store,
+                selected_bbox: None,
+                selected_line: None,
             })
         }
     }
@@ -142,12 +145,6 @@ mod viewer {
                     if ui.button("Next").clicked() && self.current_page < self.textures.len() - 1 {
                         self.current_page += 1;
                     }
-                    ui.add(egui::Slider::new(&mut self.scale_x, 0.1..=1.5).text("Scale X"));
-                    ui.add(egui::Slider::new(&mut self.scale_y, 0.1..=1.5).text("Scale Y"));
-                    ui.add(egui::Slider::new(&mut self.x_offset, -100.0..=500.0).text("X Offset"));
-                    ui.add(
-                        egui::Slider::new(&mut self.y_offset, -2000.0..=2000.0).text("Y Offset"),
-                    );
                     ui.add(egui::Checkbox::new(&mut self.show_text, "Show Text"));
                     ui.add(egui::Checkbox::new(&mut self.show_lines, "Show Lines"));
                     ui.add(egui::Checkbox::new(&mut self.show_blocks, "Show Blocks"));
@@ -229,6 +226,21 @@ mod viewer {
                                             ),
                                         };
 
+                                        let line_id = ui.make_persistent_id((
+                                            line.page_number,
+                                            line.bbox.0.to_bits(),
+                                            line.bbox.1.to_bits(),
+                                            line.bbox.2.to_bits(),
+                                            line.bbox.3.to_bits(),
+                                        ));
+
+                                        let response =
+                                            ui.interact(rect, line_id, egui::Sense::click());
+
+                                        if response.clicked() {
+                                            self.selected_line = Some(line.id);
+                                        }
+
                                         painter.rect_stroke(
                                             rect,
                                             0.0,
@@ -267,13 +279,30 @@ mod viewer {
                                 }
                             }
                         }
+
+                        if let Some(line_id) = self.selected_line {
+                            if let Some(line) = find_line_by_id(&self.blocks, line_id) {
+                                let events = self.debug_data.get_events_for_line(line.id);
+                                egui::Window::new("Line Construction Details").show(ctx, |ui| {
+                                    ui.label(format!("Line BBox: {:?}", line.bbox));
+                                    ui.separator();
+                                    for event in events {
+                                        ui.label(event);
+                                    }
+                                });
+                            }
+                        }
                     }
                 });
             });
         }
     }
 
-    pub fn launch_viewer(doc: &Document, blocks: &[TextBlock]) -> Result<(), Box<dyn Error>> {
+    pub fn launch_viewer(
+        doc: &Document,
+        blocks: &[TextBlock],
+        debug_store: DebugDataStore,
+    ) -> Result<(), Box<dyn Error>> {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([800.0, 1000.0])
@@ -288,7 +317,8 @@ mod viewer {
                 // Install image loaders
                 egui_extras::install_image_loaders(&cc.egui_ctx);
 
-                let viewer = DebugViewer::new(&cc.egui_ctx, doc, blocks).unwrap();
+                // let debug_store = crate::logging::DebugDataStore::default();
+                let viewer = DebugViewer::new(&cc.egui_ctx, doc, blocks, debug_store).unwrap();
                 Ok(Box::new(viewer) as Box<dyn eframe::App>)
             }),
         )?;
@@ -297,5 +327,15 @@ mod viewer {
     }
 }
 
+use uuid::Uuid;
 #[cfg(feature = "debug-viewer")]
 pub use viewer::*;
+
+use crate::parse::{TextBlock, TextLine};
+
+fn find_line_by_id(blocks: &[TextBlock], line_id: Uuid) -> Option<&TextLine> {
+    blocks
+        .iter()
+        .flat_map(|b| &b.lines)
+        .find(|l| l.id == line_id)
+}

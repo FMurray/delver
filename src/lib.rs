@@ -11,6 +11,7 @@ use crate::fonts::FontMetrics;
 use crate::parse::{get_pdf_text, group_text_into_lines_and_blocks};
 use logging::{PDF_TEXT_BLOCK, PDF_TEXT_OBJECT};
 use lopdf::Document;
+use parse::TextBlock;
 use std::collections::HashMap;
 use tracing::event;
 
@@ -28,7 +29,7 @@ use pyo3::prelude::*;
 pub fn process_pdf(
     pdf_bytes: &[u8],
     template_str: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(Document, Vec<TextBlock>), Box<dyn std::error::Error>> {
     // let dom = parse_template(template_str)?;
     let doc = Document::load_mem(pdf_bytes)?;
     let text_elements = get_pdf_text(&doc)?;
@@ -37,18 +38,6 @@ pub fn process_pdf(
     let block_join_threshold = 12.0; // Example threshold in PDF units
     let blocks =
         group_text_into_lines_and_blocks(&text_elements, line_join_threshold, block_join_threshold);
-
-    // // Now `blocks` is a Vec<TextBlock> with grouped lines.
-    for block in blocks.iter() {
-        // tracing::info!(target: PDF_TEXT_BLOCK, "Block bbox: {:?}", block.bbox);
-        println!("Block bbox: {:?}", block.bbox);
-        for line in &block.lines {
-            println!("Line bbox: {:?} text: {}", line.bbox, line.text);
-        }
-    }
-
-    #[cfg(feature = "debug-viewer")]
-    debug_viewer::launch_viewer(&doc, &blocks)?;
 
     // let mut all_chunks = Vec::new();
 
@@ -66,7 +55,7 @@ pub fn process_pdf(
     // // Convert chunks to JSON
     // let json = serde_json::to_string_pretty(&all_chunks)?;
     // Ok(json)
-    Ok("done".to_string())
+    Ok((doc, blocks))
 }
 
 /// Process a PDF file using a template and return extracted data as JSON

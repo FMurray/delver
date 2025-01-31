@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use delver_pdf::process_pdf;
+use delver_pdf::logging::{init_debug_logging, DebugDataStore};
+use delver_pdf::{debug_viewer, process_pdf};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -51,12 +52,8 @@ impl Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse_args();
 
-    // Initialize logging with optional custom directory and keep the guard alive
-    let _guard = if let Some(log_dir) = args.log_dir {
-        delver_pdf::logging::init_logging_with_dir(args.debug_ops, log_dir)
-    } else {
-        delver_pdf::logging::init_logging(args.debug_ops)
-    };
+    let debug_store = DebugDataStore::default();
+    let _guard = init_debug_logging(debug_store.clone());
 
     // Read the PDF file
     let pdf_bytes = fs::read(&args.pdf_path)?;
@@ -65,7 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let template_str = fs::read_to_string(&args.template)?;
 
     // Process the PDF
-    let json = process_pdf(&pdf_bytes, &template_str)?;
+    let (doc, blocks) = process_pdf(&pdf_bytes, &template_str)?;
+
+    #[cfg(feature = "debug-viewer")]
+    debug_viewer::launch_viewer(&doc, &blocks, debug_store)?;
 
     // // Output the results
     // match args.output {
