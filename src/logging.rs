@@ -47,45 +47,6 @@ const DEBUG_TARGETS: &[&str] = &[
     "delver_pdf::parse",
 ];
 
-// Create a custom formatter for text object events
-struct TextObjectFormatter;
-
-impl<S, N> FormatEvent<S, N> for TextObjectFormatter
-where
-    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    N: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, N>,
-        mut writer: format::Writer<'_>,
-        event: &Event<'_>,
-    ) -> fmt::Result {
-        let metadata = event.metadata();
-
-        println!("metadata: {:?}", metadata);
-
-        if event.metadata().is_span() {
-            write!(&mut writer, "{} {}: ", metadata.level(), metadata.target())?;
-        }
-
-        if let Some(scope) = ctx.event_scope() {
-            for span in scope.from_root() {
-                let ext = span.extensions();
-                let fields = &ext
-                    .get::<FormattedFields<N>>()
-                    .expect("will never be `None`");
-                write!(writer, "{}", fields)?;
-            }
-        }
-
-        // Format the actual event message
-        ctx.field_format().format_fields(writer.by_ref(), event)?;
-
-        writeln!(writer)
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct DebugDataStore {
     message_arena: Arc<Mutex<Vec<String>>>, // Single source of truth for messages
@@ -95,17 +56,31 @@ pub struct DebugDataStore {
 }
 
 impl DebugDataStore {
+    pub fn update_event_line_id(&self, element_id: Uuid, line_id: Uuid) {
+        let elements = self.elements.lock().unwrap();
+        let mut lines = self.lines.lock().unwrap();
+        let mut events = self.events.lock().unwrap();
+
+        if let Some(&event_idx) = elements.get(&element_id) {
+            // Update the line's event list
+            let line_entry = lines
+                .entry(line_id)
+                .or_insert_with(|| (Uuid::new_v4(), Vec::new()));
+            line_entry.1.push(event_idx);
+
+            // Update the event's line association
+            if let Some(event_indices) = events.get_mut(&line_id) {
+                event_indices.push(event_idx);
+            } else {
+                events.insert(line_id, vec![event_idx]);
+            }
+        }
+    }
+
     fn record_element(&self, element_id: Uuid, line_id: Uuid, message: String) {
         let mut arena = self.message_arena.lock().unwrap();
         let idx = arena.len();
         arena.push(message.clone()); // Clone only for logging
-
-        println!(
-            "[STORE] Recording element {} for line {}",
-            element_id, line_id
-        );
-        println!("  Message index: {}", idx);
-        println!("  Message content: {}", message);
 
         let mut elements = self.elements.lock().unwrap();
         let mut lines = self.lines.lock().unwrap();
@@ -118,35 +93,18 @@ impl DebugDataStore {
             .1
             .push(idx);
         events.entry(line_id).or_default().push(idx);
-
-        println!("[STORE] Current state:");
-        println!("  Total messages: {}", arena.len());
-        println!("  Lines registered: {}", lines.len());
-        println!(
-            "  Events per line: {:#?}",
-            events.iter().map(|(k, v)| (k, v.len())).collect::<Vec<_>>()
-        );
     }
 
     pub fn get_events_for_line(&self, line_id: Uuid) -> Vec<String> {
-        println!("[STORE] Retrieving events for line {}", line_id);
-
         let arena = self.message_arena.lock().unwrap();
         let events = self.events.lock().unwrap();
-
-        println!("  Found event indices: {:?}", events.get(&line_id));
 
         events
             .get(&line_id)
             .map(|indices| {
                 indices
                     .iter()
-                    .filter_map(|&idx| {
-                        arena.get(idx).map(|msg| {
-                            println!("  Retrieving index {}: {}", idx, msg);
-                            msg.clone()
-                        })
-                    })
+                    .filter_map(|&idx| arena.get(idx).map(|msg| msg.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -184,6 +142,19 @@ where
 
         attrs.record(&mut visitor);
         extensions.insert(data);
+
+        // Automatically update line relationships
+        if let (Some(element_id), Some(line_id)) = (data.element_id, data.line_id) {
+            self.store.update_event_line_id(element_id, line_id);
+        } else if let Some(line_id) = data.line_id {
+            // Register empty line upfront
+            self.store
+                .lines
+                .lock()
+                .unwrap()
+                .entry(line_id)
+                .or_insert_with(|| (Uuid::new_v4(), Vec::new()));
+        }
     }
 
     fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
@@ -207,15 +178,11 @@ where
             }
         }
 
-        // Record partial matches for debugging
-        println!(
-            "[DEBUG LAYER] Event captured - element: {:?}, line: {:?}",
-            visitor.element_id, visitor.line_id
-        );
+        // Capture operator data from the event message
+        let mut message = String::new();
+        event.record(&mut MessageVisitor(&mut message));
 
         if let (Some(element_id), Some(line_id)) = (*visitor.element_id, *visitor.line_id) {
-            let mut message = String::new();
-            event.record(&mut MessageVisitor(&mut message));
             self.store.record_element(element_id, line_id, message);
         }
     }
@@ -246,6 +213,8 @@ struct MessageVisitor<'a>(&'a mut String);
 
 impl tracing::field::Visit for MessageVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        println!("field: {:?}", field);
+        println!("value: {:?}", value);
         write!(self.0, "{} = {:?}; ", field.name(), value).unwrap();
     }
 }
@@ -323,56 +292,4 @@ impl tracing::field::Visit for SpanContextExtractor {
 
 pub fn init_logging(debug_ops: bool, store: DebugDataStore) -> WorkerGuard {
     init_debug_logging(store)
-}
-
-pub fn init_logging_with_dir(debug_ops: bool, log_dir: PathBuf) -> (WorkerGuard) {
-    // Create directories if they don't exist
-    std::fs::create_dir_all(&log_dir).expect("Failed to create log directory");
-
-    let file_appender = RollingFileAppender::new(Rotation::NEVER, log_dir, "pdf-debug-ops.log");
-
-    // Create the file writing layer for debug operations
-    let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
-    // let file_layer = tracing_subscriber::fmt::layer()
-    //     .with_target(true)
-    //     .with_thread_ids(true)
-    //     .with_file(true)
-    //     .with_line_number(true)
-    //     .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE | FmtSpan::ENTER | FmtSpan::EXIT)
-    //     .with_writer(non_blocking_appender)
-    //     .with_filter(EnvFilter::new(format!(
-    //         "{}={},{}={}",
-    //         PDF_OPERATIONS,
-    //         if debug_ops { "debug" } else { "info" },
-    //         PDF_TEXT_OBJECT,
-    //         if debug_ops { "trace" } else { "info" }
-    //     )));
-
-    let text_object_layer = tracing_subscriber::fmt::layer()
-        .event_format(TextObjectFormatter)
-        .with_writer(non_blocking_appender.clone())
-        .with_filter(EnvFilter::new(format!("{}=debug", PDF_TEXT_OBJECT)));
-
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE | FmtSpan::ENTER | FmtSpan::EXIT)
-        .with_filter(
-            EnvFilter::from_default_env()
-                .add_directive(Level::INFO.into())
-                .add_directive(format!("{}=info", PDF_PARSING).parse().unwrap())
-                .add_directive(format!("{}=info", PDF_FONTS).parse().unwrap()),
-        );
-
-    INIT.call_once(|| {
-        tracing_subscriber::registry()
-            // .with(file_layer)
-            .with(text_object_layer)
-            .with(stdout_layer)
-            .init();
-    });
-
-    guard
 }

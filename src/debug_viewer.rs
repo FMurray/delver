@@ -6,8 +6,10 @@ mod viewer {
         parse::{multiply_matrices, TextBlock, TextLine},
     };
     use eframe::egui;
+    use eframe::egui::{CollapsingHeader, ScrollArea};
     use lopdf::{Document, Object};
     use pdfium_render::prelude::*;
+    use std::collections::HashSet;
     use std::error::Error;
     use uuid::Uuid;
 
@@ -19,11 +21,15 @@ mod viewer {
         show_text: bool,
         show_lines: bool,
         show_blocks: bool,
+        show_grid: bool,
+        grid_spacing: f32,
         zoom: f32,
         pan: egui::Vec2,
         debug_data: crate::logging::DebugDataStore,
         selected_bbox: Option<(f32, f32, f32, f32)>,
         selected_line: Option<Uuid>,
+        selected_fields: HashSet<String>,
+        show_tree_view: bool,
     }
 
     impl DebugViewer {
@@ -118,14 +124,23 @@ mod viewer {
                 current_page: 0,
                 textures,
                 pdf_dimensions: page_dimensions,
-                show_text: false,
+                show_text: true,
                 show_lines: true,
                 show_blocks: true,
+                show_grid: false,
+                grid_spacing: 10.0,
                 zoom: 1.0,
                 pan: egui::Vec2::ZERO,
                 debug_data: debug_store,
                 selected_bbox: None,
                 selected_line: None,
+                selected_fields: HashSet::from_iter(vec![
+                    "message".into(),
+                    "element_id".into(),
+                    "line_id".into(),
+                    "element".into(),
+                ]),
+                show_tree_view: false,
             })
         }
     }
@@ -148,6 +163,7 @@ mod viewer {
                     ui.add(egui::Checkbox::new(&mut self.show_text, "Show Text"));
                     ui.add(egui::Checkbox::new(&mut self.show_lines, "Show Lines"));
                     ui.add(egui::Checkbox::new(&mut self.show_blocks, "Show Blocks"));
+                    ui.add(egui::Checkbox::new(&mut self.show_grid, "Show Grid"));
                     if ui.button("Reset View").clicked() {
                         self.zoom = 1.0;
                         self.pan = egui::Vec2::ZERO;
@@ -155,145 +171,258 @@ mod viewer {
                     ui.label(format!("Zoom: {:.2}x", self.zoom));
                 });
 
-                egui::ScrollArea::both().show(ui, |ui| {
-                    if let Some(texture) = self.textures.get(self.current_page) {
-                        let (pdf_width, pdf_height) = self.pdf_dimensions[self.current_page];
-                        let size = egui::vec2(pdf_width, pdf_height) * self.zoom;
-
-                        // Handle zoom and pan
-                        if ui.rect_contains_pointer(ui.max_rect()) {
-                            ui.input(|i| {
-                                // Handle zoom
-                                let zoom_factor = i.zoom_delta();
-                                if zoom_factor != 1.0 {
-                                    // Get mouse position relative to the image for zoom centering
-                                    if let Some(pointer_pos) = i.pointer.hover_pos() {
-                                        let old_zoom = self.zoom;
-                                        self.zoom = (self.zoom * zoom_factor).max(0.1).min(10.0);
-
-                                        // Adjust pan to keep the point under cursor fixed
-                                        if self.zoom != old_zoom {
-                                            let zoom_factor = self.zoom / old_zoom;
-                                            let pointer_delta = pointer_pos - self.pan;
-                                            self.pan = pointer_pos - pointer_delta * zoom_factor;
-                                        }
-                                    }
-                                }
-
-                                // Handle smooth scrolling for pan
-                                let scroll_delta = i.smooth_scroll_delta;
-                                if scroll_delta != egui::Vec2::ZERO {
-                                    self.pan += scroll_delta;
-                                }
-                            });
-                        }
-
-                        // Handle panning with mouse drag
-                        let response = ui.allocate_response(size, egui::Sense::drag());
-                        if response.dragged() {
-                            self.pan += response.drag_delta();
-                        }
-
-                        // Apply pan and zoom to the image position
-                        let image_rect =
-                            egui::Rect::from_min_size(response.rect.min + self.pan, size);
-
-                        // Draw the image
-                        let im_response = ui.painter().image(
-                            texture.id(),
-                            image_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-
-                        let y_offset = image_rect.min.y;
-                        let x_offset = image_rect.min.x;
-
-                        // Draw bounding boxes
-                        let painter = ui.painter();
-                        for block in self.blocks.iter() {
-                            if block.page_number as usize == self.current_page + 1 {
-                                for line in block.lines.iter() {
-                                    if self.show_lines {
-                                        let rect = egui::Rect {
-                                            min: egui::pos2(
-                                                x_offset + line.bbox.0 * self.zoom,
-                                                y_offset + line.bbox.1 * self.zoom,
-                                            ),
-                                            max: egui::pos2(
-                                                x_offset + line.bbox.2 * self.zoom,
-                                                y_offset + line.bbox.3 * self.zoom,
-                                            ),
-                                        };
-
-                                        let line_id = ui.make_persistent_id((
-                                            line.page_number,
-                                            line.bbox.0.to_bits(),
-                                            line.bbox.1.to_bits(),
-                                            line.bbox.2.to_bits(),
-                                            line.bbox.3.to_bits(),
-                                        ));
-
-                                        let response =
-                                            ui.interact(rect, line_id, egui::Sense::click());
-
-                                        if response.clicked() {
-                                            self.selected_line = Some(line.id);
-                                        }
-
-                                        painter.rect_stroke(
-                                            rect,
-                                            0.0,
-                                            egui::Stroke::new(1.0, egui::Color32::RED),
-                                        );
-
-                                        if self.show_text {
-                                            painter.text(
-                                                rect.min,
-                                                egui::Align2::LEFT_TOP,
-                                                &line.text,
-                                                egui::FontId::monospace(8.0 * self.zoom),
-                                                egui::Color32::RED,
-                                            );
-                                        }
-                                    }
-                                }
-
-                                if self.show_blocks {
-                                    let block_rect = egui::Rect {
-                                        min: egui::pos2(
-                                            x_offset + block.bbox.0 * self.zoom,
-                                            y_offset + block.bbox.1 * self.zoom,
-                                        ),
-                                        max: egui::pos2(
-                                            x_offset + block.bbox.2 * self.zoom,
-                                            y_offset + block.bbox.3 * self.zoom,
-                                        ),
-                                    };
-
-                                    painter.rect_stroke(
-                                        block_rect,
-                                        0.0,
-                                        egui::Stroke::new(1.0, egui::Color32::BLUE),
-                                    );
-                                }
-                            }
-                        }
-
-                        if let Some(line_id) = self.selected_line {
-                            if let Some(line) = find_line_by_id(&self.blocks, line_id) {
-                                let events = self.debug_data.get_events_for_line(line.id);
-                                egui::Window::new("Line Construction Details").show(ctx, |ui| {
-                                    ui.label(format!("Line BBox: {:?}", line.bbox));
-                                    ui.separator();
-                                    for event in events {
-                                        ui.label(event);
-                                    }
-                                });
+                // Add field selection toolbar
+                ui.horizontal(|ui| {
+                    ui.label("Show fields:");
+                    let fields = ["message", "element_id", "line_id", "element"];
+                    for field in fields {
+                        let mut checked = self.selected_fields.contains(field);
+                        if ui.checkbox(&mut checked, field).changed() {
+                            if checked {
+                                self.selected_fields.insert(field.into());
+                            } else {
+                                self.selected_fields.remove(field);
                             }
                         }
                     }
                 });
+
+                // PDF Page Scroll Area with persistent ID
+                egui::ScrollArea::both()
+                    .id_salt("pdf_page_scroll_area")
+                    .show(ui, |ui| {
+                        if let Some(texture) = self.textures.get(self.current_page) {
+                            let (pdf_width, pdf_height) = self.pdf_dimensions[self.current_page];
+                            let size = egui::vec2(pdf_width, pdf_height) * self.zoom;
+
+                            // Handle zoom and pan
+                            if ui.rect_contains_pointer(ui.max_rect()) {
+                                ui.input(|i| {
+                                    // Handle zoom
+                                    let zoom_factor = i.zoom_delta();
+                                    if zoom_factor != 1.0 {
+                                        // Get mouse position relative to the image for zoom centering
+                                        if let Some(pointer_pos) = i.pointer.hover_pos() {
+                                            let old_zoom = self.zoom;
+                                            self.zoom =
+                                                (self.zoom * zoom_factor).max(0.1).min(10.0);
+
+                                            // Adjust pan to keep the point under cursor fixed
+                                            if self.zoom != old_zoom {
+                                                let zoom_factor = self.zoom / old_zoom;
+                                                let pointer_delta = pointer_pos - self.pan;
+                                                self.pan =
+                                                    pointer_pos - pointer_delta * zoom_factor;
+                                            }
+                                        }
+                                    }
+
+                                    // Handle smooth scrolling for pan
+                                    let scroll_delta = i.smooth_scroll_delta;
+                                    if scroll_delta != egui::Vec2::ZERO {
+                                        self.pan += scroll_delta;
+                                    }
+                                });
+                            }
+
+                            // Handle panning with mouse drag
+                            let response = ui.allocate_response(size, egui::Sense::drag());
+                            if response.dragged() {
+                                self.pan += response.drag_delta();
+                            }
+
+                            // Apply pan and zoom to the image position
+                            let image_rect =
+                                egui::Rect::from_min_size(response.rect.min + self.pan, size);
+
+                            // Draw the image
+                            let im_response = ui.painter().image(
+                                texture.id(),
+                                image_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+
+                            let y_offset = image_rect.min.y;
+                            let x_offset = image_rect.min.x;
+
+                            // Draw grid if enabled
+                            if self.show_grid {
+                                let spacing = self.grid_spacing * self.zoom;
+
+                                // Draw vertical lines
+                                for x in
+                                    (0..(pdf_width * self.zoom) as i32).step_by(spacing as usize)
+                                {
+                                    let x = x as f32;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x_offset + x, y_offset),
+                                            egui::pos2(
+                                                x_offset + x,
+                                                y_offset + pdf_height * self.zoom,
+                                            ),
+                                        ],
+                                        egui::Stroke::new(0.5, egui::Color32::GRAY),
+                                    );
+                                }
+
+                                // Draw horizontal lines
+                                for y in
+                                    (0..(pdf_height * self.zoom) as i32).step_by(spacing as usize)
+                                {
+                                    let y = y as f32;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x_offset, y_offset + y),
+                                            egui::pos2(
+                                                x_offset + pdf_width * self.zoom,
+                                                y_offset + y,
+                                            ),
+                                        ],
+                                        egui::Stroke::new(0.5, egui::Color32::GRAY),
+                                    );
+                                }
+                            }
+
+                            // Draw bounding boxes
+                            let painter = ui.painter();
+                            for block in self.blocks.iter() {
+                                if block.page_number as usize == self.current_page + 1 {
+                                    for line in block.lines.iter() {
+                                        if self.show_lines {
+                                            let rect = egui::Rect {
+                                                min: egui::pos2(
+                                                    x_offset + line.bbox.0 * self.zoom,
+                                                    y_offset + line.bbox.1 * self.zoom,
+                                                ),
+                                                max: egui::pos2(
+                                                    x_offset + line.bbox.2 * self.zoom,
+                                                    y_offset + line.bbox.3 * self.zoom,
+                                                ),
+                                            };
+
+                                            let line_id = ui.make_persistent_id((
+                                                line.page_number,
+                                                line.bbox.0.to_bits(),
+                                                line.bbox.1.to_bits(),
+                                                line.bbox.2.to_bits(),
+                                                line.bbox.3.to_bits(),
+                                            ));
+
+                                            let response =
+                                                ui.interact(rect, line_id, egui::Sense::click());
+
+                                            if response.clicked() {
+                                                self.selected_line = Some(line.id);
+                                            }
+
+                                            painter.rect_stroke(
+                                                rect,
+                                                0.0,
+                                                egui::Stroke::new(1.0, egui::Color32::RED),
+                                            );
+
+                                            if self.show_text {
+                                                painter.text(
+                                                    rect.min,
+                                                    egui::Align2::LEFT_TOP,
+                                                    &line.text,
+                                                    egui::FontId::monospace(8.0 * self.zoom),
+                                                    egui::Color32::RED,
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    if self.show_blocks {
+                                        let block_rect = egui::Rect {
+                                            min: egui::pos2(
+                                                x_offset + block.bbox.0 * self.zoom,
+                                                y_offset + block.bbox.1 * self.zoom,
+                                            ),
+                                            max: egui::pos2(
+                                                x_offset + block.bbox.2 * self.zoom,
+                                                y_offset + block.bbox.3 * self.zoom,
+                                            ),
+                                        };
+
+                                        painter.rect_stroke(
+                                            block_rect,
+                                            0.0,
+                                            egui::Stroke::new(1.0, egui::Color32::BLUE),
+                                        );
+                                    }
+                                }
+                            }
+
+                            if let Some(line_id) = self.selected_line {
+                                if let Some(line) = find_line_by_id(&self.blocks, line_id) {
+                                    let events = self.debug_data.get_events_for_line(line.id);
+                                    egui::Window::new("Line Construction Details").show(
+                                        ctx,
+                                        |ui| {
+                                            ui.label(format!("Line BBox: {:?}", line.bbox));
+                                            ui.separator();
+                                            for (index, event) in events.iter().enumerate() {
+                                                CollapsingHeader::new(format!(
+                                                    "Event {}",
+                                                    index + 1
+                                                ))
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    // Parse event string to filter fields
+                                                    let parts: Vec<&str> =
+                                                        event.split("; ").collect();
+                                                    for part in parts {
+                                                        if let Some((field_name, value)) =
+                                                            part.split_once(" = ")
+                                                        {
+                                                            if self
+                                                                .selected_fields
+                                                                .contains(field_name)
+                                                            {
+                                                                ui.label(field_name);
+                                                                ui.label(value);
+                                                            }
+                                                        } else {
+                                                            // Display parts without " = " as is (e.g., "Begin text object")
+                                                            ui.label(part);
+                                                        }
+                                                        ui.end_row();
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                if self.show_tree_view {
+                    // Tree View Scroll Area with persistent ID
+                    ScrollArea::vertical()
+                        .id_salt("tree_view_scroll_area")
+                        .show(ui, |ui| {
+                            for block in &self.blocks {
+                                CollapsingHeader::new(format!("Block {}", block.id))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for line in &block.lines {
+                                            CollapsingHeader::new(format!("Line {}", line.id))
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    ui.label("Test Content");
+                                                });
+                                        }
+                                    });
+                            }
+                        });
+                }
             });
         }
     }

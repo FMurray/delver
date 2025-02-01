@@ -119,7 +119,7 @@ impl<'a> Default for GraphicsState<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct TextState<'a> {
     text_matrix: [f32; 6],      // Tm
     text_line_matrix: [f32; 6], // Tlm
@@ -139,6 +139,7 @@ struct TextState<'a> {
     current_font_metrics: Option<&'static FontMetrics>,
     current_encoding: Option<&'a Encoding<'a>>,
     current_metrics: Option<&'static FontMetrics>,
+    operator_log: Vec<String>,
 }
 
 impl<'a> Default for TextState<'a> {
@@ -162,6 +163,7 @@ impl<'a> Default for TextState<'a> {
             current_font_metrics: None,
             current_encoding: None,
             current_metrics: None,
+            operator_log: Vec::new(),
         }
     }
 }
@@ -174,8 +176,23 @@ impl<'a> TextState<'a> {
         self.current_pos = (0.0, 0.0);
         self.glyphs.clear();
         self.text_buffer.clear();
+        self.operator_log.clear();
     }
 }
+
+impl<'a> fmt::Debug for TextState<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextState")
+            .field("text_matrix", &self.text_matrix)
+            .field("font_name", &self.font_name)
+            .field("font_size", &self.font_size)
+            .field("current_pos", &self.current_pos)
+            .field("current_font_metrics", &self.current_font_metrics.map(|m| (m.ascent, m.descent)))
+            .field("ctm", &self.text_matrix) // Assuming you have access to CTM via GraphicsState
+            .finish()
+    }
+}
+
 
 #[derive(Clone, Debug)]
 struct PositionedGlyph {
@@ -193,6 +210,7 @@ pub struct TextElement {
     pub font_name: Option<String>,
     pub bbox: (f32, f32, f32, f32),
     pub page_number: u32,
+    pub operators: Vec<String>,
 }
 
 impl TextElement {
@@ -204,6 +222,7 @@ impl TextElement {
             font_name: None,
             bbox: (0.0, 0.0, 0.0, 0.0),
             page_number: 0,
+            operators: Vec::new(),
         }
     }
 }
@@ -212,14 +231,12 @@ impl fmt::Display for TextElement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "\"{}\" {:?} {}pt{}",
+            "TextElement {{\n  text: \"{}\",\n  bbox: {:?},\n  font: {}pt{},\n  operators: [\n    {}\n  ]\n}}",
             self.text,
             self.bbox,
             self.font_size,
-            self.font_name
-                .as_ref()
-                .map(|n| format!(" {}", n))
-                .unwrap_or_default()
+            self.font_name.as_deref().unwrap_or("unknown"),
+            self.operators.join(",\n    ")
         )
     }
 }
@@ -321,6 +338,7 @@ fn finalize_text_run(state: &TextState, page_number: u32) -> TextElement {
             font_name: state.font_name.clone(),
             bbox: (0.0, 0.0, 0.0, 0.0),
             page_number,
+            operators: Vec::new(),
         };
     }
 
@@ -345,12 +363,14 @@ fn finalize_text_run(state: &TextState, page_number: u32) -> TextElement {
         font_name: state.font_name.clone(),
         bbox: (x_min, y_min, x_max, y_max),
         page_number,
+        operators: state.operator_log.clone(),
     };
 
     tracing::debug!(
         element_id = %text_element.id,
-        line_id = tracing::field::Empty,  // Will be filled when line is created
-        block_id = tracing::field::Empty, // Will be filled when block is created
+        line_id = tracing::field::Empty,
+        text_element = ?text_element,
+        state = ?state,
         "Created text element"
     );
 
@@ -442,11 +462,22 @@ fn handle_operator<'a>(
             current_gs.ctm = multiply_matrices(&matrix, &current_gs.ctm);
         }
         "BT" => {
+            tracing::debug!("Begin text object");
             in_text_object = true;
             current_gs.text_state.text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
             current_gs.text_state.text_line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         }
         "ET" => {
+            if let Some(element) = text_elements.last_mut() {
+                for op in &current_gs.text_state.operator_log {
+                    tracing::debug!(
+                        element_id = %element.id,
+                        line_id = tracing::field::Empty,
+                        "PDF operator: {}",
+                        op
+                    );
+                }
+            }
             in_text_object = false;
             current_gs.text_state.reset();
         }
@@ -510,9 +541,11 @@ fn handle_operator<'a>(
             }
         }
         "Tm" => {
-            let m = matrix_from_operands(op);
-            current_gs.text_state.text_matrix = m;
-            current_gs.text_state.text_line_matrix = m;
+            let matrix = matrix_from_operands(op);
+            current_gs.text_state.text_matrix = matrix;
+            current_gs.text_state.text_line_matrix = matrix;
+
+            current_gs.text_state.operator_log.push(format!("Tm {:?}", matrix));
         }
         "Td" => {
             // Move text position
@@ -546,21 +579,22 @@ fn handle_operator<'a>(
             current_gs.text_state.text_line_matrix = current_gs.text_state.text_matrix;
         }
         "Tj" | "TJ" | "'" | "\"" => {
-            // Check if we have a valid encoding for the current font
-            if let Some(encoding) = current_gs.text_state.current_encoding {
-                collect_text_glyphs(
-                    &mut current_gs.text_state,
-                    &op.operands,
-                    current_gs.ctm,
-                    media_box,
-                )?;
+            let operator = op.operator.clone();
+            let operands = op.operands.iter().map(|o| format!("{:?}", o)).collect::<Vec<_>>().join(", ");
+            current_gs.text_state.operator_log.push(format!("{} [{}]", operator, operands));
+            
+            collect_text_glyphs(
+                &mut current_gs.text_state,
+                &op.operands,
+                current_gs.ctm,
+                media_box,
+            )?;
 
-                let text_element = finalize_text_run(&current_gs.text_state, page_number);
-                text_elements.push(text_element);
+            let text_element = finalize_text_run(&current_gs.text_state, page_number);
+            text_elements.push(text_element);
 
-                current_gs.text_state.glyphs.clear();
-                current_gs.text_state.text_buffer.clear();
-            }
+            current_gs.text_state.glyphs.clear();
+            current_gs.text_state.text_buffer.clear();
         }
         _ => {}
     }
@@ -734,6 +768,7 @@ impl TextLine {
             tracing::debug!(
                 element_id = %element.id,
                 line_id = %line.id,
+                element = ?element,
                 "Element added to line"
             );
         }
