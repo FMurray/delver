@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::layout::MatchContext;
 // use crate::layout::MatchContext;
-use crate::logging::{PDF_BT, PDF_OPERATIONS, PDF_TEXT_OBJECT};
+use crate::logging::{PDF_BT, PDF_OPERATIONS, PDF_PARSING, PDF_TEXT_OBJECT};
 use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -726,7 +726,6 @@ pub struct TextLine {
 }
 
 impl TextLine {
-    #[instrument(skip_all)]
     pub fn from_elements(page_number: u32, items: Vec<TextElement>) -> Self {
         let id = Uuid::new_v4();
         let mut line_min_x = f32::MAX;
@@ -735,16 +734,17 @@ impl TextLine {
         let mut line_max_y = f32::MIN;
         let mut combined_text = String::new();
 
-        for (i, it) in items.iter().enumerate() {
+        for (_, it) in items.iter().enumerate() {
             line_min_x = line_min_x.min(it.bbox.0);
             line_max_x = line_max_x.max(it.bbox.2);
             line_min_y = line_min_y.min(it.bbox.1);
             line_max_y = line_max_y.max(it.bbox.3);
 
-            if i > 0 {
-                let prev = &items[i - 1];
-                let gap = it.bbox.0 - (prev.bbox.2);
-            }
+            // TODO: Add gap calculation if necessary
+            // if i > 0 {
+            //     let prev = &items[i - 1];
+            //     l_gapgap = it.bbox.0 - (prev.bbox.2);
+            // }
             combined_text.push_str(&it.text);
         }
 
@@ -758,20 +758,12 @@ impl TextLine {
 
         tracing::debug!(
             line_id = %line.id,
-            block_id = tracing::field::Empty,
+            parent = %line.id,          // The line is the parent
+            children = ?line.elements.iter().map(|e| e.id).collect::<Vec<_>>(),
+            rel_type = "line_to_elements",
             "Created text line with {} elements",
             line.elements.len()
         );
-        
-        // After creating the line, log each element with line context
-        for element in &line.elements {
-            tracing::debug!(
-                element_id = %element.id,
-                line_id = %line.id,
-                element = ?element,
-                "Element added to line"
-            );
-        }
         
         line
     }

@@ -361,7 +361,8 @@ mod viewer {
 
                             if let Some(line_id) = self.selected_line {
                                 if let Some(line) = find_line_by_id(&self.blocks, line_id) {
-                                    let events = self.debug_data.get_events_for_line(line.id);
+                                    let events = get_line_with_elements(&self.debug_data, line.id);
+                                    println!("events: {:?}", events);
                                     egui::Window::new("Line Construction Details").show(
                                         ctx,
                                         |ui| {
@@ -453,6 +454,16 @@ mod viewer {
         )?;
 
         Ok(())
+    }
+
+    fn get_line_with_elements(store: &DebugDataStore, line_id: Uuid) -> Vec<String> {
+        let mut events = store.get_entity_events(line_id);
+
+        for element_id in store.get_children(line_id) {
+            events.extend(store.get_entity_events(element_id));
+        }
+
+        events
     }
 }
 
