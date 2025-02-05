@@ -3,16 +3,35 @@ mod viewer {
     use super::*;
     use crate::{
         logging::DebugDataStore,
-        parse::{multiply_matrices, TextBlock, TextLine},
+        parse::{TextBlock, TextLine},
     };
     use eframe::egui;
     use eframe::egui::{CollapsingHeader, ScrollArea};
+    use egui::cache::{ComputerMut, FrameCache};
     use lopdf::{Document, Object};
     use pdfium_render::prelude::*;
     use std::collections::HashSet;
     use std::error::Error;
+    use std::sync::Arc;
     use uuid::Uuid;
 
+    // Dedicated caching struct holding a reference to debug_data.
+    #[derive(Default)]
+    pub(super) struct FieldsComputer {
+        debug_data: Arc<DebugDataStore>,
+    }
+
+    impl ComputerMut<Uuid, HashSet<String>> for FieldsComputer {
+        fn compute(&mut self, line_id: Uuid) -> HashSet<String> {
+            let events = get_line_with_elements(&self.debug_data, line_id);
+            collect_fields_from_events(&events)
+        }
+    }
+
+    // Define the cache type.
+    type FieldsCache<'a> = FrameCache<HashSet<String>, FieldsComputer>;
+
+    #[derive(Default)]
     pub struct DebugViewer {
         blocks: Vec<TextBlock>,
         current_page: usize,
@@ -29,6 +48,7 @@ mod viewer {
         selected_bbox: Option<(f32, f32, f32, f32)>,
         selected_line: Option<Uuid>,
         selected_fields: HashSet<String>,
+        selected_events: HashSet<String>,
         show_tree_view: bool,
     }
 
@@ -134,12 +154,8 @@ mod viewer {
                 debug_data: debug_store,
                 selected_bbox: None,
                 selected_line: None,
-                selected_fields: HashSet::from_iter(vec![
-                    "message".into(),
-                    "element_id".into(),
-                    "line_id".into(),
-                    "element".into(),
-                ]),
+                selected_fields: HashSet::new(),
+                selected_events: HashSet::new(),
                 show_tree_view: false,
             })
         }
@@ -179,9 +195,9 @@ mod viewer {
                         let mut checked = self.selected_fields.contains(field);
                         if ui.checkbox(&mut checked, field).changed() {
                             if checked {
-                                self.selected_fields.insert(field.into());
+                                self.selected_fields.insert(field.to_string());
                             } else {
-                                self.selected_fields.remove(field);
+                                self.selected_fields.remove(&field.to_string());
                             }
                         }
                     }
@@ -318,6 +334,7 @@ mod viewer {
 
                                             if response.clicked() {
                                                 self.selected_line = Some(line.id);
+                                                ctx.request_repaint();
                                             }
 
                                             painter.rect_stroke(
@@ -360,43 +377,54 @@ mod viewer {
                             }
 
                             if let Some(line_id) = self.selected_line {
+                                let events = get_line_with_elements(&self.debug_data, line_id);
+                                println!("events: {:?}", events);
                                 if let Some(line) = find_line_by_id(&self.blocks, line_id) {
-                                    let events = get_line_with_elements(&self.debug_data, line.id);
-                                    println!("events: {:?}", events);
                                     egui::Window::new("Line Construction Details").show(
                                         ctx,
                                         |ui| {
                                             ui.label(format!("Line BBox: {:?}", line.bbox));
                                             ui.separator();
-                                            for (index, event) in events.iter().enumerate() {
-                                                CollapsingHeader::new(format!(
-                                                    "Event {}",
-                                                    index + 1
-                                                ))
-                                                .default_open(false)
-                                                .show(ui, |ui| {
-                                                    // Parse event string to filter fields
-                                                    let parts: Vec<&str> =
-                                                        event.split("; ").collect();
-                                                    for part in parts {
-                                                        if let Some((field_name, value)) =
-                                                            part.split_once(" = ")
-                                                        {
-                                                            if self
-                                                                .selected_fields
-                                                                .contains(field_name)
-                                                            {
-                                                                ui.label(field_name);
-                                                                ui.label(value);
-                                                            }
+
+                                            let mut fields: Vec<String> =
+                                                collect_fields_from_events(&events)
+                                                    .iter()
+                                                    .map(|s| s.to_string())
+                                                    .collect();
+                                            fields.sort();
+
+                                            println!("fields: {:?}", fields);
+
+                                            // Render field selection checkboxes
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label("Show fields:");
+                                                for field in &fields {
+                                                    let mut checked = self
+                                                        .selected_fields
+                                                        .contains(field.as_str());
+                                                    if ui.checkbox(&mut checked, field).changed() {
+                                                        if checked {
+                                                            self.selected_fields
+                                                                .insert(field.to_string());
                                                         } else {
-                                                            // Display parts without " = " as is (e.g., "Begin text object")
-                                                            ui.label(part);
+                                                            self.selected_fields
+                                                                .remove(field.as_str());
                                                         }
-                                                        ui.end_row();
                                                     }
+                                                }
+                                            });
+
+                                            ScrollArea::vertical()
+                                                .id_salt("detail view scroll")
+                                                .show(ui, |ui| {
+                                                    render_entity_events(
+                                                        ui,
+                                                        &events,
+                                                        0,
+                                                        &self.selected_fields,
+                                                        &mut self.selected_events,
+                                                    );
                                                 });
-                                            }
                                         },
                                     );
                                 }
@@ -456,26 +484,153 @@ mod viewer {
         Ok(())
     }
 
-    fn get_line_with_elements(store: &DebugDataStore, line_id: Uuid) -> Vec<String> {
+    fn get_line_with_elements(
+        store: &DebugDataStore,
+        line_id: Uuid,
+    ) -> crate::logging::EntityEvents {
         let mut events = store.get_entity_events(line_id);
-
-        for element_id in store.get_children(line_id) {
-            events.extend(store.get_entity_events(element_id));
-        }
 
         events
     }
+
+    fn find_line_by_id(blocks: &[TextBlock], line_id: Uuid) -> Option<&TextLine> {
+        blocks
+            .iter()
+            .flat_map(|b| &b.lines)
+            .find(|l| l.id == line_id)
+    }
+
+    fn render_event_details(ui: &mut egui::Ui, event: &str, selected_fields: &HashSet<String>) {
+        // Parse event string to filter fields
+        let parts: Vec<&str> = event.split("; ").collect();
+        for part in parts {
+            if let Some((field_name, value)) = part.split_once(" = ") {
+                if selected_fields.contains(field_name) {
+                    ui.label(field_name);
+                    ui.label(value);
+                }
+            } else {
+                // Display parts without " = " as is (e.g., "Begin text object")
+                ui.label(part);
+            }
+            ui.end_row();
+        }
+    }
+
+    fn collect_fields_from_events(events: &crate::logging::EntityEvents) -> HashSet<String> {
+        let mut fields = HashSet::new();
+        let mut process_event = |event: &str| {
+            for part in event.split("; ") {
+                if let Some((field_name, _)) = part.split_once(" = ") {
+                    fields.insert(field_name.to_string());
+                }
+            }
+        };
+
+        // Process current level events
+        for message in &events.messages {
+            process_event(message);
+        }
+
+        // Process child events recursively
+        for child in &events.children {
+            fields.extend(collect_fields_from_events(child));
+        }
+
+        fields
+    }
+
+    fn render_entity_events(
+        ui: &mut egui::Ui,
+        events: &crate::logging::EntityEvents,
+        level: usize,
+        selected_fields: &HashSet<String>,
+        selected_events: &mut HashSet<String>,
+    ) {
+        // Render messages for this level
+        for (index, message) in events.messages.iter().enumerate() {
+            let event_id = format!("event-{}-{}", level, index);
+            let mut is_selected = selected_events.contains(&event_id);
+
+            egui::CollapsingHeader::new(format!("Event {} (Level {})", index + 1, level))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut is_selected, "Select").changed() {
+                            // When toggled, mark this event and its children accordingly.
+                            mark_event_with_children(
+                                &event_id,
+                                events,
+                                selected_events,
+                                is_selected,
+                            );
+                        }
+                        if ui.button("Copy to Clipboard").clicked() {
+                            ui.output_mut(|o| o.copied_text = message.clone());
+                        }
+                    });
+                    render_event_details(ui, message, selected_fields);
+                });
+        }
+
+        // Render children events
+        if !events.children.is_empty() {
+            egui::CollapsingHeader::new(format!("Child Events (Level {})", level))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for (child_index, child) in events.children.iter().enumerate() {
+                        // Create a unique id for the child event.
+                        let child_id = format!("{}-child-{}", level, child_index);
+                        let mut child_selected = selected_events.contains(&child_id);
+                        egui::CollapsingHeader::new(format!("Child {}", child_index + 1))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut child_selected, "Select").changed() {
+                                        mark_event_with_children(
+                                            &child_id,
+                                            child,
+                                            selected_events,
+                                            child_selected,
+                                        );
+                                    }
+                                    // Use the first message (or a custom label) for copying.
+                                    let label = child.messages.get(0).cloned().unwrap_or_default();
+                                    if ui.button("Copy to Clipboard").clicked() {
+                                        ui.output_mut(|o| o.copied_text = label);
+                                    }
+                                });
+                                render_entity_events(
+                                    ui,
+                                    child,
+                                    level + 1,
+                                    selected_fields,
+                                    selected_events,
+                                );
+                            });
+                    }
+                });
+        }
+    }
+
+    fn mark_event_with_children(
+        id: &str,
+        events: &crate::logging::EntityEvents,
+        selected_events: &mut HashSet<String>,
+        selected: bool,
+    ) {
+        if selected {
+            selected_events.insert(id.to_string());
+        } else {
+            selected_events.remove(id);
+        }
+        // Recursively mark all children using a derived child id.
+        for (i, child) in events.children.iter().enumerate() {
+            let child_id = format!("{}-child-{}", id, i);
+            mark_event_with_children(&child_id, child, selected_events, selected);
+        }
+    }
 }
 
-use uuid::Uuid;
 #[cfg(feature = "debug-viewer")]
 pub use viewer::*;
-
-use crate::parse::{TextBlock, TextLine};
-
-fn find_line_by_id(blocks: &[TextBlock], line_id: Uuid) -> Option<&TextLine> {
-    blocks
-        .iter()
-        .flat_map(|b| &b.lines)
-        .find(|l| l.id == line_id)
-}

@@ -96,6 +96,8 @@ fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
         })?)
 }
 
+pub const IDENTITY_MATRIX: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
 /// Struct for how the text is tokenized
 /// Defaults to lines for now
 #[derive(Debug)]
@@ -107,20 +109,20 @@ pub struct DocumentLine {
 #[derive(Clone, Debug)]
 struct GraphicsState<'a> {
     ctm: [f32; 6],
-    text_state: TextState<'a>,
+    text_state: TextObjectState<'a>,
 }
 
 impl<'a> Default for GraphicsState<'a> {
     fn default() -> Self {
         GraphicsState {
             ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            text_state: TextState::default(),
+            text_state: TextObjectState::default(),
         }
     }
 }
 
 #[derive(Clone)]
-struct TextState<'a> {
+struct TextObjectState<'a> {
     text_matrix: [f32; 6],      // Tm
     text_line_matrix: [f32; 6], // Tlm
     font_name: Option<String>,
@@ -131,7 +133,6 @@ struct TextState<'a> {
     leading: f32,            // TL
     rise: f32,               // Ts
     render_mode: u8,         // Tr
-    start_pos: Option<(f32, f32)>,
     current_pos: (f32, f32),
     glyphs: Vec<PositionedGlyph>,
     text_buffer: String,
@@ -140,11 +141,14 @@ struct TextState<'a> {
     current_encoding: Option<&'a Encoding<'a>>,
     current_metrics: Option<&'static FontMetrics>,
     operator_log: Vec<String>,
+    char_bbox: Option<(f32, f32, f32, f32)>,
+    char_tx: f32,
+    char_ty: f32,
 }
 
-impl<'a> Default for TextState<'a> {
+impl<'a> Default for TextObjectState<'a> {
     fn default() -> Self {
-        TextState {
+        TextObjectState {
             font_name: None,
             font_size: 0.0,
             text_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
@@ -154,7 +158,6 @@ impl<'a> Default for TextState<'a> {
             horizontal_scaling: 100.0,
             leading: 0.0,
             rise: 0.0,
-            start_pos: None,
             current_pos: (0.0, 0.0),
             render_mode: 0,
             glyphs: Vec::new(),
@@ -164,15 +167,17 @@ impl<'a> Default for TextState<'a> {
             current_encoding: None,
             current_metrics: None,
             operator_log: Vec::new(),
+            char_tx: 0.0,
+            char_ty: 0.0,
+            char_bbox: None,
         }
     }
 }
 
-impl<'a> TextState<'a> {
+impl<'a> TextObjectState<'a> {
     fn reset(&mut self) {
         self.text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         self.text_line_matrix = self.text_matrix;
-        self.start_pos = None;
         self.current_pos = (0.0, 0.0);
         self.glyphs.clear();
         self.text_buffer.clear();
@@ -180,7 +185,7 @@ impl<'a> TextState<'a> {
     }
 }
 
-impl<'a> fmt::Debug for TextState<'a> {
+impl<'a> fmt::Debug for TextObjectState<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TextState")
             .field("text_matrix", &self.text_matrix)
@@ -193,8 +198,20 @@ impl<'a> fmt::Debug for TextState<'a> {
     }
 }
 
+#[derive(Debug)]
+struct TextState<'a> {
+    char_space: f32,
+    word_space: f32,
+    scale: f32,
+    leading: f32,
+    font: &'a FontMetrics,
+    fontname: String,
+    size: f32,
+    render: u8,
+    rise: f32,
+}
 
-#[derive(Clone, Debug)]
+
 struct PositionedGlyph {
     x_min: f32,
     y_min: f32,
@@ -242,13 +259,13 @@ impl fmt::Display for TextElement {
 }
 
 fn collect_text_glyphs(
-    text_state: &mut TextState,
+    text_state: &mut TextObjectState,
     operands: &[Object],
     ctm: [f32; 6],
     media_box: [f32; 4],
 ) -> LopdfResult<()> {
-    // Isolate the initial immutable borrows in a nested scope
-    let process_operand = |text_state: &mut TextState, operand: &Object| -> LopdfResult<()> {
+    // Process each text operand.
+    let process_operand = |text_state: &mut TextObjectState, operand: &Object| -> LopdfResult<()> {
         let metrics = text_state.current_metrics;
         let encoding = text_state
             .current_encoding
@@ -260,8 +277,17 @@ fn collect_text_glyphs(
                 let decoded_text = Document::decode_text(encoding, bytes)?;
 
                 for ch in decoded_text.chars() {
+                    let tsm = [
+                        text_state.font_size * text_state.horizontal_scaling,
+                        0.0,
+                        0.0,
+                        text_state.font_size,
+                        0.0,
+                        text_state.rise,
+                    ];
+
+                    // Compute the horizontal advance in text space.
                     let advance = if let Some(metrics) = metrics {
-                        // Use metrics-based calculation
                         metrics
                             .glyph_widths
                             .get(&(ch as u8))
@@ -271,46 +297,69 @@ fn collect_text_glyphs(
                         0.0
                     };
 
-                    let ascent = if let Some(metrics) = text_state.current_font_metrics {
-                        (metrics.ascent as f32 / 1000.0) * text_state.font_size
+                    let char_tx = (advance * text_state.font_size + text_state.character_spacing) * text_state.horizontal_scaling;
+                    let char_ty = 0.0;
+                    // Retrieve the ascent and descent from the font metrics.
+                    // Many fonts (like Times-Roman) provide a positive ascent and a negative descent.
+                    let (asc, desc) = if let Some(metrics) = text_state.current_font_metrics {
+                        (
+                            (metrics.ascent as f32 / 1000.0) * text_state.font_size,
+                            (metrics.descent as f32 / 1000.0) * text_state.font_size,
+                        )
                     } else {
-                        0.0
+                        (0.0, 0.0)
                     };
 
-                    let (user_x, user_y) = transform_point(
-                        &ctm,
-                        &text_state.text_matrix,
-                        text_state.current_pos.0,
-                        text_state.current_pos.1 + text_state.rise,
-                    );
+                    // Determine the effective ascent/descent based on the text matrix y-scale.
+                    // If the y scaling (element [3]) is negative, then swap the sign of asc and desc.
+                    let y_scale = text_state.text_matrix[3];
+                    let effective_asc = if y_scale < 0.0 { -asc } else { asc };
+                    let effective_desc = if y_scale < 0.0 { -desc } else { desc };
 
+                    // Append the character to the text buffer.
                     if let Some(last_char) = text_state.text_buffer.chars().last() {
                         if !(last_char == ' ' && ch == ' ') {
                             text_state.text_buffer.push(ch);
                         }
                     } else {
-                        text_state.text_buffer.push(ch); // Handle empty buffer case
+                        text_state.text_buffer.push(ch);
                     }
 
-                    text_state.current_pos.0 += advance;
+                    // Save the current text-space baseline position.
+                    let base_x = text_state.current_pos.0;
+                    let base_y = text_state.current_pos.1;
+                    
+                    // Compute the four corners in text space.
+                    // In text space the top of the glyph is at baseline + effective_ascent,
+                    // and the bottom is at baseline + effective_descent.
+                    let p_lt = transform_point(&ctm, &text_state.text_matrix, base_x, base_y + effective_asc); // top-left
+                    let p_lb = transform_point(&ctm, &text_state.text_matrix, base_x, base_y + effective_desc); // bottom-left
+                    let p_rt = transform_point(&ctm, &text_state.text_matrix, base_x + advance, base_y + effective_asc); // top-right
+                    let p_rb = transform_point(&ctm, &text_state.text_matrix, base_x + advance, base_y + effective_desc); // bottom-right
 
-                    let glyph_w = advance;
-                    let glyph_h = text_state.font_size;
+                    // Compute the bounding box from the four transformed corners.
+                    let x_min = p_lt.0.min(p_lb.0).min(p_rt.0).min(p_rb.0);
+                    let x_max = p_lt.0.max(p_lb.0).max(p_rt.0).max(p_rb.0);
+                    let y_min = p_lt.1.min(p_lb.1).min(p_rt.1).min(p_rb.1);
+                    let y_max = p_lt.1.max(p_lb.1).max(p_rt.1).max(p_rb.1);
 
                     text_state.glyphs.push(PositionedGlyph {
-                        x_min: user_x,
-                        y_min: user_y + glyph_h,
-                        x_max: user_x + glyph_w,
-                        y_max: user_y + glyph_h + ascent,
+                        x_min,
+                        y_min,
+                        x_max,
+                        y_max,
                     });
+
+                    // Update the text-space x position by the advance.
+                    text_state.current_pos.0 += advance;
                 }
             }
             Object::Integer(i) => {
-                let offset = -*i as f32 * (text_state.font_size / 1000.0); // Note the negative sign
+                let offset = -*i as f32 * (text_state.font_size / 1000.0);
                 text_state.current_pos.0 += offset;
             }
             Object::Real(f) => {
-                let offset = -*f as f32 * (text_state.font_size / 1000.0); // Note the negative sign
+                let offset = -*f as f32 * (text_state.font_size / 1000.0);
                 text_state.current_pos.0 += offset;
             }
             Object::Array(arr) => {
@@ -329,7 +378,7 @@ fn collect_text_glyphs(
 }
 
 #[tracing::instrument()]
-fn finalize_text_run(state: &TextState, page_number: u32) -> TextElement {
+fn finalize_text_run(state: &TextObjectState, page_number: u32) -> TextElement {
     if state.glyphs.is_empty() {
         return TextElement {
             id: Uuid::new_v4(),
@@ -455,12 +504,22 @@ fn handle_operator<'a>(
     let current_gs = gs_stack.last_mut().unwrap();
 
     match op.operator.as_ref() {
+        // Graphics State
         "q" => push_graphics_state(gs_stack),
         "Q" => pop_graphics_state(gs_stack),
         "cm" => {
+            if !current_gs.text_state.text_buffer.is_empty() {
+                let text_element = finalize_text_run(&current_gs.text_state, page_number);
+                text_elements.push(text_element);
+                current_gs.text_state.glyphs.clear();
+                current_gs.text_state.text_buffer.clear();
+                current_gs.text_state.operator_log.clear();
+            }
+
             let matrix = matrix_from_operands(op);
             current_gs.ctm = multiply_matrices(&matrix, &current_gs.ctm);
         }
+        // Text Object
         "BT" => {
             tracing::debug!("Begin text object");
             in_text_object = true;
@@ -478,9 +537,17 @@ fn handle_operator<'a>(
                     );
                 }
             }
+
+            if !current_gs.text_state.text_buffer.is_empty() {
+                let text_element = finalize_text_run(&current_gs.text_state, page_number);
+                text_elements.push(text_element);
+                current_gs.text_state.glyphs.clear();
+                current_gs.text_state.text_buffer.clear();
+                current_gs.text_state.operator_log.clear();
+            }
             in_text_object = false;
-            current_gs.text_state.reset();
         }
+        // Text State
         "Tf" => {
             if let (Some(Object::Name(font_name)), Some(font_size_obj)) =
                 (op.operands.get(0), op.operands.get(1))
@@ -547,15 +614,14 @@ fn handle_operator<'a>(
 
             current_gs.text_state.operator_log.push(format!("Tm {:?}", matrix));
         }
+        // Text Positioning
         "Td" => {
-            // Move text position
             if let (Some(tx_obj), Some(ty_obj)) = (op.operands.get(0), op.operands.get(1)) {
                 let tx = operand_as_float(tx_obj);
                 let ty = operand_as_float(ty_obj);
-                let tm = translate_matrix(tx, ty);
-                current_gs.text_state.text_matrix =
-                    multiply_matrices(&current_gs.text_state.text_line_matrix, &tm);
-                current_gs.text_state.text_line_matrix = current_gs.text_state.text_matrix;
+                current_gs.text_state.text_line_matrix =
+                    pre_translate(current_gs.text_state.text_line_matrix, tx, ty);
+                current_gs.text_state.text_matrix = current_gs.text_state.text_line_matrix;
             }
         }
         "TD" => {
@@ -564,10 +630,9 @@ fn handle_operator<'a>(
                 let tx = operand_as_float(tx_obj);
                 let ty = operand_as_float(ty_obj);
                 current_gs.text_state.leading = -ty;
-                let tm = translate_matrix(tx, ty);
-                current_gs.text_state.text_matrix =
-                    multiply_matrices(&current_gs.text_state.text_line_matrix, &tm);
-                current_gs.text_state.text_line_matrix = current_gs.text_state.text_matrix;
+                current_gs.text_state.text_line_matrix =
+                    pre_translate(current_gs.text_state.text_line_matrix, tx, ty);
+                current_gs.text_state.text_matrix = current_gs.text_state.text_line_matrix;
             }
         }
         "T*" => {
@@ -578,6 +643,7 @@ fn handle_operator<'a>(
                 multiply_matrices(&current_gs.text_state.text_line_matrix, &tm);
             current_gs.text_state.text_line_matrix = current_gs.text_state.text_matrix;
         }
+        // Text Showing
         "Tj" | "TJ" | "'" | "\"" => {
             let operator = op.operator.clone();
             let operands = op.operands.iter().map(|o| format!("{:?}", o)).collect::<Vec<_>>().join(", ");
@@ -758,8 +824,8 @@ impl TextLine {
 
         tracing::debug!(
             line_id = %line.id,
-            parent = %line.id,          // The line is the parent
-            children = ?line.elements.iter().map(|e| e.id).collect::<Vec<_>>(),
+            parent = %line.id,
+            children = %serde_json::to_string(&line.elements.iter().map(|e| e.id).collect::<Vec<_>>()).unwrap(),
             rel_type = "line_to_elements",
             "Created text line with {} elements",
             line.elements.len()
@@ -768,6 +834,8 @@ impl TextLine {
         line
     }
 }
+
+
 
 /// Represents a "block" of consecutive lines that are close in vertical spacing.
 #[derive(Debug, Clone)]
@@ -907,11 +975,11 @@ fn transform_point(ctm: &[f32; 6], text_matrix: &[f32; 6], x: f32, y: f32) -> (f
 
     // Then apply CTM scaling (but not translation yet)
     let px = ctm[0] * tx + ctm[2] * ty + ctm[4];
-    let py = ctm[1] * tx + ctm[3] * ty; // Note: omitting ctm[5] (772.5)
+    let py = ctm[1] * tx + ctm[3] * ty + ctm[5];
 
-    let user_y = -(ctm[5] - (py + ctm[5]));
+    // let user_y = -(ctm[5] - (py + ctm[5]));
     // Convert to device space by subtracting from CTM's Y translation
-    (px, user_y)
+    (px, py)
 }
 
 pub fn multiply_matrices(a: &[f32; 6], b: &[f32; 6]) -> [f32; 6] {
@@ -922,6 +990,17 @@ pub fn multiply_matrices(a: &[f32; 6], b: &[f32; 6]) -> [f32; 6] {
         a[2] * b[1] + a[3] * b[3],
         a[4] * b[0] + a[5] * b[2] + b[4],
         a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
+}
+
+fn pre_translate(m: [f32; 6], tx: f32, ty: f32) -> [f32; 6] {
+    [
+        m[0],         // a
+        m[1],         // b
+        m[2],         // c
+        m[3],         // d
+        m[4] + tx * m[0] + ty * m[2],  // e update: e + tx * a + ty * c
+        m[5] + tx * m[1] + ty * m[3],  // f update: f + tx * b + ty * d
     ]
 }
 

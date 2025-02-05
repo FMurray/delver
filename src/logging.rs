@@ -2,7 +2,8 @@ use std::fmt::Write;
 use std::sync::Once;
 use std::sync::{Arc, Mutex};
 use tracing::level_filters::LevelFilter;
-use tracing::Subscriber;
+use tracing::{Subscriber, Value};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::format::DefaultFields;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::{
@@ -14,6 +15,8 @@ use serde_json;
 use std::collections::HashMap;
 use tracing_tree::HierarchicalLayer;
 use uuid::Uuid;
+
+use crate::dom::ElementType;
 
 // Define log targets as constants
 pub const PDF_OPERATIONS: &str = "pdf_ops";
@@ -41,6 +44,12 @@ const DEBUG_TARGETS: &[&str] = &[
     "delver_pdf::parse",
 ];
 
+enum EntityType {
+    Element,
+    Line,
+    Block,
+}
+
 #[derive(Clone, Default)]
 pub struct DebugDataStore {
     message_arena: Arc<Mutex<Vec<String>>>,
@@ -55,6 +64,12 @@ struct LineageStore {
     children: HashMap<Uuid, Vec<Uuid>>,
     parents: HashMap<Uuid, Uuid>,
     entity_events: HashMap<Uuid, Vec<usize>>,
+}
+
+#[derive(Debug, Default)]
+pub struct EntityEvents {
+    pub messages: Vec<String>,
+    pub children: Vec<EntityEvents>,
 }
 
 impl DebugDataStore {
@@ -91,15 +106,31 @@ impl DebugDataStore {
         let mut lineage = self.lineage.lock().unwrap();
 
         if let Some(parent_id) = parent {
+            // Check for circular reference
+            if children.contains(&parent_id) {
+                eprintln!(
+                    "Circular relationship detected between {} and {:?}",
+                    parent_id, children
+                );
+                return;
+            }
+
             // Update parent -> children mapping
-            lineage
-                .children
-                .entry(parent_id)
-                .or_default()
-                .extend(children.iter().copied());
+            let existing_children = lineage.children.entry(parent_id).or_default();
+            for child_id in &children {
+                if !existing_children.contains(child_id) {
+                    existing_children.push(*child_id);
+                }
+            }
 
             // Update child -> parent mapping
             for child_id in &children {
+                if let Some(existing_parent) = lineage.parents.get(child_id) {
+                    if *existing_parent != parent_id {
+                        eprintln!("Child {} already has parent {}", child_id, existing_parent);
+                        continue;
+                    }
+                }
                 lineage.parents.insert(*child_id, parent_id);
             }
         }
@@ -124,60 +155,50 @@ impl DebugDataStore {
             .copied()
     }
 
-    pub fn get_entity_events(&self, entity_id: Uuid) -> Vec<String> {
-        let lineage = self.lineage.lock().unwrap();
-        let arena = self.message_arena.lock().unwrap();
+    pub fn get_entity_events(&self, entity_id: Uuid) -> EntityEvents {
+        // First collect all data we need while holding the lock
+        let (messages, children_ids) = {
+            let lineage = self.lineage.lock().unwrap();
+            let arena = self.message_arena.lock().unwrap();
 
-        lineage
-            .entity_events
-            .get(&entity_id)
-            .map(|indices| {
-                indices
-                    .iter()
-                    .filter_map(|&idx| arena.get(idx).cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
+            let messages = lineage
+                .entity_events
+                .get(&entity_id)
+                .map(|indices| {
+                    indices
+                        .iter()
+                        .filter_map(|&idx| arena.get(idx).cloned())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let children_ids = lineage
+                .children
+                .get(&entity_id)
+                .cloned()
+                .unwrap_or_default();
+
+            (messages, children_ids)
+        }; // Locks released here
+
+        // Now process children without holding the lock
+        let mut children = Vec::new();
+        for child_id in children_ids {
+            children.push(self.get_entity_events(child_id));
+        }
+
+        EntityEvents { messages, children }
     }
 
-    pub fn record_element(&self, element_id: Uuid, line_id: Uuid, message: String) {
-        println!(
-            "[STORE] Recording element {} (line {}): {}",
-            element_id, line_id, message
-        );
-
+    fn record_entity(&self, entity_id: Uuid, entity_type: EntityType, message: String) {
         let mut arena = self.message_arena.lock().unwrap();
         let idx = arena.len();
         arena.push(message.clone());
-        println!("[STORE] Message stored at index {}", idx);
 
-        let mut elements = self.elements.lock().unwrap();
-        let mut lines = self.lines.lock().unwrap();
-        let mut events = self.events.lock().unwrap();
-
-        elements.insert(element_id, idx);
-        lines
-            .entry(line_id)
-            .or_insert((Uuid::nil(), Vec::new()))
-            .1
-            .push(idx);
-        events.entry(line_id).or_default().push(idx);
-
-        // Track entity-event association
-        self.lineage
-            .lock()
-            .unwrap()
+        let mut lineage = self.lineage.lock().unwrap();
+        lineage
             .entity_events
-            .entry(element_id)
-            .or_default()
-            .push(idx);
-
-        // Also track line-event association
-        self.lineage
-            .lock()
-            .unwrap()
-            .entity_events
-            .entry(line_id)
+            .entry(entity_id)
             .or_default()
             .push(idx);
     }
@@ -198,8 +219,6 @@ where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
-        println!("[DEBUG] Event received: {:?}", event.metadata().name());
-
         let mut id_visitor = IdVisitor {
             element_id: &mut None,
             line_id: &mut None,
@@ -224,14 +243,14 @@ where
         let mut message = String::new();
         event.record(&mut MessageVisitor(&mut message));
 
-        // After message capture
-        println!("[DEBUG] Captured message: {}", message);
-
-        if let (Some(e_id), Some(l_id)) = (*id_visitor.element_id, *id_visitor.line_id) {
-            println!("[DEBUG] Recording element {} in line {}", e_id, l_id);
-            self.store.record_element(e_id, l_id, message);
-        } else {
-            println!("[DEBUG] No element/line IDs found");
+        match (*id_visitor.element_id, *id_visitor.line_id) {
+            (Some(e_id), None) => {
+                self.store.record_entity(e_id, EntityType::Element, message);
+            }
+            (None, Some(l_id)) => {
+                self.store.record_entity(l_id, EntityType::Line, message);
+            }
+            _ => {}
         }
 
         let mut rel_parent = None;
@@ -253,13 +272,19 @@ where
 struct IdVisitor<'a> {
     element_id: &'a mut Option<Uuid>,
     line_id: &'a mut Option<Uuid>,
+    // children: &'a mut Vec<Uuid>,
 }
 
 impl tracing::field::Visit for IdVisitor<'_> {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         match field.name() {
-            "element_id" => *self.element_id = Uuid::parse_str(value).ok(),
-            "line_id" => *self.line_id = Uuid::parse_str(value).ok(),
+            "line_id" => *self.element_id = Uuid::parse_str(value).ok(),
+            "element_id" => *self.line_id = Uuid::parse_str(value).ok(),
+            // "children" => {
+            //     if let Ok(ids) = serde_json::from_str::<Vec<Uuid>>(value) {
+            //         self.children.extend(ids);
+            //     }
+            // }
             _ => {}
         }
     }
@@ -290,6 +315,13 @@ impl tracing::field::Visit for RelationshipVisitor<'_> {
             REL_CHILDREN => {
                 if let Ok(ids) = serde_json::from_str::<Vec<Uuid>>(value) {
                     self.children.extend(ids);
+                } else {
+                    let cleaned = value.trim_matches(|c| c == '[' || c == ']');
+                    for id_str in cleaned.split(',') {
+                        if let Ok(id) = Uuid::parse_str(id_str.trim()) {
+                            self.children.push(id);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -307,39 +339,55 @@ impl tracing::field::Visit for RelationshipVisitor<'_> {
 //     pub _guard: tracing_appender::non_blocking::WorkerGuard,
 // }
 
-pub fn init_debug_logging(
-    store: DebugDataStore,
-) -> Result<Box<dyn tracing::Subscriber + Send + Sync>, Box<dyn std::error::Error>> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::DEBUG.into())
-        .parse(DEBUG_TARGETS.join(",debug,"))?;
+pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
 
-    let debug_layer = DebugLayer { store }.with_filter(filter);
+    let debug_layer = DebugLayer { store }.with_filter(
+        EnvFilter::try_new(
+            DEBUG_TARGETS
+                .iter()
+                .map(|t| format!("{}={}", t, "debug"))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .unwrap(),
+    );
 
-    let tree_layer = HierarchicalLayer::default()
-        .with_writer(std::io::stdout)
-        .with_indent_lines(true)
-        .with_indent_amount(2)
-        .with_thread_names(true)
-        .with_thread_ids(true)
-        .with_verbose_exit(false)
-        .with_verbose_entry(false)
-        .with_targets(true)
-        .with_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::DEBUG.into())
-                .parse(DEBUG_TARGETS.join(",debug,"))?,
-        );
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::Layer::new()
+                .with_writer(writer)
+                .with_filter(EnvFilter::from_default_env()),
+        )
+        .with(debug_layer)
+        .init();
 
-    let subscriber = Registry::default().with(debug_layer).with(tree_layer);
+    guard
 
-    Ok(Box::new(subscriber))
+    // let tree_layer = HierarchicalLayer::default()
+    //     .with_writer(std::io::stdout)
+    //     .with_indent_lines(true)
+    //     .with_indent_amount(2)
+    //     .with_thread_names(true)
+    //     .with_thread_ids(true)
+    //     .with_verbose_exit(false)
+    //     .with_verbose_entry(false)
+    //     .with_targets(true)
+    //     .with_filter(
+    //         EnvFilter::builder()
+    //             .with_default_directive(LevelFilter::DEBUG.into())
+    //             .parse(DEBUG_TARGETS.join(",debug,"))?,
+    //     );
+
+    // let subscriber = Registry::default().with(debug_layer).with(tree_layer);
+
+    // Ok(Box::new(subscriber))
 }
 
-pub fn init_logging(
-    debug_ops: bool,
-    store: DebugDataStore,
-) -> Result<(), Box<dyn std::error::Error>> {
-    init_debug_logging(store)?;
-    Ok(())
-}
+// pub fn init_logging(
+//     debug_ops: bool,
+//     store: DebugDataStore,
+// ) -> Result<(), Box<dyn std::error::Error>> {
+//     init_debug_logging(store)?;
+//     Ok(())
+// }

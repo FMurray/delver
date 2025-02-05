@@ -53,8 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse_args();
 
     let debug_store = DebugDataStore::default();
-    let subscriber = init_debug_logging(debug_store.clone()).unwrap();
-    let _guard = tracing::subscriber::set_global_default(subscriber);
+    let _guard = init_debug_logging(debug_store.clone());
 
     // Read the PDF file
     let pdf_bytes = fs::read(&args.pdf_path)?;
