@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod debug_viewer;
 pub mod dom;
 pub mod fonts;
+pub mod geo;
 pub mod layout;
 pub mod logging;
 pub mod parse;

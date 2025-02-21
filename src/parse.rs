@@ -7,6 +7,7 @@ use std::path::Path;
 use std::thread::current;
 use uuid::Uuid;
 
+use crate::geo::{multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
 use crate::layout::MatchContext;
 // use crate::layout::MatchContext;
 use crate::logging::{PDF_BT, PDF_OPERATIONS, PDF_PARSING, PDF_TEXT_OBJECT};
@@ -96,8 +97,6 @@ fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
         })?)
 }
 
-pub const IDENTITY_MATRIX: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-
 /// Struct for how the text is tokenized
 /// Defaults to lines for now
 #[derive(Debug)]
@@ -108,40 +107,32 @@ pub struct DocumentLine {
 
 #[derive(Clone, Debug)]
 struct GraphicsState<'a> {
-    ctm: [f32; 6],
-    text_state: TextObjectState<'a>,
+    ctm: Matrix,
+    text_state: TextState<'a>,
 }
 
 impl<'a> Default for GraphicsState<'a> {
     fn default() -> Self {
         GraphicsState {
-            ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            text_state: TextObjectState::default(),
+            ctm: IDENTITY_MATRIX,
+            text_state: TextState::default(),
         }
     }
 }
 
 #[derive(Clone)]
 struct TextObjectState<'a> {
-    text_matrix: [f32; 6],      // Tm
-    text_line_matrix: [f32; 6], // Tlm
+    text_matrix: Matrix,      // Tm
+    text_line_matrix: Matrix, // Tlm
     font_name: Option<String>,
-    font_size: f32,
-    character_spacing: f32,  // Tc
-    word_spacing: f32,       // Tw
-    horizontal_scaling: f32, // Tz (expressed as fraction, e.g. 1.0=100%)
-    leading: f32,            // TL
-    rise: f32,               // Ts
-    render_mode: u8,         // Tr
-    current_pos: (f32, f32),
     glyphs: Vec<PositionedGlyph>,
     text_buffer: String,
     current_font_object: Option<Object>,
-    current_font_metrics: Option<&'static FontMetrics>,
+    font_metrics: Option<&'static FontMetrics>,
     current_encoding: Option<&'a Encoding<'a>>,
     current_metrics: Option<&'static FontMetrics>,
     operator_log: Vec<String>,
-    char_bbox: Option<(f32, f32, f32, f32)>,
+    char_bbox: Option<Rect>,
     char_tx: f32,
     char_ty: f32,
 }
@@ -150,20 +141,12 @@ impl<'a> Default for TextObjectState<'a> {
     fn default() -> Self {
         TextObjectState {
             font_name: None,
-            font_size: 0.0,
-            text_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            text_line_matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            character_spacing: 0.0,
-            word_spacing: 0.0,
-            horizontal_scaling: 100.0,
-            leading: 0.0,
-            rise: 0.0,
-            current_pos: (0.0, 0.0),
-            render_mode: 0,
+            text_matrix: IDENTITY_MATRIX,
+            text_line_matrix: IDENTITY_MATRIX,
             glyphs: Vec::new(),
             text_buffer: String::new(),
             current_font_object: None,
-            current_font_metrics: None,
+            font_metrics: None,
             current_encoding: None,
             current_metrics: None,
             operator_log: Vec::new(),
@@ -176,9 +159,8 @@ impl<'a> Default for TextObjectState<'a> {
 
 impl<'a> TextObjectState<'a> {
     fn reset(&mut self) {
-        self.text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        self.text_matrix = IDENTITY_MATRIX;
         self.text_line_matrix = self.text_matrix;
-        self.current_pos = (0.0, 0.0);
         self.glyphs.clear();
         self.text_buffer.clear();
         self.operator_log.clear();
@@ -190,33 +172,49 @@ impl<'a> fmt::Debug for TextObjectState<'a> {
         f.debug_struct("TextState")
             .field("text_matrix", &self.text_matrix)
             .field("font_name", &self.font_name)
-            .field("font_size", &self.font_size)
-            .field("current_pos", &self.current_pos)
-            .field("current_font_metrics", &self.current_font_metrics.map(|m| (m.ascent, m.descent)))
+            .field("font_metrics", &self.font_metrics.map(|m| (m.ascent, m.descent)))
             .field("ctm", &self.text_matrix) // Assuming you have access to CTM via GraphicsState
             .finish()
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TextState<'a> {
     char_space: f32,
     word_space: f32,
     scale: f32,
     leading: f32,
-    font: &'a FontMetrics,
+    font: Option<&'a FontMetrics>,
     fontname: String,
+    encoding: Option<&'a Encoding<'a>>,
     size: f32,
     render: u8,
     rise: f32,
 }
 
+impl<'a> Default for TextState<'a> {
+    fn default() -> Self {
+        TextState {
+            char_space: 0.0,
+            word_space: 0.0,
+            scale: 1.0,
+            leading: 0.0,
+            font: None,
+            fontname: String::new(),
+            encoding: None,
+            size: 0.0,
+            render: 0,
+            rise: 0.0,
+        }
+    }
+}
 
+#[derive(Debug, Clone, PartialEq)]
 struct PositionedGlyph {
-    x_min: f32,
-    y_min: f32,
-    x_max: f32,
-    y_max: f32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,70 +257,72 @@ impl fmt::Display for TextElement {
 }
 
 fn collect_text_glyphs(
-    text_state: &mut TextObjectState,
+    text_object_state: &mut TextObjectState,
+    text_state: &mut TextState,
     operands: &[Object],
-    ctm: [f32; 6],
-    media_box: [f32; 4],
+    ctm: Matrix,
+    trm: &mut Matrix,
 ) -> LopdfResult<()> {
     // Process each text operand.
-    let process_operand = |text_state: &mut TextObjectState, operand: &Object| -> LopdfResult<()> {
-        let metrics = text_state.current_metrics;
+    let process_operand = |tos: &mut TextObjectState, text_state: &mut TextState, operand: &Object| -> LopdfResult<()> {
+        let metrics = text_state.font;
         let encoding = text_state
-            .current_encoding
+            .encoding
             .as_ref()
             .ok_or(LopdfError::ContentDecode)?;
 
         match operand {
             Object::String(bytes, _) => {
                 let decoded_text = Document::decode_text(encoding, bytes)?;
+                let encoded_bytes = Document::encode_text(encoding, &decoded_text);
 
-                for ch in decoded_text.chars() {
-                    let tsm = [
-                        text_state.font_size * text_state.horizontal_scaling,
-                        0.0,
-                        0.0,
-                        text_state.font_size,
-                        0.0,
-                        text_state.rise,
-                    ];
+                for (byte, ch) in encoded_bytes.iter().zip(decoded_text.chars()) {
+                    let ucs = *byte as u32;
+                    let tsm = Matrix {
+                        a: text_state.size * text_state.scale,
+                        b: 0.0,
+                        c: 0.0,
+                        d: text_state.size,
+                        e: 0.0,
+                        f: text_state.rise,
+                    };
 
                     // Compute the horizontal advance in text space.
                     let advance = if let Some(metrics) = metrics {
                         metrics
                             .glyph_widths
-                            .get(&(ch as u8))
-                            .map(|w| (w / 1000.0) * text_state.font_size)
+                            .get(&ucs)
+                            .map(|w| (w / 1000.0) * text_state.size)
                             .unwrap_or(0.0)
                     } else {
                         0.0
                     };
 
-                    let char_tx = (advance * text_state.font_size + text_state.character_spacing) * text_state.horizontal_scaling;
-                    let char_ty = 0.0;
+                    text_object_state.char_tx = (advance * text_state.size + text_state.char_space) * text_state.scale;
+                    text_object_state.char_ty = 0.0;
+
+                    *trm = multiply_matrices(&tsm, &text_object_state.text_matrix);
+
                     // Retrieve the ascent and descent from the font metrics.
                     // Many fonts (like Times-Roman) provide a positive ascent and a negative descent.
-                    let (asc, desc) = if let Some(metrics) = text_state.current_font_metrics {
+                    let (asc, desc) = if let Some(metrics) = text_state.font {
                         (
-                            (metrics.ascent as f32 / 1000.0) * text_state.font_size,
-                            (metrics.descent as f32 / 1000.0) * text_state.font_size,
+                            (metrics.ascent as f32 / 1000.0) * text_state.size,
+                            (metrics.descent as f32 / 1000.0) * text_state.size,
                         )
                     } else {
                         (0.0, 0.0)
                     };
 
-                    // Determine the effective ascent/descent based on the text matrix y-scale.
-                    // If the y scaling (element [3]) is negative, then swap the sign of asc and desc.
-                    let y_scale = text_state.text_matrix[3];
-                    let effective_asc = if y_scale < 0.0 { -asc } else { asc };
-                    let effective_desc = if y_scale < 0.0 { -desc } else { desc };
+                    let char_bbox = glyph_bound(text_object_state.font_metrics.unwrap(), ucs, trm);
 
                     // Append the character to the text buffer.
-                    if let Some(last_char) = text_state.text_buffer.chars().last() {
+                    if let Some(last_char) = text_object_state.text_buffer.chars().last() {
                         if !(last_char == ' ' && ch == ' ') {
-                            text_state.text_buffer.push(ch);
+                            text_object_state.text_buffer.push(ch);
                         }
                     } else {
-                        text_state.text_buffer.push(ch);
+                        text_object_state.text_buffer.push(ch);
                     }
 
                     // Save the current text-space baseline position.
@@ -454,7 +454,7 @@ fn pop_graphics_state(gs_stack: &mut Vec<GraphicsState>) {
     }
 }
 
-fn matrix_from_operands(op: &lopdf::content::Operation) -> [f32; 6] {
+fn matrix_from_operands(op: &lopdf::content::Operation) -> Matrix {
     op.operands
         .iter()
         .map(|obj| match obj {
@@ -464,7 +464,7 @@ fn matrix_from_operands(op: &lopdf::content::Operation) -> [f32; 6] {
         })
         .collect::<Vec<f32>>()
         .try_into()
-        .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+        .unwrap_or(IDENTITY_MATRIX)
 }
 
 fn operand_as_float(obj: &Object) -> f32 {
@@ -523,8 +523,8 @@ fn handle_operator<'a>(
         "BT" => {
             tracing::debug!("Begin text object");
             in_text_object = true;
-            current_gs.text_state.text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-            current_gs.text_state.text_line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+            current_gs.text_state.text_matrix = IDENTITY_MATRIX;
+            current_gs.text_state.text_line_matrix = IDENTITY_MATRIX;
         }
         "ET" => {
             if let Some(element) = text_elements.last_mut() {
@@ -968,42 +968,21 @@ pub fn group_text_into_lines_and_blocks(
     all_blocks
 }
 
-fn transform_point(ctm: &[f32; 6], text_matrix: &[f32; 6], x: f32, y: f32) -> (f32, f32) {
-    // First apply text matrix
-    let tx = text_matrix[0] * x + text_matrix[2] * y + text_matrix[4];
-    let ty = text_matrix[1] * x + text_matrix[3] * y + text_matrix[5];
 
-    // Then apply CTM scaling (but not translation yet)
-    let px = ctm[0] * tx + ctm[2] * ty + ctm[4];
-    let py = ctm[1] * tx + ctm[3] * ty + ctm[5];
-
-    // let user_y = -(ctm[5] - (py + ctm[5]));
-    // Convert to device space by subtracting from CTM's Y translation
-    (px, py)
-}
-
-pub fn multiply_matrices(a: &[f32; 6], b: &[f32; 6]) -> [f32; 6] {
-    [
-        a[0] * b[0] + a[1] * b[2],
-        a[0] * b[1] + a[1] * b[3],
-        a[2] * b[0] + a[3] * b[2],
-        a[2] * b[1] + a[3] * b[3],
-        a[4] * b[0] + a[5] * b[2] + b[4],
-        a[4] * b[1] + a[5] * b[3] + b[5],
-    ]
-}
-
-fn pre_translate(m: [f32; 6], tx: f32, ty: f32) -> [f32; 6] {
-    [
-        m[0],         // a
-        m[1],         // b
-        m[2],         // c
-        m[3],         // d
-        m[4] + tx * m[0] + ty * m[2],  // e update: e + tx * a + ty * c
-        m[5] + tx * m[1] + ty * m[3],  // f update: f + tx * b + ty * d
-    ]
-}
-
-pub fn translate_matrix(x: f32, y: f32) -> [f32; 6] {
-    [1.0, 0.0, 0.0, 1.0, x, y]
+/// The transformed bounding box as a `Rect`.
+pub fn glyph_bound(font: &FontMetrics, glyph: u32, trm: &Matrix) -> Rect {
+    // Look up the glyph width; if not present, default to 0.0.
+    let glyph_width = font.glyph_widths.get(&glyph).cloned().unwrap_or(0.0);
+    // Define a base bounding box:
+    //   x: 0 to glyph_width, y: from the font's overall bbox y-min to y-max.
+    let base_bbox = Rect {
+        x0: 0.0,
+        y0: font.bbox.y0,
+        x1: glyph_width,
+        y1: font.bbox.y1,
+    };
+    // Transform the base bbox by the text rendering matrix.
+    let transformed_bbox = transform_rect(&base_bbox, trm);
+    // Optionally expand the box slightly (similar to MuPDF's fz_expand_rect).
+    transformed_bbox.expand(1.0)
 }

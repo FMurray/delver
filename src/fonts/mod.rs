@@ -2,6 +2,7 @@ mod generated;
 
 pub use generated::*;
 
+use crate::geo::Rect;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -15,7 +16,7 @@ pub struct FontMetrics {
     pub flags: u32,
     pub font_family: String,
     pub font_weight: String,
-    pub glyph_widths: HashMap<u8, f32>,
+    pub glyph_widths: HashMap<u32, f32>,
 }
 
 // Existing sanitization needs to handle PDF's subset prefixes
