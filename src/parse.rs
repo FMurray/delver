@@ -7,7 +7,7 @@ use std::path::Path;
 use std::thread::current;
 use uuid::Uuid;
 
-use crate::geo::{multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
+use crate::geo::{pre_translate,multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
 use crate::layout::MatchContext;
 // use crate::layout::MatchContext;
 use crate::logging::{PDF_BT, PDF_OPERATIONS, PDF_PARSING, PDF_TEXT_OBJECT};
@@ -20,31 +20,31 @@ use tracing::{error, event, instrument, trace, warn, Span};
 #[cfg(feature = "async")]
 use tokio::runtime::Builder;
 
-use crate::fonts::{sanitize_font_name, FontMetrics, FONT_METRICS};
+use crate::fonts::{canonicalize_font_name, FontMetrics, FONT_METRICS};
 
-static IGNORE: &[&str] = &[
-    "Length",
-    "BBox",
-    "FormType",
-    "Matrix",
-    "Type",
-    "XObject",
-    "Subtype",
-    "Filter",
-    "ColorSpace",
-    "Width",
-    "Height",
-    "BitsPerComponent",
-    "Length1",
-    "Length2",
-    "Length3",
-    "PTEX.FileName",
-    "PTEX.PageNumber",
-    "PTEX.InfoDict",
+static IGNORE: &[&[u8]] = &[
+    b"Length",
+    b"BBox",
+    b"FormType",
+    b"Matrix",
+    b"Type",
+    b"XObject",
+    b"Subtype",
+    b"Filter",
+    b"ColorSpace",
+    b"Width",
+    b"Height",
+    b"BitsPerComponent",
+    b"Length1",
+    b"Length2",
+    b"Length3",
+    b"PTEX.FileName",
+    b"PTEX.PageNumber",
+    b"PTEX.InfoDict",
     // "FontDescriptor",
-    "ExtGState",
+    b"ExtGState",
     // "MediaBox",
-    "Annot",
+    b"Annot",
 ];
 
 fn filter_func(object_id: (u32, u16), object: &mut Object) -> Option<((u32, u16), Object)> {
@@ -127,7 +127,6 @@ struct TextObjectState<'a> {
     font_name: Option<String>,
     glyphs: Vec<PositionedGlyph>,
     text_buffer: String,
-    current_font_object: Option<Object>,
     font_metrics: Option<&'static FontMetrics>,
     current_encoding: Option<&'a Encoding<'a>>,
     current_metrics: Option<&'static FontMetrics>,
@@ -145,7 +144,6 @@ impl<'a> Default for TextObjectState<'a> {
             text_line_matrix: IDENTITY_MATRIX,
             glyphs: Vec::new(),
             text_buffer: String::new(),
-            current_font_object: None,
             font_metrics: None,
             current_encoding: None,
             current_metrics: None,
@@ -185,6 +183,7 @@ struct TextState<'a> {
     scale: f32,
     leading: f32,
     font: Option<&'a FontMetrics>,
+    font_dict: Option<Object>,
     fontname: String,
     encoding: Option<&'a Encoding<'a>>,
     size: f32,
@@ -200,6 +199,7 @@ impl<'a> Default for TextState<'a> {
             scale: 1.0,
             leading: 0.0,
             font: None,
+            font_dict: None,
             fontname: String::new(),
             encoding: None,
             size: 0.0,
@@ -209,12 +209,14 @@ impl<'a> Default for TextState<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 struct PositionedGlyph {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    cid: u32,
+    unicode: char,
+    text_matrix: Matrix,
+    device_matrix: Matrix,
+    bbox: Rect,
+    advance: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,135 +258,140 @@ impl fmt::Display for TextElement {
     }
 }
 
+fn process_glyph(
+    tos: &mut TextObjectState,
+    ts: &mut TextState,
+    operand: &Object,
+    ctm: Matrix,
+) -> LopdfResult<()> {
+    let encoding = ts
+            .encoding
+            .as_ref()
+            .ok_or(LopdfError::CharacterEncoding)?;
+
+    match operand {
+        Object::String(bytes, _) => {
+
+            // Current assumiptions:
+            // 1. The encoding is either a one-byte encoding or a Unicode map encoding (WinAnsi, MacRoman, etc.)
+            // 2. Font uses identity CMap (CID = byte value)
+            // 3. No vertical text layouts
+            let decoded_text = Document::decode_text(encoding, bytes)?;
+
+            
+            // let cmap = Encoding::string_to_bytes(&self, text);
+
+            println!("GLYPH: Font: {}, Size: {}", ts.fontname, ts.size);
+            println!("GLYPH: Text matrix: {:?}", tos.text_matrix);
+            println!("GLYPH: CTM: {:?}", ctm);
+            
+            for ch in decoded_text.chars() {
+                let cid = ch as u32;
+
+                let metrics = ts.font.unwrap();
+
+                let tsm = Matrix {
+                    a: ts.size * ts.scale / 1000.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: ts.size / 1000.0,
+                    e: 0.0,
+                    f: ts.rise,
+                };
+                
+                println!("GLYPH '{}': TSM: {:?}", ch, tsm);
+                
+                let mut advance = metrics.glyph_widths.get(&cid)
+                    .map(|w| (w / 1000.0) * ts.size)
+                    .unwrap_or(0.0);
+
+                if ch == ' ' {
+                    advance += ts.word_space;
+                } 
+                advance += ts.char_space;
+
+                // Retrieve the ascent and descent from the font metrics.
+                // Many fonts (like Times-Roman) provide a positive ascent and a negative descent.
+                let (asc, desc) = if let Some(metrics) = ts.font {
+                    (
+                        (metrics.ascent as f32 / 1000.0) * ts.size,
+                        (metrics.descent as f32 / 1000.0) * ts.size,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+
+                // Calculate TRM = TSM × Tm (PDF spec order)
+                let trm_temp = multiply_matrices(&tsm, &tos.text_matrix);
+                let trm = multiply_matrices(&trm_temp, &ctm);
+                
+                println!("GLYPH '{}': TRM: {:?}", ch, trm);
+                
+                let char_bbox = glyph_bound(metrics, cid, &trm);
+                println!("GLYPH '{}': Bounding box: {:?}", ch, char_bbox);
+
+                // Append the character to the text buffer.
+                // if let Some(last_char) = text_object_state.text_buffer.chars().last() {
+                //     if !(last_char == ' ' && ch == ' ') {
+                //         text_object_state.text_buffer.push(ch);
+                //     }
+                // } else {
+                //     text_object_state.text_buffer.push(ch);
+                // }
+
+                // Save the current text-space baseline position.
+                // let base_x = text_object_state.text_matrix.e += advance * text_state.scale;
+                
+                tos.glyphs.push(PositionedGlyph {
+                    cid,
+                    unicode: ch,
+                    text_matrix: tos.text_matrix,
+                    device_matrix: trm,
+                    bbox: char_bbox,
+                    advance
+                });
+
+                if !(ch == ' ' && tos.text_buffer.ends_with(' ')) {
+                    tos.text_buffer.push(ch);
+                }
+            }
+        }
+        Object::Integer(i) => {
+            let offset = -*i as f32 * (ts.size / 1000.0);
+            tos.text_matrix.e += offset;
+        }
+        Object::Real(f) => {
+            let offset = -*f as f32 * (ts.size / 1000.0);
+            tos.text_matrix.e += offset;
+        }
+        Object::Array(arr) => {
+            collect_text_glyphs(tos, ts, arr, ctm)?;
+        }
+    _ => {}
+}
+    Ok(())
+}
+
 fn collect_text_glyphs(
     text_object_state: &mut TextObjectState,
     text_state: &mut TextState,
     operands: &[Object],
     ctm: Matrix,
-    trm: &mut Matrix,
 ) -> LopdfResult<()> {
-    // Process each text operand.
-    let process_operand = |tos: &mut TextObjectState, text_state: &mut TextState, operand: &Object| -> LopdfResult<()> {
-        let metrics = text_state.font;
-        let encoding = text_state
-            .encoding
-            .as_ref()
-            .ok_or(LopdfError::ContentDecode)?;
-
-        match operand {
-            Object::String(bytes, _) => {
-                let decoded_text = Document::decode_text(encoding, bytes)?;
-                let encoded_bytes = Document::encode_text(encoding, &decoded_text);
-
-                for (byte, ch) in encoded_bytes.iter().zip(decoded_text.chars()) {
-                    let ucs = *byte as u32;
-                    let tsm = Matrix {
-                        a: text_state.size * text_state.scale,
-                        b: 0.0,
-                        c: 0.0,
-                        d: text_state.size,
-                        e: 0.0,
-                        f: text_state.rise,
-                    };
-
-                    // Compute the horizontal advance in text space.
-                    let advance = if let Some(metrics) = metrics {
-                        metrics
-                            .glyph_widths
-                            .get(&ucs)
-                            .map(|w| (w / 1000.0) * text_state.size)
-                            .unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
-
-                    text_object_state.char_tx = (advance * text_state.size + text_state.char_space) * text_state.scale;
-                    text_object_state.char_ty = 0.0;
-
-                    *trm = multiply_matrices(&tsm, &text_object_state.text_matrix);
-
-                    // Retrieve the ascent and descent from the font metrics.
-                    // Many fonts (like Times-Roman) provide a positive ascent and a negative descent.
-                    let (asc, desc) = if let Some(metrics) = text_state.font {
-                        (
-                            (metrics.ascent as f32 / 1000.0) * text_state.size,
-                            (metrics.descent as f32 / 1000.0) * text_state.size,
-                        )
-                    } else {
-                        (0.0, 0.0)
-                    };
-
-                    let char_bbox = glyph_bound(text_object_state.font_metrics.unwrap(), ucs, trm);
-
-                    // Append the character to the text buffer.
-                    if let Some(last_char) = text_object_state.text_buffer.chars().last() {
-                        if !(last_char == ' ' && ch == ' ') {
-                            text_object_state.text_buffer.push(ch);
-                        }
-                    } else {
-                        text_object_state.text_buffer.push(ch);
-                    }
-
-                    // Save the current text-space baseline position.
-                    let base_x = text_state.current_pos.0;
-                    let base_y = text_state.current_pos.1;
-                    
-                    // Compute the four corners in text space.
-                    // In text space the top of the glyph is at baseline + effective_ascent,
-                    // and the bottom is at baseline + effective_descent.
-                    let p_lt = transform_point(&ctm, &text_state.text_matrix, base_x, base_y + effective_asc); // top-left
-                    let p_lb = transform_point(&ctm, &text_state.text_matrix, base_x, base_y + effective_desc); // bottom-left
-                    let p_rt = transform_point(&ctm, &text_state.text_matrix, base_x + advance, base_y + effective_asc); // top-right
-                    let p_rb = transform_point(&ctm, &text_state.text_matrix, base_x + advance, base_y + effective_desc); // bottom-right
-
-                    // Compute the bounding box from the four transformed corners.
-                    let x_min = p_lt.0.min(p_lb.0).min(p_rt.0).min(p_rb.0);
-                    let x_max = p_lt.0.max(p_lb.0).max(p_rt.0).max(p_rb.0);
-                    let y_min = p_lt.1.min(p_lb.1).min(p_rt.1).min(p_rb.1);
-                    let y_max = p_lt.1.max(p_lb.1).max(p_rt.1).max(p_rb.1);
-
-                    text_state.glyphs.push(PositionedGlyph {
-                        x_min,
-                        y_min,
-                        x_max,
-                        y_max,
-                    });
-
-                    // Update the text-space x position by the advance.
-                    text_state.current_pos.0 += advance;
-                }
-            }
-            Object::Integer(i) => {
-                let offset = -*i as f32 * (text_state.font_size / 1000.0);
-                text_state.current_pos.0 += offset;
-            }
-            Object::Real(f) => {
-                let offset = -*f as f32 * (text_state.font_size / 1000.0);
-                text_state.current_pos.0 += offset;
-            }
-            Object::Array(arr) => {
-                let elements = arr.clone();
-                collect_text_glyphs(text_state, &elements, ctm, media_box)?;
-            }
-            _ => {}
-        }
-        Ok(())
-    };
-
     for operand in operands {
-        process_operand(text_state, operand)?;
+        process_glyph(text_object_state, text_state, operand, ctm)?;
     }
     Ok(())
 }
 
 #[tracing::instrument()]
-fn finalize_text_run(state: &TextObjectState, page_number: u32) -> TextElement {
-    if state.glyphs.is_empty() {
+fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32) -> TextElement {
+    if tos.glyphs.is_empty() {
         return TextElement {
             id: Uuid::new_v4(),
             text: String::new(),
-            font_size: state.font_size,
-            font_name: state.font_name.clone(),
+            font_size: ts.size,
+            font_name: Some(ts.fontname.clone()),
             bbox: (0.0, 0.0, 0.0, 0.0),
             page_number,
             operators: Vec::new(),
@@ -396,30 +403,34 @@ fn finalize_text_run(state: &TextObjectState, page_number: u32) -> TextElement {
     let mut x_max = f32::MIN;
     let mut y_max = f32::MIN;
 
-    for g in &state.glyphs {
-        x_min = x_min.min(g.x_min);
-        y_min = y_min.min(g.y_min);
-        x_max = x_max.max(g.x_max);
-        y_max = y_max.max(g.y_max);
+    for g in &tos.glyphs {
+        x_min = x_min.min(g.bbox.x0);
+        y_min = y_min.min(g.bbox.y0);
+        x_max = x_max.max(g.bbox.x1);
+        y_max = y_max.max(g.bbox.y1);
     }
 
-    let text_run = state.text_buffer.clone();
+    let text_run = tos.text_buffer.clone();
+
+    tos.glyphs.clear();
+    tos.text_buffer.clear();
+    tos.operator_log.clear();
 
     let text_element = TextElement {
         id: Uuid::new_v4(),
         text: text_run,
-        font_size: state.font_size,
-        font_name: state.font_name.clone(),
+        font_size: ts.size,
+        font_name: Some(ts.fontname.clone()),
         bbox: (x_min, y_min, x_max, y_max),
         page_number,
-        operators: state.operator_log.clone(),
+        operators: tos.operator_log.clone(),
     };
 
     tracing::debug!(
         element_id = %text_element.id,
         line_id = tracing::field::Empty,
         text_element = ?text_element,
-        state = ?state,
+        state = ?tos,
         "Created text element"
     );
 
@@ -494,12 +505,11 @@ fn operand_as_u8(obj: &Object) -> u8 {
 fn handle_operator<'a>(
     gs_stack: &mut Vec<GraphicsState<'a>>,
     op: &lopdf::content::Operation,
-    mut in_text_object: bool,
+    text_object_state: &mut TextObjectState,
     text_elements: &mut Vec<TextElement>,
     page_number: u32,
     fonts: &BTreeMap<Vec<u8>, &Dictionary>,
     encodings: &'a BTreeMap<Vec<u8>, Encoding<'a>>,
-    media_box: [f32; 4],
 ) -> Result<(), LopdfError> {
     let current_gs = gs_stack.last_mut().unwrap();
 
@@ -508,27 +518,28 @@ fn handle_operator<'a>(
         "q" => push_graphics_state(gs_stack),
         "Q" => pop_graphics_state(gs_stack),
         "cm" => {
-            if !current_gs.text_state.text_buffer.is_empty() {
-                let text_element = finalize_text_run(&current_gs.text_state, page_number);
+            if !text_object_state.text_buffer.is_empty() {
+                let text_element = finalize_text_run(text_object_state, &current_gs.text_state, page_number);
                 text_elements.push(text_element);
-                current_gs.text_state.glyphs.clear();
-                current_gs.text_state.text_buffer.clear();
-                current_gs.text_state.operator_log.clear();
             }
 
             let matrix = matrix_from_operands(op);
+            println!("CM: New matrix: {:?}", matrix);
+            println!("CM: Current CTM before: {:?}", current_gs.ctm);
+            
             current_gs.ctm = multiply_matrices(&matrix, &current_gs.ctm);
+            
+            println!("CM: Updated CTM after: {:?}", current_gs.ctm);
         }
         // Text Object
         "BT" => {
             tracing::debug!("Begin text object");
-            in_text_object = true;
-            current_gs.text_state.text_matrix = IDENTITY_MATRIX;
-            current_gs.text_state.text_line_matrix = IDENTITY_MATRIX;
+            text_object_state.text_matrix = IDENTITY_MATRIX;
+            text_object_state.text_line_matrix = IDENTITY_MATRIX;
         }
         "ET" => {
             if let Some(element) = text_elements.last_mut() {
-                for op in &current_gs.text_state.operator_log {
+                for op in &text_object_state.operator_log {
                     tracing::debug!(
                         element_id = %element.id,
                         line_id = tracing::field::Empty,
@@ -538,14 +549,14 @@ fn handle_operator<'a>(
                 }
             }
 
-            if !current_gs.text_state.text_buffer.is_empty() {
-                let text_element = finalize_text_run(&current_gs.text_state, page_number);
+            if !text_object_state.text_buffer.is_empty() {
+                let text_element = finalize_text_run(text_object_state, &current_gs.text_state, page_number);
                 text_elements.push(text_element);
-                current_gs.text_state.glyphs.clear();
-                current_gs.text_state.text_buffer.clear();
-                current_gs.text_state.operator_log.clear();
+                
             }
-            in_text_object = false;
+            text_object_state.glyphs.clear();
+            text_object_state.text_buffer.clear();
+            text_object_state.operator_log.clear();
         }
         // Text State
         "Tf" => {
@@ -561,35 +572,35 @@ fn handle_operator<'a>(
                         .get(b"BaseFont")
                         .and_then(Object::as_name)
                         .map(|name| String::from_utf8_lossy(name))
-                        .map(|name| sanitize_font_name(&name).to_string())
+                        .map(|name| canonicalize_font_name(&name).to_string())
                         .unwrap_or("".to_string());
 
-                    current_gs.text_state.font_name = Some(base_font.to_string());
-                    current_gs.text_state.font_size = font_size;
-                    current_gs.text_state.current_font_object =
+                    current_gs.text_state.fontname = base_font.to_string();
+                    current_gs.text_state.size = font_size;
+                    current_gs.text_state.font_dict =
                         Some(Object::Dictionary((*dict).clone()));
 
                     // Use base_font for metrics lookup
-                    current_gs.text_state.current_font_metrics =
+                    current_gs.text_state.font =
                         FONT_METRICS.get(base_font.as_str()).copied();
                     // Use original font_name for encoding lookup
-                    current_gs.text_state.current_encoding = encodings.get(font_name).clone();
+                    current_gs.text_state.encoding = encodings.get(font_name).clone();
                 }
             }
         }
         "Tc" => {
             if let Some(spacing) = op.operands.first() {
-                current_gs.text_state.character_spacing = operand_as_float(spacing)
+                current_gs.text_state.char_space = operand_as_float(spacing)
             }
         }
         "Tw" => {
             if let Some(spacing) = op.operands.first() {
-                current_gs.text_state.word_spacing = operand_as_float(spacing)
+                current_gs.text_state.word_space = operand_as_float(spacing)
             }
         }
         "Tz" => {
             if let Some(scale_percent) = op.operands.first() {
-                current_gs.text_state.horizontal_scaling = operand_as_float(scale_percent) / 100.0
+                current_gs.text_state.scale = operand_as_float(scale_percent) / 100.0
             }
         }
         "TL" => {
@@ -599,7 +610,7 @@ fn handle_operator<'a>(
         }
         "Tr" => {
             if let Some(render_mode) = op.operands.first() {
-                current_gs.text_state.render_mode = operand_as_u8(render_mode)
+                current_gs.text_state.render = operand_as_u8(render_mode)
             }
         }
         "Ts" => {
@@ -609,19 +620,28 @@ fn handle_operator<'a>(
         }
         "Tm" => {
             let matrix = matrix_from_operands(op);
-            current_gs.text_state.text_matrix = matrix;
-            current_gs.text_state.text_line_matrix = matrix;
+            text_object_state.text_matrix = matrix;
+            text_object_state.text_line_matrix = matrix;
 
-            current_gs.text_state.operator_log.push(format!("Tm {:?}", matrix));
+            text_object_state.operator_log.push(format!("Tm {:?}", matrix));
+
+            println!("TM: Setting text matrix to: ({}, {}, {}, {}, {}, {})",
+                text_object_state.text_matrix.a,
+                text_object_state.text_matrix.b,
+                text_object_state.text_matrix.c,
+                text_object_state.text_matrix.d,
+                text_object_state.text_matrix.e,
+                text_object_state.text_matrix.f
+            );
         }
         // Text Positioning
         "Td" => {
             if let (Some(tx_obj), Some(ty_obj)) = (op.operands.get(0), op.operands.get(1)) {
                 let tx = operand_as_float(tx_obj);
                 let ty = operand_as_float(ty_obj);
-                current_gs.text_state.text_line_matrix =
-                    pre_translate(current_gs.text_state.text_line_matrix, tx, ty);
-                current_gs.text_state.text_matrix = current_gs.text_state.text_line_matrix;
+                text_object_state.text_line_matrix =
+                    pre_translate(text_object_state.text_line_matrix, tx, ty);
+                text_object_state.text_matrix = text_object_state.text_line_matrix;
             }
         }
         "TD" => {
@@ -630,41 +650,97 @@ fn handle_operator<'a>(
                 let tx = operand_as_float(tx_obj);
                 let ty = operand_as_float(ty_obj);
                 current_gs.text_state.leading = -ty;
-                current_gs.text_state.text_line_matrix =
-                    pre_translate(current_gs.text_state.text_line_matrix, tx, ty);
-                current_gs.text_state.text_matrix = current_gs.text_state.text_line_matrix;
+                text_object_state.text_line_matrix =
+                    pre_translate(text_object_state.text_line_matrix, tx, ty);
+                text_object_state.text_matrix = text_object_state.text_line_matrix;
             }
         }
         "T*" => {
             let tx = 0.0;
             let ty = -current_gs.text_state.leading;
-            let tm: [f32; 6] = translate_matrix(tx, ty);
-            current_gs.text_state.text_matrix =
-                multiply_matrices(&current_gs.text_state.text_line_matrix, &tm);
-            current_gs.text_state.text_line_matrix = current_gs.text_state.text_matrix;
+            text_object_state.text_line_matrix = pre_translate(text_object_state.text_line_matrix, tx, ty);
+            text_object_state.text_matrix = text_object_state.text_line_matrix;
         }
         // Text Showing
         "Tj" | "TJ" | "'" | "\"" => {
             let operator = op.operator.clone();
             let operands = op.operands.iter().map(|o| format!("{:?}", o)).collect::<Vec<_>>().join(", ");
-            current_gs.text_state.operator_log.push(format!("{} [{}]", operator, operands));
+            text_object_state.operator_log.push(format!("{} [{}]", operator, operands));
             
             collect_text_glyphs(
+                text_object_state,
                 &mut current_gs.text_state,
                 &op.operands,
-                current_gs.ctm,
-                media_box,
+                current_gs.ctm
             )?;
 
-            let text_element = finalize_text_run(&current_gs.text_state, page_number);
+            let text_element = finalize_text_run(text_object_state, &current_gs.text_state, page_number);
             text_elements.push(text_element);
-
-            current_gs.text_state.glyphs.clear();
-            current_gs.text_state.text_buffer.clear();
         }
         _ => {}
     }
     Ok(())
+}
+
+fn pdf_page_transform(page_dict: &Dictionary) -> (Rect, Matrix) {
+    // Get MediaBox
+    let mediabox = page_dict
+        .get(b"MediaBox")
+        .and_then(|obj| obj.as_array())
+        .map(|arr| {
+            let mut box_rect = [0.0; 4];
+            for (i, obj) in arr.iter().take(4).enumerate() {
+                box_rect[i] = match obj {
+                    Object::Integer(i) => *i as f32,
+                    Object::Real(f) => *f,
+                    _ => 0.0,
+                };
+            }
+            Rect {
+                x0: box_rect[0],
+                y0: box_rect[1],
+                x1: box_rect[2],
+                y1: box_rect[3],
+            }
+        })
+        .unwrap_or(Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 612.0,
+            y1: 792.0,
+        });
+
+    // Check for rotation
+    let rotate = page_dict
+        .get(b"Rotate")
+        .and_then(|obj| obj.as_i64())
+        .unwrap_or(0) as i32;
+
+    // Calculate the transform matrix
+    let mut ctm = IDENTITY_MATRIX;
+    
+    // Apply rotation if present
+    if rotate != 0 {
+        let rx = (mediabox.x0 + mediabox.x1) * 0.5;
+        let ry = (mediabox.y0 + mediabox.y1) * 0.5;
+        
+        // Translate to origin, rotate, translate back
+        ctm = pre_translate(ctm,-rx, -ry);
+        ctm = multiply_matrices(&Matrix {
+            a: (rotate == 90 || rotate == -270) as i32 as f32 * -1.0 + (rotate == 0 || rotate == 180) as i32 as f32,
+            b: (rotate == 90 || rotate == -270) as i32 as f32,
+            c: (rotate == 270 || rotate == -90) as i32 as f32,
+            d: (rotate == 270 || rotate == -90) as i32 as f32 * -1.0 + (rotate == 0 || rotate == 180) as i32 as f32,
+            e: 0.0,
+            f: 0.0,
+        }, &ctm);
+        ctm = pre_translate(ctm, rx, ry);
+    }
+
+    println!("PAGE TRANSFORM: MediaBox: {:?}, Rotation: {}", mediabox, rotate);
+    println!("PAGE TRANSFORM: Final CTM: {:?}", ctm);
+
+    (mediabox, ctm)
 }
 
 fn get_page_text_elements(
@@ -673,37 +749,25 @@ fn get_page_text_elements(
     page_id: (u32, u16),
 ) -> Result<Vec<TextElement>, LopdfError> {
     let mut text_elements = Vec::new();
-    let mut gs_stack = vec![GraphicsState::default()];
+    let mut text_object_state = TextObjectState::default();
 
     let content_data = match doc.get_and_decode_page_content(page_id) {
         Ok(content) => content,
         Err(e) => {
             error!("Failed to decode content for page {}: {}", page_number, e);
-            panic!("Failed to decode content for page {}", e);
+            return Err(e);
         }
     };
-    let page_dict = doc.get_dictionary(page_id).unwrap();
+    let page_dict = doc.get_dictionary(page_id)?;
 
-    let media_box = page_dict
-        .get(b"MediaBox")
-        .and_then(|obj| obj.as_array())
-        .map(|arr| {
-            let mut media_box = [0.0; 4];
-            for (i, obj) in arr.iter().take(4).enumerate() {
-                media_box[i] = match obj {
-                    Object::Integer(i) => *i as f32,
-                    Object::Real(f) => *f,
-                    _ => 0.0,
-                };
-            }
-            media_box
-        })
-        .unwrap_or([0.0; 4]);
-
-    let page_rotation = page_dict
-        .get(b"Rotate")
-        .and_then(|obj| obj.as_i64())
-        .unwrap_or(0);
+    // Calculate page transform and mediabox
+    let (mediabox, page_ctm) = pdf_page_transform(page_dict);
+    
+    // Initialize graphics state with this transform
+    let mut gs_stack = vec![GraphicsState {
+        ctm: page_ctm,
+        text_state: TextState::default(),
+    }];
 
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
@@ -735,16 +799,37 @@ fn get_page_text_elements(
         handle_operator(
             &mut gs_stack,
             &op,
-            in_text_object,
+            &mut text_object_state,
             &mut text_elements,
             page_number,
             &fonts,
             &encodings,
-            media_box,
         )?;
     }
 
-    Ok(text_elements)
+    // After processing content, convert coordinates to top-left based system
+    let mut top_left_elements = Vec::new();
+    for element in text_elements {
+        let (x0, y0, x1, y1) = element.bbox;
+        
+        // Convert to top-left coordinates by flipping Y axis
+        let top_left_bbox = (
+            x0,               // Left remains the same
+            mediabox.y1 - y1, // Top = page_height - bottom
+            x1,               // Right remains the same  
+            mediabox.y1 - y0  // Bottom = page_height - top
+        );
+        
+        let mut new_element = element.clone();
+        new_element.bbox = top_left_bbox;
+        top_left_elements.push(new_element);
+    }
+
+    for element in &top_left_elements {
+        println!("{:?}", element);
+    }
+    
+    Ok(top_left_elements)
 }
 
 pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
@@ -970,19 +1055,25 @@ pub fn group_text_into_lines_and_blocks(
 
 
 /// The transformed bounding box as a `Rect`.
-pub fn glyph_bound(font: &FontMetrics, glyph: u32, trm: &Matrix) -> Rect {
-    // Look up the glyph width; if not present, default to 0.0.
-    let glyph_width = font.glyph_widths.get(&glyph).cloned().unwrap_or(0.0);
-    // Define a base bounding box:
-    //   x: 0 to glyph_width, y: from the font's overall bbox y-min to y-max.
+pub fn glyph_bound(font: &FontMetrics, glyph_id: u32, trm: &Matrix) -> Rect {
+    let glyph_width = font.glyph_widths.get(&glyph_id).cloned().unwrap_or(0.0);
+    
+    println!("BOUND: Glyph ID: {}, Width: {}", glyph_id, glyph_width);
+    println!("BOUND: Font metrics - Ascent: {}, Descent: {}", font.ascent, font.descent);
+    
     let base_bbox = Rect {
         x0: 0.0,
-        y0: font.bbox.y0,
+        y0: font.descent as f32,
         x1: glyph_width,
-        y1: font.bbox.y1,
+        y1: font.ascent as f32,
     };
-    // Transform the base bbox by the text rendering matrix.
+    
+    println!("BOUND: Base bbox: {:?}", base_bbox);
+    println!("BOUND: TRM: {:?}", trm);
+    
     let transformed_bbox = transform_rect(&base_bbox, trm);
-    // Optionally expand the box slightly (similar to MuPDF's fz_expand_rect).
-    transformed_bbox.expand(1.0)
+    
+    println!("BOUND: Transformed bbox: {:?}", transformed_bbox);
+    
+    transformed_bbox
 }

@@ -64,6 +64,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Process the PDF
     let (doc, blocks) = process_pdf(&pdf_bytes, &template_str)?;
 
+    // for block in blocks {
+    //     // println!("block: {:?}", block);
+    //     for line in block.lines {
+    //         println!("{:?} {:?}", line.text, line.bbox);
+    //     }
+    // }
+
     #[cfg(feature = "debug-viewer")]
     debug_viewer::launch_viewer(&doc, &blocks, debug_store)?;
 
@@ -75,6 +82,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     }
     //     None => println!("{}", json),
     // }
-
     Ok(())
 }

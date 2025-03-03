@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq)]
 pub struct Rect {
     pub x0: f32,
     pub y0: f32,
@@ -13,6 +13,15 @@ impl Rect {
             y0: self.y0 - amount,
             x1: self.x1 + amount,
             y1: self.y1 + amount,
+        }
+    }
+
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
         }
     }
 }
@@ -72,12 +81,12 @@ pub const IDENTITY_MATRIX: Matrix = Matrix {
 
 pub fn multiply_matrices(a: &Matrix, b: &Matrix) -> Matrix {
     Matrix {
-        a: a.a * b.a + a.c * b.b,
+        a: a.a * b.a + a.b * b.c,
         b: a.a * b.b + a.c * b.d,
-        c: a.a * b.c + a.c * b.d,
-        d: a.a * b.d + a.c * b.d,
-        e: a.a * b.e + a.c * b.f + b.e,
-        f: a.a * b.f + a.c * b.f + b.f,
+        c: a.c * b.a + a.d * b.c,
+        d: a.c * b.b + a.d * b.d,
+        e: a.e * b.a + a.f * b.c + b.e,
+        f: a.e * b.b + a.f * b.d + b.f,
     }
 }
 
@@ -102,7 +111,7 @@ pub fn transform_rect(r: &Rect, m: &Matrix) -> Rect {
     }
 }
 
-fn pre_translate(m: Matrix, tx: f32, ty: f32) -> Matrix {
+pub fn pre_translate(m: Matrix, tx: f32, ty: f32) -> Matrix {
     Matrix {
         a: m.a,
         b: m.b,

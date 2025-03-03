@@ -1,7 +1,14 @@
+#[path = "src/fonts/mod.rs"]
+mod fonts;
+
+#[path = "src/fonts/canonicalize.rs"]
+mod canonicalize;
+use canonicalize::canonicalize_font_name;
+
+use rusttype::{point, Font, Scale};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-
 #[derive(Debug, Default)]
 struct IntermediateMetrics {
     font_name: String,
@@ -33,80 +40,107 @@ pub struct FontMetrics {
 }
 
 fn main() {
-    let afm_dir = Path::new("src/fonts/afm/");
     let mut output = String::new();
-    let mut font_metrics = Vec::new();
-
     output.push_str("// AUTO-GENERATED FILE - DO NOT EDIT\n");
-    output.push_str("use super::FontMetrics;\n");
-    output.push_str("use lazy_static::lazy_static;\n");
-    output.push_str("use std::collections::HashMap;\n\n");
+    output.push_str("use super::FontMetrics;\nuse lazy_static::lazy_static;\nuse std::collections::HashMap;\n\n");
 
+    let afm_dir = Path::new("src/fonts/afm/");
+    let mut font_metrics = Vec::new();
     for entry in fs::read_dir(afm_dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().map(|s| s != "afm").unwrap_or(true) {
             continue;
         }
-
         let afm_content = fs::read_to_string(&path).unwrap();
         let metrics = parse_afm(&afm_content);
         font_metrics.push(metrics.clone());
+        output.push_str(&generate_lazy_static_block(&metrics));
+    }
 
-        output.push_str(&format!(
-            "lazy_static! {{\n\
-            pub static ref {}: FontMetrics = FontMetrics {{\n\
-                ascent: {:.1},\n\
-                descent: {:.1},\n\
-                cap_height: {:.1},\n\
-                x_height: {:.1},\n\
-                italic_angle: {:.1},\n\
-                bbox: ({:.1}, {:.1}, {:.1}, {:.1}),\n\
-                flags: {},\n\
-                font_family: \"{}\".to_string(),\n\
-                font_weight: \"{}\".to_string(),\n\
-                glyph_widths: vec![\n",
-            sanitize_name(&metrics.font_name),
-            metrics.ascent as f32,
-            metrics.descent as f32,
-            metrics.cap_height as f32,
-            metrics.x_height as f32,
-            metrics.italic_angle,
-            metrics.bbox.0,
-            metrics.bbox.1,
-            metrics.bbox.2,
-            metrics.bbox.3,
-            metrics.flags,
-            metrics.font_family,
-            metrics.font_weight
-        ));
+    let ttf_dir = Path::new("src/fonts/ttf/");
+    for entry in fs::read_dir(ttf_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().map(|s| s != "ttf").unwrap_or(true) {
+            continue;
+        }
+        let font_data = fs::read(&path).unwrap();
+        let font = rusttype::Font::try_from_vec(font_data).expect("Error constructing TTF font");
 
-        for (code, width) in &metrics.glyph_widths {
-            output.push_str(&format!("({}, {:.1}),", code, width));
+        let scale = rusttype::Scale::uniform(1000.0);
+        let v_metrics = font.v_metrics(scale);
+        let mut glyph_widths: HashMap<u8, f32> = HashMap::new();
+        for code in 32u8..=126u8 {
+            let ch = char::from(code);
+            let glyph = font.glyph(ch).scaled(scale);
+            glyph_widths.insert(code, glyph.h_metrics().advance_width);
         }
 
-        output.push_str(
-            "].into_iter().collect(),\n\
-            };\n}\n\n",
-        );
+        let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let (font_family, font_weight) = if name.contains('_') {
+            let parts: Vec<&str> = name.split('_').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        } else if name.contains('-') {
+            let parts: Vec<&str> = name.split('-').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (name.clone(), "Regular".to_string())
+        };
+
+        let metrics = FontMetrics {
+            ascent: v_metrics.ascent,
+            descent: v_metrics.descent,
+            cap_height: v_metrics.ascent,
+            x_height: v_metrics.ascent * 0.5,
+            italic_angle: 0.0,
+            bbox: (0.0, v_metrics.descent, 1000.0, v_metrics.ascent),
+            flags: 0,
+            font_name: name.clone(),
+            font_family,
+            font_weight,
+            glyph_widths,
+        };
+        output.push_str(&generate_lazy_static_block(&metrics));
+        font_metrics.push(metrics);
     }
 
-    output.push_str("\nlazy_static! {\n");
-    output.push_str("    pub static ref FONT_METRICS: std::collections::HashMap<&'static str, &'static FontMetrics> = {\n");
-    output.push_str("        let mut m = std::collections::HashMap::new();\n");
-
+    output.push_str("\nlazy_static! {\n    pub static ref FONT_METRICS: std::collections::HashMap<&'static str, &'static FontMetrics> = {\n        let mut m = std::collections::HashMap::new();\n");
     for font in &font_metrics {
-        let sanitized = sanitize_name(&font.font_name);
+        let canonical_name = canonicalize_font_name(&font.font_name);
+        let sanitized_var_name = sanitize_name(&font.font_name);
+
         output.push_str(&format!(
             "        m.insert(\"{}\", &*{} as &'static FontMetrics);\n",
-            font.font_name, sanitized
+            canonical_name, sanitized_var_name
         ));
     }
-
-    output.push_str("        m\n");
-    output.push_str("    };\n");
-    output.push_str("}\n");
+    output.push_str("        m\n    };\n}\n");
 
     fs::write("src/fonts/generated.rs", output).unwrap();
+}
+
+fn generate_lazy_static_block(metrics: &FontMetrics) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "lazy_static! {{\n    pub static ref {}: FontMetrics = FontMetrics {{\n        ascent: {:.1},\n        descent: {:.1},\n        cap_height: {:.1},\n        x_height: {:.1},\n        italic_angle: {:.1},\n        bbox: ({:.1}, {:.1}, {:.1}, {:.1}),\n        flags: {},\n        font_family: \"{}\".to_string(),\n        font_weight: \"{}\".to_string(),\n        glyph_widths: vec![\n",
+        sanitize_name(&metrics.font_name),
+        metrics.ascent,
+        metrics.descent,
+        metrics.cap_height,
+        metrics.x_height,
+        metrics.italic_angle,
+        metrics.bbox.0,
+        metrics.bbox.1,
+        metrics.bbox.2,
+        metrics.bbox.3,
+        metrics.flags,
+        metrics.font_family,
+        metrics.font_weight
+    ));
+    for (code, width) in &metrics.glyph_widths {
+        s.push_str(&format!("({}, {:.1}),", code, width));
+    }
+    s.push_str("].into_iter().collect(),\n    };\n}\n\n");
+    s
 }
 
 fn parse_afm(content: &str) -> FontMetrics {
@@ -119,7 +153,6 @@ fn parse_afm(content: &str) -> FontMetrics {
             continue;
         }
 
-        // Handle multi-line comments
         if line.starts_with("Comment") {
             continue;
         }
@@ -159,7 +192,6 @@ fn parse_afm(content: &str) -> FontMetrics {
                 let mut code: i32 = -1;
                 let mut width = 0.0;
 
-                // Split line into components
                 let components: Vec<&str> = line.split(';').collect();
                 for component in components {
                     let fields: Vec<&str> = component.split_whitespace().collect();
@@ -178,9 +210,8 @@ fn parse_afm(content: &str) -> FontMetrics {
         }
     }
 
-    // Calculate flags
     if metrics.italic_angle != 0.0 {
-        metrics.flags |= 1 << 6; // Set italic flag
+        metrics.flags |= 1 << 6;
     }
 
     FontMetrics {
