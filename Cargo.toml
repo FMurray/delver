@@ -44,6 +44,7 @@ tracing-tree = "0.4.0"
 once_cell = "1.20.3"
 
 [dev-dependencies]
+flamegraph = "0.6.7"
 pretty_assertions = "1.3"
 
 [build-dependencies]

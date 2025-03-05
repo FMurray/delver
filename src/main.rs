@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use delver_pdf::logging::{init_debug_logging, DebugDataStore};
-use delver_pdf::{debug_viewer, process_pdf};
+use delver_pdf::{debug_viewer::launch_viewer, process_pdf};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -52,35 +52,23 @@ impl Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse_args();
 
+    // Initialize debug data store
     let debug_store = DebugDataStore::default();
+
+    // Initialize tracing with debug layer
     let _guard = init_debug_logging(debug_store.clone());
 
-    // Read the PDF file
+    // Process PDF and launch viewer as before
     let pdf_bytes = fs::read(&args.pdf_path)?;
-
-    // Read the template file
     let template_str = fs::read_to_string(&args.template)?;
-
-    // Process the PDF
-    let (doc, blocks) = process_pdf(&pdf_bytes, &template_str)?;
-
-    // for block in blocks {
-    //     // println!("block: {:?}", block);
-    //     for line in block.lines {
-    //         println!("{:?} {:?}", line.text, line.bbox);
-    //     }
-    // }
+    let (json, blocks, doc) = process_pdf(&pdf_bytes, &template_str)?;
 
     #[cfg(feature = "debug-viewer")]
-    debug_viewer::launch_viewer(&doc, &blocks, debug_store)?;
+    launch_viewer(&doc, &blocks, debug_store)?;
 
-    // // Output the results
-    // match args.output {
-    //     Some(path) => {
-    //         fs::write(&path, json)?;
-    //         info!("Output written to: {:?}", path);
-    //     }
-    //     None => println!("{}", json),
-    // }
+    match args.output {
+        Some(path) => fs::write(&path, json)?,
+        None => println!("{}", json),
+    }
     Ok(())
 }

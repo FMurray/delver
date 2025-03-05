@@ -1,5 +1,6 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
-use crate::layout::{extract_section_content, perform_matching, select_best_match};
+use crate::layout::{MatchContext, TextBlock, TextLine};
+use crate::matcher::{align_template_with_content, MatchedContent, TemplateContentMatch};
 use crate::parse::{get_refs, TextElement};
 use log::{error, info};
 use lopdf::Document;
@@ -20,7 +21,7 @@ pub struct Root {
     pub elements: Vec<Element>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Element {
     pub name: String,
     pub attributes: HashMap<String, Value>,
@@ -222,141 +223,115 @@ fn process_value(pair: Pair<Rule>) -> Value {
 
 pub fn process_template_element(
     template_element: &Element,
+    text_lines: &[TextLine],
     text_elements: &[TextElement],
     doc: &Document,
     inherited_metadata: &HashMap<String, Value>,
 ) -> Vec<ChunkOutput> {
-    info!("\n=== Processing {} ===", template_element.name);
     let context = get_refs(doc).unwrap();
     let mut all_chunks = Vec::new();
 
-    // Create MatchContext with fonts
-    let mut match_context = context;
-    // match_context.fonts = Some(text_elements.first().unwrap().font_name.clone());
-
-    // Handle standalone TextChunk elements (not siblings of Section)
-    if template_element.name == "TextChunk" {
-        // Only process if this is a root-level TextChunk (not a sibling of Section)
-        if template_element.parent.is_none() {
-            return process_text_chunk(template_element, text_elements, inherited_metadata);
-        }
-        return Vec::new(); // Return empty vec for non-root TextChunks
-    }
-
-    // For Section elements, look for matches
-    if let Some(Value::String(match_str)) = template_element.attributes.get("match") {
-        info!(
-            "Looking for match: '{}' in {} elements",
-            match_str,
-            text_elements.len()
-        );
-
-        let threshold = if let Some(Value::Number(n)) = template_element.attributes.get("threshold")
-        {
-            (*n as f64) / 1000.0
-        } else {
-            0.75
-        };
-
-        let matched_elements = perform_matching(&text_elements, match_str, threshold);
-
-        if let Some(best_match) = select_best_match(matched_elements.clone(), &match_context) {
-            info!(
-                "Best match found on page {}: '{}'",
-                best_match.page_number, best_match.text
-            );
-
-            // Process text before the section starts
-            let pre_section_elements = text_elements
-                .iter()
-                .take_while(|e| {
-                    // Stop at the exact position of the section header
-                    e.page_number < best_match.page_number
-                        || (e.page_number == best_match.page_number
-                            && e.bbox.1 <= best_match.bbox.1 - best_match.font_size)
-                    // Subtract font size to avoid including the header
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-
-            // Only chunk pre-section content if there's a TextChunk sibling before this Section
-            if let Some(prev_sibling) = template_element.previous_sibling() {
-                if prev_sibling.as_ref().name == "TextChunk" {
-                    info!(
-                        "Chunking pre-section content ({} elements) up to '{}' on page {}",
-                        pre_section_elements.len(),
-                        best_match.text,
-                        best_match.page_number
-                    );
-                    all_chunks.extend(process_text_chunk(
-                        prev_sibling.as_ref(),
-                        &pre_section_elements,
-                        inherited_metadata,
-                    ));
-                }
-            }
-
-            let mut metadata = inherited_metadata.clone();
-            if let Some(Value::String(alias)) = template_element.attributes.get("as") {
-                metadata.insert(alias.clone(), Value::String(alias.clone()));
-            }
-
-            // Extract the end_match string and find the end element
-            let end_match_str = template_element.attributes.get("end_match").and_then(|v| {
-                if let Value::String(s) = v {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            });
-
-            let end_element = if let Some(end_str) = end_match_str {
-                let end_matched_elements = perform_matching(&text_elements, end_str, threshold);
-                select_best_match(end_matched_elements, &match_context)
-            } else {
-                None
-            };
-
-            // Extract section content
-            let section_text_elements =
-                extract_section_content(text_elements, &best_match, end_element.as_ref());
-
-            // Process child elements within the section boundaries
-            for child in &template_element.children {
-                all_chunks.extend(process_template_element(
-                    child,
-                    &section_text_elements,
-                    doc,
-                    &metadata,
-                ));
-            }
-
-            // Process text after the section ends if there's a TextChunk sibling after this Section
-            if let Some(end_elem) = end_element {
-                if let Some(next_sibling) = template_element.next_sibling() {
-                    if next_sibling.as_ref().name == "TextChunk" {
-                        let post_section_elements = text_elements
-                            .iter()
-                            .skip_while(|e| {
-                                e.page_number < end_elem.page_number
-                                    || (e.page_number == end_elem.page_number
-                                        && e.bbox.1 <= end_elem.bbox.1)
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-
-                        all_chunks.extend(process_text_chunk(
-                            next_sibling.as_ref(),
-                            &post_section_elements,
-                            inherited_metadata,
-                        ));
-                    }
-                }
-            }
-        }
+    // Use the matcher to align the template with content
+    if let Some(matched) = align_template_with_content(
+        template_element,
+        text_lines,
+        text_elements,
+        &context,
+        inherited_metadata,
+    ) {
+        // Process the matched content to generate chunks
+        all_chunks.extend(process_matched_content(&matched));
     }
 
     all_chunks
+}
+
+// Process the matched content to generate chunks
+pub fn process_matched_content(matched: &TemplateContentMatch) -> Vec<ChunkOutput> {
+    let mut chunks = Vec::new();
+
+    match &matched.matched_content {
+        MatchedContent::Chunk { content } => {
+            // Convert elements to chunks directly
+            chunks.extend(process_text_chunk_elements(
+                content,
+                &matched.template_element,
+                &matched.metadata,
+            ));
+        }
+        MatchedContent::Section { content, .. } => {
+            // Process child matches first
+            for child in &matched.children {
+                chunks.extend(process_matched_content(child));
+            }
+
+            // If no children processed the content, process it as chunks
+            if chunks.is_empty() && matched.template_element.children.is_empty() {
+                chunks.extend(process_text_chunk_elements(
+                    content,
+                    &matched.template_element,
+                    &matched.metadata,
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    chunks
+}
+
+// Helper function to convert elements to chunks
+fn process_text_chunk_elements(
+    elements: &[TextElement],
+    template_element: &Element,
+    metadata: &HashMap<String, Value>,
+) -> Vec<ChunkOutput> {
+    // Similar to the existing process_text_chunk function
+    let chunk_size = template_element
+        .attributes
+        .get("chunkSize")
+        .map_or(500, |v| {
+            if let Value::Number(n) = v {
+                *n as usize
+            } else {
+                500
+            }
+        });
+
+    let chunk_overlap = template_element
+        .attributes
+        .get("chunkOverlap")
+        .map_or(150, |v| {
+            if let Value::Number(n) = v {
+                *n as usize
+            } else {
+                150
+            }
+        });
+
+    // Use your existing chunking logic
+    let strategy = ChunkingStrategy::Characters {
+        max_chars: chunk_size,
+    };
+    let chunks = chunk_text_elements(elements, &strategy, chunk_overlap);
+
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let chunk_text = chunk
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            ChunkOutput {
+                text: chunk_text,
+                metadata: metadata.clone(),
+                chunk_index: i,
+            }
+        })
+        .collect()
 }
 
 // Helper function to process TextChunk elements

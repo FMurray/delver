@@ -278,13 +278,6 @@ fn process_glyph(
             // 3. No vertical text layouts
             let decoded_text = Document::decode_text(encoding, bytes)?;
 
-            
-            // let cmap = Encoding::string_to_bytes(&self, text);
-
-            println!("GLYPH: Font: {}, Size: {}", ts.fontname, ts.size);
-            println!("GLYPH: Text matrix: {:?}", tos.text_matrix);
-            println!("GLYPH: CTM: {:?}", ctm);
-            
             for ch in decoded_text.chars() {
                 let cid = ch as u32;
 
@@ -299,8 +292,6 @@ fn process_glyph(
                     f: ts.rise,
                 };
                 
-                println!("GLYPH '{}': TSM: {:?}", ch, tsm);
-                
                 let mut advance = metrics.glyph_widths.get(&cid)
                     .map(|w| (w / 1000.0) * ts.size)
                     .unwrap_or(0.0);
@@ -310,25 +301,12 @@ fn process_glyph(
                 } 
                 advance += ts.char_space;
 
-                // Retrieve the ascent and descent from the font metrics.
-                // Many fonts (like Times-Roman) provide a positive ascent and a negative descent.
-                let (asc, desc) = if let Some(metrics) = ts.font {
-                    (
-                        (metrics.ascent as f32 / 1000.0) * ts.size,
-                        (metrics.descent as f32 / 1000.0) * ts.size,
-                    )
-                } else {
-                    (0.0, 0.0)
-                };
-
                 // Calculate TRM = TSM × Tm (PDF spec order)
                 let trm_temp = multiply_matrices(&tsm, &tos.text_matrix);
                 let trm = multiply_matrices(&trm_temp, &ctm);
                 
-                println!("GLYPH '{}': TRM: {:?}", ch, trm);
                 
                 let char_bbox = glyph_bound(metrics, cid, &trm);
-                println!("GLYPH '{}': Bounding box: {:?}", ch, char_bbox);
 
                 // Append the character to the text buffer.
                 // if let Some(last_char) = text_object_state.text_buffer.chars().last() {
@@ -440,14 +418,31 @@ fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32
 pub fn get_pdf_text(doc: &Document) -> Result<BTreeMap<u32, Vec<TextElement>>, Error> {
     let mut pages_map: BTreeMap<u32, Vec<TextElement>> = BTreeMap::new();
 
-    for (page_num, page_id) in doc.get_pages().into_iter().take(1) {
+    // for (page_num, page_id) in doc.get_pages().into_iter().into_par_iter() {
+    //     let text_elements = get_page_text_elements(doc, page_num, page_id).map_err(|e| {
+    //         Error::new(
+    //             ErrorKind::Other,
+    //             format!("Failed to extract text from page {page_num} id={page_id:?}: {e:?}"),
+    //         )
+    //     })?;
+    //     pages_map.insert(page_num, text_elements);
+    // }
+
+    let results: Result<Vec<(u32, Vec<TextElement>)>, Error> = doc.get_pages()
+    .into_par_iter()
+    .map(|(page_num, page_id)| {
         let text_elements = get_page_text_elements(doc, page_num, page_id).map_err(|e| {
             Error::new(
                 ErrorKind::Other,
                 format!("Failed to extract text from page {page_num} id={page_id:?}: {e:?}"),
             )
         })?;
-        pages_map.insert(page_num, text_elements);
+        Ok((page_num, text_elements))
+    })
+    .collect();
+
+    for (page_num, elements) in results? {
+        pages_map.insert(page_num, elements);
     }
 
     Ok(pages_map)
@@ -524,12 +519,9 @@ fn handle_operator<'a>(
             }
 
             let matrix = matrix_from_operands(op);
-            println!("CM: New matrix: {:?}", matrix);
-            println!("CM: Current CTM before: {:?}", current_gs.ctm);
             
             current_gs.ctm = multiply_matrices(&matrix, &current_gs.ctm);
-            
-            println!("CM: Updated CTM after: {:?}", current_gs.ctm);
+        
         }
         // Text Object
         "BT" => {
@@ -624,15 +616,6 @@ fn handle_operator<'a>(
             text_object_state.text_line_matrix = matrix;
 
             text_object_state.operator_log.push(format!("Tm {:?}", matrix));
-
-            println!("TM: Setting text matrix to: ({}, {}, {}, {}, {}, {})",
-                text_object_state.text_matrix.a,
-                text_object_state.text_matrix.b,
-                text_object_state.text_matrix.c,
-                text_object_state.text_matrix.d,
-                text_object_state.text_matrix.e,
-                text_object_state.text_matrix.f
-            );
         }
         // Text Positioning
         "Td" => {
@@ -737,9 +720,6 @@ fn pdf_page_transform(page_dict: &Dictionary) -> (Rect, Matrix) {
         ctm = pre_translate(ctm, rx, ry);
     }
 
-    println!("PAGE TRANSFORM: MediaBox: {:?}, Rotation: {}", mediabox, rotate);
-    println!("PAGE TRANSFORM: Final CTM: {:?}", ctm);
-
     (mediabox, ctm)
 }
 
@@ -782,10 +762,8 @@ fn get_page_text_elements(
         .map(|(name, font)| font.get_font_encoding(doc).map(|it| (name.clone(), it)))
         .collect::<LopdfResult<BTreeMap<Vec<u8>, Encoding>>>()?;
 
-    let mut in_text_object = false;
-    let mut text_block_span: Option<Span> = None;
 
-    for (i, op) in content_data
+    for (_i, op) in content_data
         .operations
         .iter()
         .filter(|op| {
@@ -825,10 +803,6 @@ fn get_page_text_elements(
         top_left_elements.push(new_element);
     }
 
-    for element in &top_left_elements {
-        println!("{:?}", element);
-    }
-    
     Ok(top_left_elements)
 }
 
@@ -865,201 +839,11 @@ pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
     Ok(context)
 }
 
-/// Represents a single line of text on the page after grouping TextElements.
-#[derive(Debug, Clone)]
-pub struct TextLine {
-    pub id: Uuid,
-    pub text: String,
-    pub page_number: u32,
-    pub elements: Vec<TextElement>,
-    /// A bounding box for the entire line (x_min, y_min, x_max, y_max).
-    pub bbox: (f32, f32, f32, f32),
-}
-
-impl TextLine {
-    pub fn from_elements(page_number: u32, items: Vec<TextElement>) -> Self {
-        let id = Uuid::new_v4();
-        let mut line_min_x = f32::MAX;
-        let mut line_min_y = f32::MAX;
-        let mut line_max_x = f32::MIN;
-        let mut line_max_y = f32::MIN;
-        let mut combined_text = String::new();
-
-        for (_, it) in items.iter().enumerate() {
-            line_min_x = line_min_x.min(it.bbox.0);
-            line_max_x = line_max_x.max(it.bbox.2);
-            line_min_y = line_min_y.min(it.bbox.1);
-            line_max_y = line_max_y.max(it.bbox.3);
-
-            // TODO: Add gap calculation if necessary
-            // if i > 0 {
-            //     let prev = &items[i - 1];
-            //     l_gapgap = it.bbox.0 - (prev.bbox.2);
-            // }
-            combined_text.push_str(&it.text);
-        }
-
-        let line = TextLine {
-            id,
-            text: combined_text,
-            page_number,
-            elements: items,
-            bbox: (line_min_x, line_min_y, line_max_x, line_max_y),
-        };
-
-        tracing::debug!(
-            line_id = %line.id,
-            parent = %line.id,
-            children = %serde_json::to_string(&line.elements.iter().map(|e| e.id).collect::<Vec<_>>()).unwrap(),
-            rel_type = "line_to_elements",
-            "Created text line with {} elements",
-            line.elements.len()
-        );
-        
-        line
-    }
-}
-
-
-
-/// Represents a "block" of consecutive lines that are close in vertical spacing.
-#[derive(Debug, Clone)]
-pub struct TextBlock {
-    pub id: Uuid,
-    pub page_number: u32,
-    pub lines: Vec<TextLine>,
-    /// A bounding box for the entire block (x_min, y_min, x_max, y_max).
-    pub bbox: (f32, f32, f32, f32),
-}
-
-impl TextBlock {
-    pub fn from_lines(page_number: u32, lines: Vec<TextLine>) -> Self {
-        let id = Uuid::new_v4();
-        let (x_min, y_min, x_max, y_max) = lines.iter().fold(
-            (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
-            |(xmin, ymin, xmax, ymax), line| {
-                (
-                    xmin.min(line.bbox.0),
-                    ymin.min(line.bbox.1),
-                    xmax.max(line.bbox.2),
-                    ymax.max(line.bbox.3),
-                )
-            },
-        );
-
-        let block = Self {
-            id: id,
-            page_number,
-            lines,
-            bbox: (x_min, y_min, x_max, y_max),
-        };
-        
-        tracing::debug!(
-            block_id = %block.id,
-            "Created text block with {} lines",
-            block.lines.len()
-        );
-
-        block
-    }
-}
-
-
-/// Example grouping function that demonstrates how to:
-/// 1) Separate text by page
-/// 2) Sort by descending y (top to bottom), then ascending x
-/// 3) Group into lines based on a "y-threshold" and spacing
-/// 4) Group lines into blocks based on vertical proximity
-pub fn group_text_into_lines_and_blocks(
-    pages_map: &BTreeMap<u32, Vec<TextElement>>,
-    line_join_threshold: f32,
-    block_join_threshold: f32,
-) -> Vec<TextBlock> {
-    let mut all_blocks = Vec::new();
-
-    for (page_number, elements) in pages_map.into_iter() {
-        let mut elements = elements.clone();
-        elements.sort_by(|a, b| {
-            b.bbox
-                .1
-                .partial_cmp(&a.bbox.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    a.bbox
-                        .0
-                        .partial_cmp(&b.bbox.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        });
-
-        let mut lines = Vec::new();
-        let mut current_line = Vec::new();
-
-        let mut last_y = f32::MAX;
-
-        for elem in elements {
-            if current_line.is_empty() {
-                current_line.push(elem.clone());
-                last_y = elem.bbox.1;
-            } else {
-                if (last_y - elem.bbox.1).abs() < line_join_threshold {
-                    current_line.push(elem.clone());
-                } else {
-                    lines.push(TextLine::from_elements(*page_number, current_line));
-                    current_line = vec![elem.clone()];
-                    last_y = elem.bbox.1;
-                }
-            }
-        }
-
-        if !current_line.is_empty() {
-            lines.push(TextLine::from_elements(*page_number, current_line));
-        }
-
-        for line in &mut lines {
-            line.elements.sort_by(|a, b| {
-                a.bbox
-                    .0
-                    .partial_cmp(&b.bbox.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-
-        let mut blocks = Vec::new();
-        let mut current_block_lines = Vec::new();
-
-        let mut prev_line_y: Option<f32> = None;
-        for line in lines {
-            let line_y_top = line.bbox.1.min(line.bbox.3);
-            if let Some(py) = prev_line_y {
-                if (py - line_y_top).abs() > block_join_threshold {
-                    if !current_block_lines.is_empty() {
-                        blocks.push(TextBlock::from_lines(*page_number, current_block_lines));
-                        current_block_lines = Vec::new();
-                    }
-                }
-            }
-            prev_line_y = Some(line_y_top);
-            current_block_lines.push(line);
-        }
-
-        if !current_block_lines.is_empty() {
-            blocks.push(TextBlock::from_lines(*page_number, current_block_lines));
-        }
-
-        all_blocks.extend(blocks);
-    }
-
-    all_blocks
-}
-
 
 /// The transformed bounding box as a `Rect`.
 pub fn glyph_bound(font: &FontMetrics, glyph_id: u32, trm: &Matrix) -> Rect {
+    // Look up the glyph width; if not present, default to 0.0.
     let glyph_width = font.glyph_widths.get(&glyph_id).cloned().unwrap_or(0.0);
-    
-    println!("BOUND: Glyph ID: {}, Width: {}", glyph_id, glyph_width);
-    println!("BOUND: Font metrics - Ascent: {}, Descent: {}", font.ascent, font.descent);
     
     let base_bbox = Rect {
         x0: 0.0,
@@ -1068,12 +852,7 @@ pub fn glyph_bound(font: &FontMetrics, glyph_id: u32, trm: &Matrix) -> Rect {
         y1: font.ascent as f32,
     };
     
-    println!("BOUND: Base bbox: {:?}", base_bbox);
-    println!("BOUND: TRM: {:?}", trm);
-    
     let transformed_bbox = transform_rect(&base_bbox, trm);
-    
-    println!("BOUND: Transformed bbox: {:?}", transformed_bbox);
     
     transformed_bbox
 }
