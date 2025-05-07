@@ -75,14 +75,16 @@ pub struct PdfText {
 
 #[cfg(not(feature = "async"))]
 pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    // Document::load_filtered(path, filter_func)
-    //     .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+    // Always use Document::load for now to simplify and test
+    Document::load(path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+    /* Original logic:
     if !cfg!(debug_assertions) {
         Document::load(path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     } else {
         Document::load_filtered(path, filter_func)
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     }
+    */
 }
 
 #[cfg(feature = "async")]
