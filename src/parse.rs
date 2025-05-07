@@ -60,9 +60,6 @@ fn filter_func(object_id: (u32, u16), object: &mut Object) -> Option<((u32, u16)
         d.remove(b"XObject");
         // d.remove(b"MediaBox");
         d.remove(b"Annots");
-        if d.is_empty() {
-            return None;
-        }
     }
     Some((object_id, object.to_owned()))
 }
@@ -75,16 +72,13 @@ pub struct PdfText {
 
 #[cfg(not(feature = "async"))]
 pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    // Always use Document::load for now to simplify and test
-    Document::load(path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
-    /* Original logic:
+    // Restore original logic
     if !cfg!(debug_assertions) {
         Document::load(path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     } else {
         Document::load_filtered(path, filter_func)
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     }
-    */
 }
 
 #[cfg(feature = "async")]
