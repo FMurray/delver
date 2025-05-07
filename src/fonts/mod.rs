@@ -1,15 +1,14 @@
 mod generated;
 
-pub use generated::*;
 
 // use crate::geo::Rect;
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
-use once_cell::sync::Lazy;
 
 pub mod canonicalize;
 pub use canonicalize::canonicalize_font_name;
+pub use generated::*;
 
 // Re-export the generated types
 // pub use super::FontMetrics;
