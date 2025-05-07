@@ -32,7 +32,7 @@ fn test_10k_template_parsing() -> std::io::Result<()> {
     if let Some(Value::String(s)) = section.attributes.get("match") {
         assert_eq!(
             s,
-            "Management's Discussion and Analysis of Financial Condition and Results of Operations"
+            "Management’s Discussion and Analysis of Financial Condition and Results of Operations"
         );
     }
 
