@@ -65,10 +65,10 @@ fn main() -> Result<()> {
     // Process PDF and launch viewer as before
     let pdf_bytes = fs::read(&args.pdf_path)?;
     let template_str = fs::read_to_string(&args.template)?;
-    let (json, blocks, doc) = process_pdf(&pdf_bytes, &template_str)?;
+    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str)?;
 
     #[cfg(feature = "debug-viewer")]
-    launch_viewer(&doc, &blocks, debug_store)?;
+    launch_viewer(&_doc, &_blocks, debug_store)?;
 
     match args.output {
         Some(path) => fs::write(&path, json)?,

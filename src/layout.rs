@@ -6,7 +6,10 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use strsim::normalized_levenshtein;
 use uuid::Uuid;
+use std::collections::HashMap;
+use std::fmt::Debug;
 
+use crate::geo::{Rect, IDENTITY_MATRIX};
 use crate::parse::TextElement;
 
 // Add this struct at the module level
@@ -232,7 +235,7 @@ pub fn group_text_into_lines(
     text_elements: &Vec<TextElement>,
     line_join_threshold: f32,
 ) -> Vec<TextLine> {
-    let mut all_lines = Vec::new();
+    let all_lines = Vec::new();
 
     let mut elements = text_elements.clone();
     elements.sort_by(|a, b| {

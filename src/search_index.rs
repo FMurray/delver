@@ -3,7 +3,7 @@ use crate::{
     layout::{MatchContext, TextLine},
     parse::TextElement,
 };
-use lopdf::{Document, Object};
+use lopdf::Object;
 use multi_index_map::MultiIndexMap;
 use rstar::{RTree, RTreeObject, AABB};
 use std::collections::{BTreeMap, HashMap, HashSet};

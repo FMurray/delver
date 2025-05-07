@@ -120,19 +120,19 @@ pub fn align_template_with_content<'a>(
 fn match_section<'a, 'map_lt>(
     template: &'a Element,
     index: &'a PdfIndex,
-    page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
+    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
     inherited_metadata: &HashMap<String, Value>,
     prev_match: Option<&TemplateContentMatch<'a>>,
 ) -> Option<TemplateContentMatch<'a>> {
-    let match_config = template.attributes.get("match")?.as_match_config()?;
+    let _match_config = template.attributes.get("match")?.as_match_config()?;
     
-    let mut candidates: Vec<TextLine> = match match_config.match_type {
+    let mut candidates: Vec<TextLine> = match _match_config.match_type {
         MatchType::Text => {
             let owned_elements_for_grouping: Vec<TextElement> = index.elements.iter().map(|el_ref| el_ref.clone()).collect();
             let all_lines = group_text_into_lines(&owned_elements_for_grouping, 5.0);
             index.find_line_text_matches(
-                &match_config.pattern, 
-                match_config.threshold,
+                &_match_config.pattern, 
+                _match_config.threshold,
                 &all_lines 
             )
             .into_iter()
@@ -191,7 +191,7 @@ fn match_section<'a, 'map_lt>(
         .get("end_match")
         .and_then(|v| v.as_string())
     {
-        let end_matches = index.find_text_matches(&end_match_str, match_config.threshold);
+        let end_matches = index.find_text_matches(&end_match_str, _match_config.threshold);
         
         let end_candidates: Vec<_> = end_matches.iter()
             .filter(|(elem, _)| {
@@ -214,7 +214,7 @@ fn match_section<'a, 'map_lt>(
     };
     
     let section_content = extract_section_content(
-        page_map_view,
+        _page_map_view,
         best_match_element_ref.page_number, 
         best_match_element_ref, 
         end_element
@@ -252,7 +252,7 @@ fn match_section<'a, 'map_lt>(
 /// Matches a TextChunk element in the template with content
 fn match_text_chunk<'a, 'map_lt>(
     template: &'a Element,
-    page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
+    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
     index: &'a PdfIndex,
     inherited_metadata: &HashMap<String, Value>,
     prev_match: Option<&TemplateContentMatch<'a>>,
@@ -381,15 +381,15 @@ fn score_match_line(line: &TextElement, index: &PdfIndex) -> f32 {
 
 /// Extracts the content between a start element and an optional end element
 pub fn extract_section_content<'a, 'map_lt>(
-    page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
+    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
     start_page: u32,
-    start_element: &TextElement,
+    _start_element: &TextElement,
     end_element: Option<&TextElement>,
 ) -> Vec<&'a TextElement> {
     let mut content = Vec::new();
     let mut capturing = false;
 
-    for (page_num, elements_on_page) in page_map_view {
+    for (page_num, elements_on_page) in _page_map_view {
         if *page_num < start_page {
             continue;
         }
@@ -400,7 +400,7 @@ pub fn extract_section_content<'a, 'map_lt>(
         }
         for element_ref in elements_on_page {
             if !capturing {
-                if (*element_ref).id == start_element.id {
+                if (*element_ref).id == _start_element.id {
                     capturing = true;
                     content.push(*element_ref);
                 }
@@ -435,16 +435,16 @@ fn create_section_page_map(elements: &[TextElement]) -> BTreeMap<u32, Vec<TextEl
 // Add basic implementations for Table and Image matchers
 fn match_table<'a, 'map_lt>(
     template: &'a Element,
-    page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
+    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
     inherited_metadata: &HashMap<String, Value>,
 ) -> Option<TemplateContentMatch<'a>> {
     println!("MATCHER: Processing Table template element");
 
-    let match_config = template.attributes.get("match")?.as_match_config()?;
+    let _match_config = template.attributes.get("match")?.as_match_config()?;
 
     let table_indicators = ["table", "column", "row", "|", "total"];
 
-    let potential_table_elements: Vec<&'a TextElement> = page_map_view
+    let potential_table_elements: Vec<&'a TextElement> = _page_map_view
         .values()
         .flatten()
         .copied()
@@ -468,7 +468,7 @@ fn match_table<'a, 'map_lt>(
         );
         
         let table_content = extract_section_content(
-            page_map_view,
+            _page_map_view,
             start_marker.page_number,
             start_marker,
             end_marker,
@@ -500,7 +500,7 @@ fn match_table<'a, 'map_lt>(
 
 fn match_image<'a, 'map_lt>(
     template: &'a Element,
-    page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
+    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
     inherited_metadata: &HashMap<String, Value>,
 ) -> Option<TemplateContentMatch<'a>> {
     println!("MATCHER: Processing Image template element");
@@ -514,7 +514,7 @@ fn match_image<'a, 'map_lt>(
         "picture",
     ];
 
-    let potential_image_elements: Vec<&'a TextElement> = page_map_view
+    let potential_image_elements: Vec<&'a TextElement> = _page_map_view
         .values()
         .flatten()
         .copied()
@@ -558,9 +558,9 @@ fn match_image<'a, 'map_lt>(
 
 // Helper function to extract table content
 fn extract_table_content<'a, 'map_lt>(
-    page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
-    start_element: &TextLine,
-    end_element: Option<&TextLine>,
+    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
+    _start_element: &TextLine,
+    _end_element: Option<&TextLine>,
 ) -> Vec<&'a TextElement> {
     Vec::new()
 }

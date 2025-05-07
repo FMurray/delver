@@ -118,18 +118,18 @@ impl<'a> Default for GraphicsState<'a> {
 
 #[derive(Clone)]
 struct TextObjectState<'a> {
-    text_matrix: Matrix,      // Tm
-    text_line_matrix: Matrix, // Tlm
     font_name: Option<String>,
+    text_matrix: Matrix,
+    text_line_matrix: Matrix,
     glyphs: Vec<PositionedGlyph>,
     text_buffer: String,
     font_metrics: Option<&'static FontMetrics>,
-    current_encoding: Option<&'a Encoding<'a>>,
-    current_metrics: Option<&'static FontMetrics>,
+    _current_encoding: Option<&'a Encoding<'a>>,
+    _current_metrics: Option<&'static FontMetrics>,
     operator_log: Vec<String>,
-    char_bbox: Option<Rect>,
-    char_tx: f32,
-    char_ty: f32,
+    _char_bbox: Option<Rect>,
+    _char_tx: f32,
+    _char_ty: f32,
 }
 
 impl<'a> Default for TextObjectState<'a> {
@@ -141,23 +141,32 @@ impl<'a> Default for TextObjectState<'a> {
             glyphs: Vec::new(),
             text_buffer: String::new(),
             font_metrics: None,
-            current_encoding: None,
-            current_metrics: None,
+            _current_encoding: None,
+            _current_metrics: None,
             operator_log: Vec::new(),
-            char_tx: 0.0,
-            char_ty: 0.0,
-            char_bbox: None,
+            _char_bbox: None,
+            _char_tx: 0.0,
+            _char_ty: 0.0,
         }
     }
 }
 
 impl<'a> TextObjectState<'a> {
-    fn reset(&mut self) {
-        self.text_matrix = IDENTITY_MATRIX;
-        self.text_line_matrix = self.text_matrix;
-        self.glyphs.clear();
-        self.text_buffer.clear();
-        self.operator_log.clear();
+    fn new() -> Self {
+        TextObjectState {
+            font_name: None,
+            text_matrix: IDENTITY_MATRIX,
+            text_line_matrix: IDENTITY_MATRIX,
+            glyphs: Vec::new(),
+            text_buffer: String::new(),
+            font_metrics: None,
+            _current_encoding: None,
+            _current_metrics: None,
+            operator_log: Vec::new(),
+            _char_bbox: None,
+            _char_tx: 0.0,
+            _char_ty: 0.0,
+        }
     }
 }
 
@@ -207,12 +216,12 @@ impl<'a> Default for TextState<'a> {
 
 #[derive(Debug, Clone)]
 struct PositionedGlyph {
-    cid: u32,
-    unicode: char,
-    text_matrix: Matrix,
-    device_matrix: Matrix,
+    _cid: u32,
+    _unicode: char,
+    _text_matrix: Matrix,
+    _device_matrix: Matrix,
     bbox: Rect,
-    advance: f32,
+    _advance: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -317,12 +326,12 @@ fn process_glyph(
                 // let base_x = text_object_state.text_matrix.e += advance * text_state.scale;
                 
                 tos.glyphs.push(PositionedGlyph {
-                    cid,
-                    unicode: ch,
-                    text_matrix: tos.text_matrix,
-                    device_matrix: trm,
+                    _cid: cid,
+                    _unicode: ch,
+                    _text_matrix: tos.text_matrix,
+                    _device_matrix: trm,
                     bbox: char_bbox,
-                    advance
+                    _advance: advance
                 });
 
                 if !(ch == ' ' && tos.text_buffer.ends_with(' ')) {

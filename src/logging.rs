@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::sync::Once;
 use std::sync::{Arc, Mutex};
 use tracing::level_filters::LevelFilter;
-use tracing::{Subscriber, Value};
+use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::format::DefaultFields;
 use tracing_subscriber::layer::Context;
@@ -51,11 +51,8 @@ const DEBUG_TARGETS: &[&str] = &[
 ];
 
 enum EntityType {
-    Element,
     Line,
-    Block,
     Template, // Add a new entity type for templates
-    Match,    // Add a new entity type for matches
 }
 
 #[derive(Clone, Default)]
@@ -114,7 +111,7 @@ impl DebugDataStore {
         events
     }
 
-    pub fn record_relationship(&self, parent: Option<Uuid>, children: Vec<Uuid>, rel_type: &str) {
+    pub fn record_relationship(&self, parent: Option<Uuid>, children: Vec<Uuid>, _rel_type: &str) {
         let mut lineage = self.lineage.lock().unwrap();
 
         if let Some(parent_id) = parent {
@@ -202,7 +199,7 @@ impl DebugDataStore {
         EntityEvents { messages, children }
     }
 
-    fn record_entity(&self, entity_id: Uuid, entity_type: EntityType, message: String) {
+    fn record_entity(&self, entity_id: Uuid, _entity_type: EntityType, message: String) {
         let mut arena = self.message_arena.lock().unwrap();
         let idx = arena.len();
         arena.push(message.clone());
@@ -424,7 +421,7 @@ pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
     let debug_layer = DebugLayer::new(store);
 
     // Create a non-blocking file appender to get the WorkerGuard
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let (_non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
 
     // Create a filter that explicitly allows our targets
     let filter = tracing_subscriber::filter::filter_fn(|metadata| {
@@ -537,7 +534,7 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
                     templates.insert(template_id, name);
                 }
             }
-            (_, Some(line_id), Some(template_id), Some(match_id)) => {
+            (_, Some(line_id), Some(template_id), Some(_match_id)) => {
                 println!(
                     "CAPTURE: Found template match between template={} and line={}",
                     template_id, line_id
@@ -568,7 +565,7 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
             }
             // Standard element case
             (Some(e_id), _, _, _) => {
-                self.store.record_entity(e_id, EntityType::Element, message);
+                self.store.record_entity(e_id, EntityType::Line, message);
             }
             // Standard line case
             (_, Some(l_id), _, _) => {
@@ -578,7 +575,7 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
             _ => {
                 if let Some(e_id) = *id_visitor.element_id {
                     self.store
-                        .record_entity(e_id, EntityType::Element, message.clone());
+                        .record_entity(e_id, EntityType::Line, message.clone());
                 }
                 if let Some(l_id) = *id_visitor.line_id {
                     self.store
