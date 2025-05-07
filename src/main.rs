@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use delver_pdf::logging::{init_debug_logging, DebugDataStore};
-use delver_pdf::{debug_viewer::launch_viewer, process_pdf};
+use delver_pdf::process_pdf;
+
+#[cfg(feature = "debug-viewer")]
+use delver_pdf::debug_viewer::launch_viewer;
 
 #[derive(Parser, Debug)]
 #[clap(
