@@ -7,10 +7,10 @@ use uuid::Uuid;
 
 use crate::geo::{pre_translate, multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
 use crate::layout::MatchContext;
-use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
+use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult, Stream};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 #[cfg(feature = "extension-module")]
 use tokio::runtime::Builder;
@@ -163,7 +163,7 @@ struct TextState<'a> {
     word_space: f32,
     scale: f32,
     leading: f32,
-    font: Option<&'a FontMetrics>,
+    font: Option<&'static FontMetrics>,
     font_dict: Option<Object>,
     fontname: String,
     encoding: Option<&'a Encoding<'a>>,
@@ -237,6 +237,23 @@ impl fmt::Display for TextElement {
             self.operators.join(",\n    ")
         )
     }
+}
+
+// Define ImageElement struct
+#[derive(Debug, Clone)]
+pub struct ImageElement {
+    pub id: Uuid,
+    pub page_number: u32,
+    pub bbox: Rect, // Use geo::Rect
+    pub image_object: Object, // Store the raw lopdf image object for now
+    // format, bytes etc. would be derived later from image_object
+}
+
+// Define enum to hold either TextElement or ImageElement
+#[derive(Debug, Clone)]
+pub enum PageContent {
+    Text(TextElement),
+    Image(ImageElement),
 }
 
 fn process_glyph(
@@ -329,17 +346,9 @@ fn collect_text_glyphs(
 }
 
 #[tracing::instrument()]
-fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32) -> TextElement {
-    if tos.glyphs.is_empty() {
-        return TextElement {
-            id: Uuid::new_v4(),
-            text: String::new(),
-            font_size: ts.size,
-            font_name: Some(ts.fontname.clone()),
-            bbox: (0.0, 0.0, 0.0, 0.0),
-            page_number,
-            operators: Vec::new(),
-        };
+fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32) -> Option<PageContent> {
+    if tos.glyphs.is_empty() || tos.text_buffer.trim().is_empty() {
+        return None; // Don't create empty text elements
     }
 
     let mut x_min = f32::MAX;
@@ -358,6 +367,7 @@ fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32
 
     tos.glyphs.clear();
     tos.text_buffer.clear();
+    let operators = tos.operator_log.clone(); // Clone before clearing
     tos.operator_log.clear();
 
     let text_element = TextElement {
@@ -365,12 +375,12 @@ fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32
         text: text_run,
         font_size: ts.size,
         font_name: Some(ts.fontname.clone()),
-        bbox: (x_min, y_min, x_max, y_max),
+        bbox: (x_min, y_min, x_max, y_max), // Bbox as tuple
         page_number,
-        operators: tos.operator_log.clone(),
+        operators: operators, // Use the cloned operators
     };
 
-    tracing::debug!(
+    debug!(
         element_id = %text_element.id,
         line_id = tracing::field::Empty,
         text_element = ?text_element,
@@ -378,32 +388,22 @@ fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32
         "Created text element"
     );
 
-    text_element
+    Some(PageContent::Text(text_element))
 }
 
-pub fn get_pdf_text(doc: &Document) -> Result<BTreeMap<u32, Vec<TextElement>>, Error> {
-    let mut pages_map: BTreeMap<u32, Vec<TextElement>> = BTreeMap::new();
+pub fn get_page_content(doc: &Document) -> Result<BTreeMap<u32, Vec<PageContent>>, Error> {
+    let mut pages_map: BTreeMap<u32, Vec<PageContent>> = BTreeMap::new();
 
-    // for (page_num, page_id) in doc.get_pages().into_iter().into_par_iter() {
-    //     let text_elements = get_page_text_elements(doc, page_num, page_id).map_err(|e| {
-    //         Error::new(
-    //             ErrorKind::Other,
-    //             format!("Failed to extract text from page {page_num} id={page_id:?}: {e:?}"),
-    //         )
-    //     })?;
-    //     pages_map.insert(page_num, text_elements);
-    // }
-
-    let results: Result<Vec<(u32, Vec<TextElement>)>, Error> = doc.get_pages()
+    let results: Result<Vec<(u32, Vec<PageContent>)>, Error> = doc.get_pages()
     .into_par_iter()
     .map(|(page_num, page_id)| {
-        let text_elements = get_page_text_elements(doc, page_num, page_id).map_err(|e| {
+        let page_elements = get_page_elements(doc, page_num, page_id).map_err(|e| {
             Error::new(
                 ErrorKind::Other,
-                format!("Failed to extract text from page {page_num} id={page_id:?}: {e:?}"),
+                format!("Failed to extract content from page {page_num} id={page_id:?}: {e:?}"),
             )
         })?;
-        Ok((page_num, text_elements))
+        Ok((page_num, page_elements))
     })
     .collect();
 
@@ -460,90 +460,99 @@ fn operand_as_u8(obj: &Object) -> u8 {
     fields(
         operator = %op.operator,
         params = ?op.operands,
-        in_text_object 
+        in_text_object = tracing::field::Empty // Placeholder
     )
 )]
 fn handle_operator<'a>(
     gs_stack: &mut Vec<GraphicsState<'a>>,
     op: &lopdf::content::Operation,
     text_object_state: &mut TextObjectState,
-    text_elements: &mut Vec<TextElement>,
+    page_elements: &mut Vec<PageContent>, // Changed type
     page_number: u32,
-    fonts: &BTreeMap<Vec<u8>, &Dictionary>,
+    page_resources: &'a Dictionary, // Pass page resources
+    doc: &'a Document, // Pass document to resolve XObjects
     encodings: &'a BTreeMap<Vec<u8>, Encoding<'a>>,
 ) -> Result<(), LopdfError> {
     let current_gs = gs_stack.last_mut().unwrap();
+    let in_text_object = !text_object_state.text_buffer.is_empty() || !text_object_state.glyphs.is_empty();
+    tracing::Span::current().record("in_text_object", &in_text_object);
 
     match op.operator.as_ref() {
         // Graphics State
         "q" => push_graphics_state(gs_stack),
         "Q" => pop_graphics_state(gs_stack),
         "cm" => {
-            if !text_object_state.text_buffer.is_empty() {
-                let text_element = finalize_text_run(text_object_state, &current_gs.text_state, page_number);
-                text_elements.push(text_element);
+            // Finalize any pending text run before CTM change
+            if let Some(text_elem) = finalize_text_run(text_object_state, &current_gs.text_state, page_number) {
+                page_elements.push(text_elem);
             }
-
             let matrix = matrix_from_operands(op);
-            
             current_gs.ctm = multiply_matrices(&matrix, &current_gs.ctm);
-        
         }
         // Text Object
         "BT" => {
-            tracing::debug!("Begin text object");
+            // Finalize any pending graphics element (if any were handled outside text object)
+            debug!("Begin text object");
             text_object_state.text_matrix = IDENTITY_MATRIX;
             text_object_state.text_line_matrix = IDENTITY_MATRIX;
         }
         "ET" => {
-            if let Some(element) = text_elements.last_mut() {
-                for op in &text_object_state.operator_log {
-                    tracing::debug!(
-                        element_id = %element.id,
-                        line_id = tracing::field::Empty,
-                        "PDF operator: {}",
-                        op
-                    );
-                }
+            // Finalize the last text run within the text object
+            if let Some(text_elem) = finalize_text_run(text_object_state, &current_gs.text_state, page_number) {
+                 page_elements.push(text_elem);
             }
-
-            if !text_object_state.text_buffer.is_empty() {
-                let text_element = finalize_text_run(text_object_state, &current_gs.text_state, page_number);
-                text_elements.push(text_element);
-                
-            }
+            // Clear text state specifics
             text_object_state.glyphs.clear();
             text_object_state.text_buffer.clear();
             text_object_state.operator_log.clear();
+            debug!("End text object");
         }
         // Text State
         "Tf" => {
-            if let (Some(Object::Name(font_name)), Some(font_size_obj)) =
+             if let Some(text_elem) = finalize_text_run(text_object_state, &current_gs.text_state, page_number) {
+                 page_elements.push(text_elem);
+             }
+              if let (Some(Object::Name(font_name_bytes)), Some(font_size_obj)) =
                 (op.operands.get(0), op.operands.get(1))
             {
                 let font_size = operand_as_float(font_size_obj);
-
-                // Get the font dictionary first
-                if let Some(dict) = fonts.get(font_name) {
-                    // Get base font name from dictionary
-                    let base_font = dict
-                        .get(b"BaseFont")
-                        .and_then(Object::as_name)
-                        .map(|name| String::from_utf8_lossy(name))
-                        .map(|name| canonicalize_font_name(&name).to_string())
-                        .unwrap_or("".to_string());
-
-                    current_gs.text_state.fontname = base_font.to_string();
-                    current_gs.text_state.size = font_size;
-                    current_gs.text_state.font_dict =
-                        Some(Object::Dictionary((*dict).clone()));
-
-                    // Use base_font for metrics lookup
-                    current_gs.text_state.font =
-                        FONT_METRICS.get(base_font.as_str()).copied();
-                    // Use original font_name for encoding lookup
-                    current_gs.text_state.encoding = encodings.get(font_name).clone();
+                match page_resources.get(b"Font").and_then(Object::as_dict) {
+                    Ok(fonts_dict) => {
+                         match fonts_dict.get(font_name_bytes) {
+                             Ok(font_ref_obj) => {
+                                 match doc.get_object(font_ref_obj.as_reference()?).and_then(|o| o.as_dict()) {
+                                     Ok(dict) => {
+                                        let base_font = dict
+                                            .get(b"BaseFont")
+                                            .and_then(Object::as_name)
+                                            .map(|name| String::from_utf8_lossy(name).into_owned())
+                                            .map(|name_string| canonicalize_font_name(name_string.as_str()))
+                                            .unwrap_or_else(|_| "".to_string());
+                                        
+                                        current_gs.text_state.fontname = base_font.to_string();
+                                        current_gs.text_state.size = font_size;
+                                        current_gs.text_state.font_dict = Some(Object::Dictionary(dict.clone()));
+                                        current_gs.text_state.font = FONT_METRICS.get(base_font.as_str()).copied();
+                                        current_gs.text_state.encoding = encodings.get(font_name_bytes);
+                                        text_object_state.font_name = Some(current_gs.text_state.fontname.clone());
+                                        text_object_state.font_metrics = current_gs.text_state.font;
+                                     }
+                                     Err(e) => {
+                                         warn!(font_name=?String::from_utf8_lossy(font_name_bytes), error=?e, "Could not resolve/parse font dictionary object reference");
+                                     }
+                                 }
+                             }
+                             Err(_) => {
+                                warn!(font_name=?String::from_utf8_lossy(font_name_bytes), "Font name not found in Font resources dictionary");
+                             }
+                         }
+                    }
+                    Err(_) => {
+                         warn!("Page resources do not contain a Font dictionary.");
+                    }
                 }
+            } else {
+                 warn!("Tf operator missing font name or size operand");
             }
         }
         "Tc" => {
@@ -577,13 +586,15 @@ fn handle_operator<'a>(
             }
         }
         "Tm" => {
+            // Finalize pending text before matrix change
+            if let Some(text_elem) = finalize_text_run(text_object_state, &current_gs.text_state, page_number) {
+                 page_elements.push(text_elem);
+            }
             let matrix = matrix_from_operands(op);
             text_object_state.text_matrix = matrix;
             text_object_state.text_line_matrix = matrix;
-
             text_object_state.operator_log.push(format!("Tm {:?}", matrix));
         }
-        // Text Positioning
         "Td" => {
             if let (Some(tx_obj), Some(ty_obj)) = (op.operands.get(0), op.operands.get(1)) {
                 let tx = operand_as_float(tx_obj);
@@ -612,19 +623,58 @@ fn handle_operator<'a>(
         }
         // Text Showing
         "Tj" | "TJ" | "'" | "\"" => {
-            let operator = op.operator.clone();
-            let operands = op.operands.iter().map(|o| format!("{:?}", o)).collect::<Vec<_>>().join(", ");
-            text_object_state.operator_log.push(format!("{} [{}]", operator, operands));
-            
-            collect_text_glyphs(
+            text_object_state.operator_log.push(format!("{} {:?}", op.operator, op.operands));
+             collect_text_glyphs(
                 text_object_state,
                 &mut current_gs.text_state,
                 &op.operands,
                 current_gs.ctm
             )?;
+             // NOTE: Don't finalize here, wait for ET or explicit text state change
+        }
+        // Handling XObjects (Images)
+        "Do" => {
+            // Finalize any pending text run before handling graphics object
+             if let Some(text_elem) = finalize_text_run(text_object_state, &current_gs.text_state, page_number) {
+                 page_elements.push(text_elem);
+             }
 
-            let text_element = finalize_text_run(text_object_state, &current_gs.text_state, page_number);
-            text_elements.push(text_element);
+            if let Some(Object::Name(name)) = op.operands.first() {
+                if let Ok(xobjects) = page_resources.get(b"XObject").and_then(Object::as_dict) {
+                    if let Ok(xobject_stream) = xobjects.get(name).and_then(|o| doc.get_object(o.as_reference()?)) {
+                         if let Ok(stream) = xobject_stream.as_stream() {
+                              if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Image".as_ref()) {
+                                  debug!(xobject_name = ?String::from_utf8_lossy(name), "Found Image XObject");
+                                  // --- Image Found --- 
+                                  // Calculate BBox - Placeholder: Assume image is 100x100 pts at current origin
+                                  // Real implementation needs CTM and image dimensions
+                                  let origin = multiply_matrices(&IDENTITY_MATRIX, &current_gs.ctm);
+                                  let corner = multiply_matrices(&Matrix { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 100.0, f: 100.0 }, &current_gs.ctm); 
+                                  let bbox = Rect {
+                                      x0: origin.e,
+                                      y0: origin.f,
+                                      x1: corner.e, // Simplified - needs proper transform
+                                      y1: corner.f, // Simplified - needs proper transform
+                                  };
+
+                                  let image_element = ImageElement {
+                                      id: Uuid::new_v4(),
+                                      page_number,
+                                      bbox, 
+                                      image_object: xobject_stream.clone(), // Clone the object (Stream)
+                                  };
+                                  page_elements.push(PageContent::Image(image_element));
+                              }
+                          } else {
+                             warn!(xobject_name=?String::from_utf8_lossy(name), "XObject is not a stream");
+                          }
+                     } else {
+                         warn!(xobject_name=?String::from_utf8_lossy(name), "Could not resolve XObject reference");
+                     }
+                } else {
+                     warn!("Page resources do not contain XObject dictionary");
+                }
+            }
         }
         _ => {}
     }
@@ -689,22 +739,23 @@ fn pdf_page_transform(page_dict: &Dictionary) -> (Rect, Matrix) {
     (mediabox, ctm)
 }
 
-fn get_page_text_elements(
+fn get_page_elements(
     doc: &Document,
     page_number: u32,
     page_id: (u32, u16),
-) -> Result<Vec<TextElement>, LopdfError> {
-    let mut text_elements = Vec::new();
+) -> Result<Vec<PageContent>, LopdfError> {
+    let mut page_elements = Vec::new(); // Changed type
     let mut text_object_state = TextObjectState::default();
 
     let content_data = match doc.get_and_decode_page_content(page_id) {
         Ok(content) => content,
         Err(e) => {
-            error!("Failed to decode content for page {}: {}", page_number, e);
+            error!(page=%page_number, "Failed to decode content: {}", e);
             return Err(e);
         }
     };
     let page_dict = doc.get_dictionary(page_id)?;
+    let resources = page_dict.get(b"Resources").and_then(|o| doc.get_object(o.as_reference()?)).and_then(|o| o.as_dict())?;
 
     // Calculate page transform and mediabox
     let (mediabox, page_ctm) = pdf_page_transform(page_dict);
@@ -715,58 +766,82 @@ fn get_page_text_elements(
         text_state: TextState::default(),
     }];
     
-    let fonts = match doc.get_page_fonts(page_id) {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Failed to get fonts for page {}: {}", page_number, e);
-            return Err(e);
+    let fonts = match resources.get(b"Font").and_then(Object::as_dict) {
+        Ok(f) => f.clone(), // Clone the font dictionary
+        Err(_) => {
+            warn!(page=%page_number, "No Font resources found on page.");
+            Dictionary::new() // Return an empty dictionary if no fonts
         }
     };
-
-    let encodings: BTreeMap<Vec<u8>, Encoding> = fonts
+    
+    let font_dictionaries: BTreeMap<Vec<u8>, &Dictionary> = fonts
         .iter()
-        .map(|(name, font)| font.get_font_encoding(doc).map(|it| (name.clone(), it)))
-        .collect::<LopdfResult<BTreeMap<Vec<u8>, Encoding>>>()?;
-
-
-    for (_i, op) in content_data
-        .operations
-        .iter()
-        .filter(|op| {
-            matches!(
-                op.operator.as_ref(),
-                "BT" | "ET" | "Tm" | "Td" | "Tf" | "TJ" | "Tj" | "'" | "\"" | "cm" | "q" | "Q"
-            )
+        .filter_map(|(name, obj)| {
+            doc.get_object(obj.as_reference().ok()?).and_then(Object::as_dict).ok().map(|dict| (name.clone(), dict))
         })
-        .enumerate()
-    {
-        handle_operator(
-            &mut gs_stack,
-            &op,
-            &mut text_object_state,
-            &mut text_elements,
-            page_number,
-            &fonts,
-            &encodings,
-        )?;
+        .collect();
+
+    let encodings: BTreeMap<Vec<u8>, Encoding> = font_dictionaries
+        .iter()
+        .filter_map(|(name, font_dict)| {
+            font_dict.get_font_encoding(doc).ok().map(|it| (name.clone(), it))
+        })
+        .collect();
+
+    for (_i, op) in content_data.operations.iter().enumerate() {
+        // Filter relevant operators (expanded to include graphics state)
+        if matches!(op.operator.as_ref(), "BT" | "ET" | "Tm" | "Td" | "TD" | "T*" | "Tf" | "Tc" | "Tw" | "Tz" | "TL" | "Tr" | "Ts" | "Tj" | "TJ" | "'" | "\"" | "cm" | "q" | "Q" | "Do") {
+            if let Err(e) = handle_operator(
+                &mut gs_stack,
+                &op,
+                &mut text_object_state,
+                &mut page_elements,
+                page_number,
+                resources, // Pass page resources
+                doc,
+                &encodings,
+            ) {
+                 error!(page=%page_number, operator=%op.operator, error=?e, "Error handling operator");
+                 // Decide whether to continue or return error
+                 // return Err(e); 
+            }
+        }
+    }
+
+    // Finalize any pending text object state after processing all operators
+    if let Some(text_elem) = finalize_text_run(&mut text_object_state, &gs_stack.last().unwrap().text_state, page_number) {
+        page_elements.push(text_elem);
     }
 
     // After processing content, convert coordinates to top-left based system
     let mut top_left_elements = Vec::new();
-    for element in text_elements {
-        let (x0, y0, x1, y1) = element.bbox;
-        
-        // Convert to top-left coordinates by flipping Y axis
-        let top_left_bbox = (
-            x0,               // Left remains the same
-            mediabox.y1 - y1, // Top = page_height - bottom
-            x1,               // Right remains the same  
-            mediabox.y1 - y0  // Bottom = page_height - top
-        );
-        
-        let mut new_element = element.clone();
-        new_element.bbox = top_left_bbox;
-        top_left_elements.push(new_element);
+    for element in page_elements {
+        match element {
+            PageContent::Text(mut text_elem) => {
+                 let (x0, y0, x1, y1) = text_elem.bbox;
+                 let top_left_bbox = (
+                    x0,
+                    mediabox.y1 - y1, // Top = page_height - bottom
+                    x1,
+                    mediabox.y1 - y0  // Bottom = page_height - top
+                 );
+                 text_elem.bbox = top_left_bbox;
+                 top_left_elements.push(PageContent::Text(text_elem));
+            },
+            PageContent::Image(mut img_elem) => {
+                 // Transform image bbox as well
+                 let transformed_bbox = transform_rect(&img_elem.bbox, &IDENTITY_MATRIX); // Using Identity, assumes bbox is already in page space?
+                                                                                      // TODO: Verify CTM usage for image bbox
+                 let top_left_bbox = Rect {
+                     x0: transformed_bbox.x0,
+                     y0: mediabox.y1 - transformed_bbox.y1,
+                     x1: transformed_bbox.x1,
+                     y1: mediabox.y1 - transformed_bbox.y0,
+                 };
+                 img_elem.bbox = top_left_bbox;
+                 top_left_elements.push(PageContent::Image(img_elem));
+            }
+        }
     }
 
     Ok(top_left_elements)

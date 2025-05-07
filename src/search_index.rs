@@ -1,20 +1,19 @@
 use crate::{
     layout::{MatchContext, TextLine},
-    parse::TextElement,
+    parse::{TextElement, ImageElement, PageContent},
 };
 use lopdf::Object;
-use multi_index_map::MultiIndexMap;
 use rstar::{RTree, RTreeObject, AABB};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 // Wrapper for TextElement to implement RTreeObject
 #[derive(Clone, Debug)]
-pub struct SpatialElement {
+pub struct SpatialTextElement {
     element: TextElement,
 }
 
-impl RTreeObject for SpatialElement {
+impl RTreeObject for SpatialTextElement {
     type Envelope = AABB<[f32; 2]>;
 
     fn envelope(&self) -> Self::Envelope {
@@ -23,7 +22,7 @@ impl RTreeObject for SpatialElement {
     }
 }
 
-impl SpatialElement {
+impl SpatialTextElement {
     fn new(element: TextElement) -> Self {
         Self { element }
     }
@@ -56,94 +55,107 @@ impl FontUsage {
     }
 }
 
-#[derive(Debug, MultiIndexMap)]
+#[derive(Debug)]
 pub struct PdfIndex {
     pub elements: Vec<TextElement>,
-    pub by_page: BTreeMap<u32, Vec<usize>>, // Indices by page number
-    pub font_size_index: Vec<(f32, usize)>, // Sorted vector for binary search
-    pub reference_count_index: Vec<(u32, usize)>, // Count of references (destinations pointing to element)
-    pub rtree: RTree<SpatialElement>,             // Spatial index for bounding box queries
-    pub element_id_to_index: HashMap<Uuid, usize>, // Map from element ID to index
-    pub fonts: HashMap<String, FontUsage>,        // Font usage analysis
-    pub font_frequency_index: Vec<(u32, String)>, // Fonts sorted by frequency
+    pub images: Vec<ImageElement>,
+    pub by_page: BTreeMap<u32, Vec<usize>>,
+    pub image_indices_by_page: BTreeMap<u32, Vec<usize>>,
+    pub font_size_index: Vec<(f32, usize)>,
+    pub reference_count_index: Vec<(u32, usize)>,
+    pub text_rtree: RTree<SpatialTextElement>,
+    pub element_id_to_index: HashMap<Uuid, usize>,
+    pub image_id_to_index: HashMap<Uuid, usize>,
+    pub fonts: HashMap<String, FontUsage>,
+    pub font_frequency_index: Vec<(u32, String)>,
 }
 
 impl PdfIndex {
-    pub fn new(page_map: &BTreeMap<u32, Vec<TextElement>>, match_context: &MatchContext) -> Self {
+    pub fn new(page_map: &BTreeMap<u32, Vec<PageContent>>, _match_context: &MatchContext) -> Self {
         let mut elements = Vec::new();
+        let mut images = Vec::new();
         let mut by_page = BTreeMap::new();
+        let mut image_indices_by_page = BTreeMap::new();
         let mut font_size_index = Vec::new();
         let mut spatial_elements = Vec::new();
         let mut element_id_to_index = HashMap::new();
+        let mut image_id_to_index = HashMap::new();
         let mut fonts = HashMap::new();
 
-        // First, collect all elements across all pages
-        for (page_num, page_elements) in page_map {
-            let start_idx = elements.len();
-            let indices: Vec<usize> = (start_idx..start_idx + page_elements.len()).collect();
-            by_page.insert(*page_num, indices);
+        let mut current_element_index = 0;
+        let mut current_image_index = 0;
 
-            for element in page_elements {
-                let element_idx = elements.len();
+        for (page_number, page_contents) in page_map {
+            let mut page_element_indices = Vec::new();
+            let mut page_image_indices = Vec::new();
 
-                // Add to element ID map
-                element_id_to_index.insert(element.id, element_idx);
-
-                // Add to font size index
-                font_size_index.push((element.font_size, element_idx));
-
-                // Track font usage
-                let font_name = element.font_name.clone().unwrap_or_default();
-                let font_key = format!("{}_{:.2}", font_name, element.font_size);
-
-                let font_usage = fonts.entry(font_key).or_insert_with(|| {
-                    FontUsage::new(
-                        font_name.clone(),
-                        element.font_name.clone(),
-                        element.font_size,
-                    )
-                });
-                font_usage.add_usage(element_idx);
-
-                // Create a spatial element for RTree
-                spatial_elements.push(SpatialElement::new(element.clone()));
-
-                // Add to main elements vector
-                elements.push(element.clone());
+            for content in page_contents {
+                match content {
+                    PageContent::Text(text_elem) => {
+                        let element_id = text_elem.id;
+                        let font_size = text_elem.font_size;
+                        let font_name = text_elem.font_name.clone().unwrap_or_default();
+                        let canonical_font_name = crate::fonts::canonicalize::canonicalize_font_name(&font_name);
+                        
+                        // Update element list and indices
+                        elements.push(text_elem.clone());
+                        page_element_indices.push(current_element_index);
+                        element_id_to_index.insert(element_id, current_element_index);
+                        font_size_index.push((font_size, current_element_index));
+                        spatial_elements.push(SpatialTextElement::new(text_elem.clone()));
+                        
+                        // Update font usage
+                        let font_entry = fonts.entry(canonical_font_name.clone()).or_insert_with(|| FontUsage::new(canonical_font_name, text_elem.font_name.clone(), font_size));
+                        font_entry.add_usage(current_element_index);
+                        
+                        current_element_index += 1;
+                    }
+                    PageContent::Image(image_elem) => {
+                         let image_id = image_elem.id;
+                         images.push(image_elem.clone());
+                         page_image_indices.push(current_image_index);
+                         image_id_to_index.insert(image_id, current_image_index);
+                         current_image_index += 1;
+                    }
+                }
+            }
+            if !page_element_indices.is_empty() {
+                by_page.insert(*page_number, page_element_indices);
+            }
+            if !page_image_indices.is_empty() {
+                image_indices_by_page.insert(*page_number, page_image_indices);
             }
         }
 
-        // Sort indices by their values for binary search
+        // Sort font size index
         font_size_index.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Create font frequency index
-        let font_frequency_index = fonts
+        // Build RTree for text elements
+        let text_rtree = RTree::bulk_load(spatial_elements);
+
+        // Placeholder for reference count index - update logic needed if references apply to images
+        let reference_count_index = Vec::new();
+
+        // Build font frequency index
+        let mut font_frequency_index: Vec<(u32, String)> = fonts
             .iter()
-            .map(|(id, usage)| (usage.total_usage, id.clone()))
-            .collect::<Vec<_>>();
+            .map(|(name, usage)| (usage.total_usage, name.clone()))
+            .collect();
+        font_frequency_index.sort_by(|a, b| b.0.cmp(&a.0));
 
-        // Build the RTree
-        let rtree = RTree::bulk_load(spatial_elements);
-
-        // Create the index first so we can use its methods
-        let mut index = Self {
+        PdfIndex {
             elements,
+            images,
             by_page,
+            image_indices_by_page,
             font_size_index,
-            reference_count_index: Vec::new(),
-            rtree,
+            reference_count_index,
+            text_rtree,
             element_id_to_index,
+            image_id_to_index,
             fonts,
             font_frequency_index,
-        };
-
-        // Sort the font frequency index
-        index.sort_font_frequency_index();
-
-        // Build the reference count index using the correct destination matching logic
-        index.update_reference_counts(match_context);
-
-        index
+        }
     }
 
     /// Sort the font frequency index
@@ -212,7 +224,7 @@ impl PdfIndex {
 
                     // Find elements that match the page and the spatial query
                     let matching_elements = self
-                        .rtree
+                        .text_rtree
                         .locate_in_envelope(&search_region)
                         .filter(|spatial_elem| spatial_elem.element.page_number == dest_page)
                         .filter_map(|spatial_elem| {
@@ -292,7 +304,7 @@ impl PdfIndex {
     pub fn elements_in_region(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<&TextElement> {
         let query_rect = AABB::from_corners([x0, y0], [x1, y1]);
 
-        self.rtree
+        self.text_rtree
             .locate_in_envelope(&query_rect)
             .map(|spatial_elem| &spatial_elem.element)
             .collect()
@@ -357,7 +369,7 @@ impl PdfIndex {
             let query_rect = AABB::from_corners([x0, y0], [x1, y1]);
 
             let region_elements: HashSet<usize> = self
-                .rtree
+                .text_rtree
                 .locate_in_envelope(&query_rect)
                 .filter_map(|spatial_elem| {
                     self.element_id_to_index
@@ -416,10 +428,21 @@ impl PdfIndex {
     }
 
     /// Find elements that might match a text string (simple search)
-    pub fn find_text_matches(&self, text: &str, threshold: f64) -> Vec<(&TextElement, f64)> {
+    /// Updated to accept an optional start index.
+    pub fn find_text_matches(
+        &self, 
+        text: &str, 
+        threshold: f64,
+        start_index: Option<usize> // Added optional start index
+    ) -> Vec<(&TextElement, f64)> {
         use strsim::normalized_levenshtein;
 
-        self.elements
+        let start = start_index.unwrap_or(0);
+        if start >= self.elements.len() {
+            return Vec::new(); // Return empty if start index is out of bounds
+        }
+
+        self.elements[start..] // Slice the elements starting from start_index
             .iter()
             .map(|element| {
                 let score = normalized_levenshtein(text, &element.text);
@@ -569,5 +592,12 @@ impl PdfIndex {
         } else {
             Vec::new()
         }
+    }
+
+    /// Get image by ID
+    pub fn get_image_by_id(&self, id: &Uuid) -> Option<&ImageElement> {
+        self.image_id_to_index
+            .get(id)
+            .map(|&idx| &self.images[idx])
     }
 }

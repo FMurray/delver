@@ -1,6 +1,6 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
 use crate::matcher::{MatchedContent, TemplateContentMatch};
-use crate::parse::TextElement;
+use crate::parse::{TextElement, PageContent};
 use log::{error, info};
 use lopdf::Document;
 use pest::iterators::Pair;
@@ -77,6 +77,11 @@ pub enum ElementType {
     TextChunk,
     Table,
     Image,
+    // Image-specific processing children
+    ImageSummary,
+    ImageBytes,
+    ImageCaption,
+    ImageEmbedding,
     Unknown,
     // Add other types as needed
 }
@@ -89,11 +94,30 @@ pub struct MatchedElement {
     pub metadata: HashMap<String, Value>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 pub struct ChunkOutput {
     pub text: String,
     pub metadata: HashMap<String, Value>,
     pub chunk_index: usize,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct ImageOutput {
+    pub id: String, // Use UUID as String for JSON compatibility
+    pub page_number: u32,
+    pub bbox: (f32, f32, f32, f32),
+    pub caption: Option<String>,
+    pub bytes_base64: Option<String>,
+    pub summary: Option<String>,
+    pub embedding: Option<Vec<f32>>, // Assuming embedding is Vec<f32>
+    pub metadata: HashMap<String, Value>,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+#[serde(tag = "type")] // Add type field for distinguishing in JSON
+pub enum ProcessedOutput {
+    Text(ChunkOutput),
+    Image(ImageOutput),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -263,6 +287,10 @@ fn process_element(pair: Pair<Rule>) -> Element {
         "TextChunk" => ElementType::TextChunk,
         "Table" => ElementType::Table,
         "Image" => ElementType::Image,
+        "ImageSummary" => ElementType::ImageSummary,
+        "ImageBytes" => ElementType::ImageBytes,
+        "ImageCaption" => ElementType::ImageCaption,
+        "ImageEmbedding" => ElementType::ImageEmbedding,
         _ => ElementType::Unknown,
     };
 
@@ -358,44 +386,112 @@ fn process_value(pair: Pair<Rule>) -> Value {
     }
 }
 
-// Process the matched content to generate chunks
-pub fn process_matched_content(matched: &Vec<TemplateContentMatch>) -> Vec<ChunkOutput> {
-    let mut chunks = Vec::new();
+// Process the matched content to generate chunks or image data
+pub fn process_matched_content(matched: &Vec<TemplateContentMatch>) -> Vec<ProcessedOutput> {
+    let mut output_elements = Vec::new();
 
     for match_item in matched {
         match &match_item.matched_content {
             MatchedContent::TextChunk { content } => {
-                // content is &Vec<&'a TextElement>
-                // item in content.iter() is &&'a TextElement
                 let owned_content: Vec<TextElement> = content.iter().map(|el_ref_ref| (**el_ref_ref).clone()).collect();
-                chunks.extend(process_text_chunk_elements(
+                let chunk_outputs = process_text_chunk_elements(
                     &owned_content,
                     &match_item.template_element,
                     &match_item.metadata,
-                ));
+                );
+                for chunk_output in chunk_outputs {
+                    output_elements.push(ProcessedOutput::Text(chunk_output));
+                }
             }
             MatchedContent::Section { content, .. } => {
-                for child in &match_item.children {
-                    chunks.extend(process_matched_content(&vec![child.clone()]));
+                if !match_item.children.is_empty() {
+                    output_elements.extend(process_matched_content(&match_item.children));
+                } else {
+                    // Filter for Text elements only before collecting
+                    let owned_content: Vec<TextElement> = content.iter().filter_map(|pc| match pc {
+                        PageContent::Text(t) => Some((*t).clone()),
+                        _ => None,
+                    }).collect();
+                    
+                    if !owned_content.is_empty() {
+                        let chunk_outputs = process_text_chunk_elements(
+                            &owned_content,
+                            &match_item.template_element,
+                            &match_item.metadata,
+                        );
+                        for chunk_output in chunk_outputs {
+                            output_elements.push(ProcessedOutput::Text(chunk_output));
+                        }
+                    } // else: Section contained only non-text, produce no output
                 }
-                if chunks.is_empty() && match_item.template_element.children.is_empty() {
-                    // content is &Vec<&'a TextElement>
-                    let owned_content: Vec<TextElement> = content.iter().map(|el_ref_ref| (**el_ref_ref).clone()).collect();
-                    chunks.extend(process_text_chunk_elements(
-                        &owned_content,
-                        &match_item.template_element,
-                        &match_item.metadata,
-                    ));
-                }
+            }
+            MatchedContent::Image(image_element) => {
+                 output_elements.push(process_image_element(
+                     image_element,
+                     &match_item.template_element,
+                     &match_item.metadata,
+                 ));
+            }
+            _ => {} 
+        }
+    }
+
+    output_elements
+}
+
+// Helper function to process a matched Image element based on its children
+fn process_image_element(
+    image_element: &crate::parse::ImageElement,
+    template_element: &Element,
+    metadata: &HashMap<String, Value>,
+) -> ProcessedOutput {
+    let mut image_output = ImageOutput {
+        id: image_element.id.to_string(),
+        page_number: image_element.page_number,
+        // Manually convert geo::Rect to tuple
+        bbox: (
+            image_element.bbox.x0,
+            image_element.bbox.y0,
+            image_element.bbox.x1,
+            image_element.bbox.y1,
+        ),
+        caption: None,
+        bytes_base64: None,
+        summary: None,
+        embedding: None,
+        metadata: metadata.clone(),
+    };
+
+    // Iterate through children of the Image template element (e.g., ImageBytes, ImageCaption)
+    for child_template in &template_element.children {
+        match child_template.element_type {
+            ElementType::ImageBytes => {
+                println!("Placeholder: Need to implement image decoding for ImageBytes");
+                image_output.bytes_base64 = Some("PLACEHOLDER_BASE64_IMAGE_DATA".to_string());
+            }
+            ElementType::ImageCaption => {
+                println!("Placeholder: Need to implement caption finding for ImageCaption");
+                image_output.caption = Some("PLACEHOLDER_IMAGE_CAPTION".to_string());
+            }
+            ElementType::ImageSummary => {
+                let model = child_template.attributes.get("model").and_then(|v| v.as_string()).unwrap_or_default();
+                let prompt = child_template.attributes.get("prompt").and_then(|v| v.as_string()).unwrap_or_default();
+                println!("Placeholder: Call external summary model ('{}') with prompt: {}", model, prompt);
+                image_output.summary = Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", model));
+            }
+            ElementType::ImageEmbedding => {
+                let model = child_template.attributes.get("model").and_then(|v| v.as_string()).unwrap_or_default();
+                 println!("Placeholder: Call external embedding model ('{}')", model);
+                image_output.embedding = Some(vec![0.1, 0.2, 0.3]); // Placeholder embedding
             }
             _ => {}
         }
     }
 
-    chunks
+    ProcessedOutput::Image(image_output)
 }
 
-// Helper function to convert elements to chunks
+// Helper function to convert elements to text chunks (remains largely the same)
 fn process_text_chunk_elements(
     elements: &[TextElement],
     template_element: &Element,

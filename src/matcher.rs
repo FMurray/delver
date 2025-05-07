@@ -1,12 +1,12 @@
 use crate::dom::{Element, ElementType, MatchType, Value};
 use crate::layout::{group_text_into_lines, TextBlock, TextLine};
 use crate::logging::TEMPLATE_MATCH;
-use crate::parse::TextElement;
+use crate::parse::{TextElement, ImageElement, PageContent};
 use crate::search_index::PdfIndex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use strsim::normalized_levenshtein;
-use tracing::{event, Level};
+use tracing::{event, Level, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -22,10 +22,11 @@ pub enum MatchedContent<'a> {
     Block(TextBlock),
     Line(TextLine),
     Element(TextElement),
+    Image(ImageElement),
     Section {
         start_marker: &'a TextElement,
         end_marker: Option<&'a TextElement>,
-        content: Vec<&'a TextElement>,
+        content: Vec<&'a PageContent>,
     },
     TextChunk {
         content: Vec<&'a TextElement>,
@@ -84,21 +85,33 @@ pub fn align_template_with_content<'a>(
     }
     
     let mut current_prev_option = prev_match;
+    let mut current_element_idx = prev_match
+        .and_then(|pm| get_last_element_index(pm, index))
+        .map_or(0, |idx| idx + 1);
+    let mut current_image_idx = prev_match
+        .and_then(|pm| get_last_image_index(pm, index))
+        .map_or(0, |idx| idx + 1);
 
     for template_element in template_elements {
         let maybe_match = match template_element.element_type {
             ElementType::Section => {
-                match_section(template_element, index, &elements_by_page_view, actual_inherited_metadata, current_prev_option)
+                match_section(template_element, index, &elements_by_page_view, actual_inherited_metadata, current_prev_option, current_element_idx)
             }
             ElementType::TextChunk => {
-                match_text_chunk(template_element, &elements_by_page_view, index, actual_inherited_metadata, current_prev_option)
+                match_text_chunk(template_element, index, actual_inherited_metadata, current_prev_option, current_element_idx)
+            }
+            ElementType::Image => {
+                match_image(template_element, index, actual_inherited_metadata, current_image_idx)
             }
             ElementType::Table => match_table(template_element, &elements_by_page_view, actual_inherited_metadata),
-            ElementType::Image => match_image(template_element, &elements_by_page_view, actual_inherited_metadata),
+            ElementType::ImageSummary | ElementType::ImageBytes | ElementType::ImageCaption | ElementType::ImageEmbedding => None,
             _ => None,
         };
         
         if let Some(matched_val) = maybe_match {
+            current_element_idx = get_last_element_index(&matched_val, index).map_or(current_element_idx, |idx| idx + 1);
+            current_image_idx = get_last_image_index(&matched_val, index).map_or(current_image_idx, |idx| idx + 1);
+            
             results.push(matched_val);
             current_prev_holder = results.last().unwrap();
             current_prev_option = Some(current_prev_holder);
@@ -118,109 +131,70 @@ fn match_section<'a, 'map_lt>(
     index: &'a PdfIndex,
     _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
     inherited_metadata: &HashMap<String, Value>,
-    prev_match: Option<&TemplateContentMatch<'a>>,
+    _prev_match: Option<&TemplateContentMatch<'a>>,
+    start_element_index: usize,
 ) -> Option<TemplateContentMatch<'a>> {
     let _match_config = template.attributes.get("match")?.as_match_config()?;
     
-    let mut candidates: Vec<TextLine> = match _match_config.match_type {
+    let relevant_elements: Vec<&TextElement> = index.elements[start_element_index..].iter().collect();
+    if relevant_elements.is_empty() { return None; }
+
+    let owned_elements_for_grouping: Vec<TextElement> = relevant_elements.into_iter().cloned().collect();
+    let potential_lines = group_text_into_lines(&owned_elements_for_grouping, 5.0);
+    if potential_lines.is_empty() { return None; }
+
+    let candidates: Vec<TextLine> = match _match_config.match_type {
         MatchType::Text => {
-            let owned_elements_for_grouping: Vec<TextElement> = index.elements.iter().map(|el_ref| el_ref.clone()).collect();
-            let all_lines = group_text_into_lines(&owned_elements_for_grouping, 5.0);
             index.find_line_text_matches(
                 &_match_config.pattern, 
                 _match_config.threshold,
-                &all_lines 
+                &potential_lines
             )
             .into_iter()
-            .map(|line_ref| line_ref.clone())
+            .cloned()
             .collect()
         },
         _ => return None,
     };
     
-    if candidates.is_empty() {
-        return None;
-    }
-    
-    if let Some(prev) = prev_match {
-        let min_pos = match &prev.matched_content {
-            MatchedContent::Section { end_marker, start_marker, .. } => {
-                end_marker.as_ref().copied().or_else(|| Some(*start_marker))
-                    .and_then(|elem| index.element_id_to_index.get(&elem.id).copied())
-            },
-            MatchedContent::TextChunk { content } => {
-                content.last().copied()
-                    .and_then(|last| index.element_id_to_index.get(&last.id).copied())
-            },
-            _ => None
-        };
-        
-        if let Some(pos) = min_pos {
-            candidates.retain(|line| {
-                if let Some(first_elem) = line.elements.first() {
-                    if let Some(&elem_idx) = index.element_id_to_index.get(&first_elem.id) {
-                        elem_idx > pos
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            });
-        }
-    }
-    
-    if candidates.is_empty() {
-        return None;
-    }
+    if candidates.is_empty() { return None; }
 
-    let potential_matched_elements: Vec<&TextElement> = candidates.iter()
-        .flat_map(|line| line.elements.iter())
-        .collect();
+    let best_match_line = candidates.iter()
+        .min_by(|a, b| {
+             let first_a_idx = a.elements.first().and_then(|e| index.element_id_to_index.get(&e.id));
+             let first_b_idx = b.elements.first().and_then(|e| index.element_id_to_index.get(&e.id));
+             match (first_a_idx, first_b_idx) {
+                 (Some(idx_a), Some(idx_b)) => idx_a.cmp(idx_b),
+                 (Some(_), None) => std::cmp::Ordering::Less,
+                 (None, Some(_)) => std::cmp::Ordering::Greater,
+                 (None, None) => std::cmp::Ordering::Equal,
+             }
+         })?;
 
-    let best_match_id = select_best_match(potential_matched_elements, index)?;
+    let best_match_line_first_elem = best_match_line.elements.first()?;
+    let start_marker_ref = index.get_element_by_id(&best_match_line_first_elem.id)?;
     
-    let best_match_element_ref = index.elements.iter().find(|el| el.id == best_match_id)?;
-    
-    let end_element = if let Some(end_match_str) = template
+    let end_element_search_start_index = index.element_id_to_index.get(&start_marker_ref.id).map_or(start_element_index, |idx| idx + 1);
+    let end_element_ref = if let Some(end_match_str) = template
         .attributes
         .get("end_match")
         .and_then(|v| v.as_string())
     {
-        let end_matches = index.find_text_matches(&end_match_str, _match_config.threshold);
-        
-        let end_candidates: Vec<_> = end_matches.iter()
-            .filter(|(elem, _)| {
-                (elem.page_number == best_match_element_ref.page_number && elem.bbox.1 > best_match_element_ref.bbox.1) || 
-                elem.page_number > best_match_element_ref.page_number
-            })
-            .collect();
-        
-        end_candidates.into_iter()
-            .min_by(|(a, _), (b, _)| {
-                if a.page_number != b.page_number {
-                    a.page_number.cmp(&b.page_number)
-                } else {
-                    a.bbox.1.partial_cmp(&b.bbox.1).unwrap_or(std::cmp::Ordering::Equal)
-                }
-            })
-            .map(|(elem_ref_ref, _)| *elem_ref_ref)
+        index.find_text_matches(&end_match_str, _match_config.threshold, Some(end_element_search_start_index))
+            .into_iter()
+            .min_by_key(|(elem, _score)| index.element_id_to_index.get(&elem.id))
+            .map(|(elem_ref, _)| elem_ref)
     } else {
         None
     };
     
-    let section_content = extract_section_content(
-        _page_map_view,
-        best_match_element_ref.page_number, 
-        best_match_element_ref, 
-        end_element
-    );
+    let section_content: Vec<&PageContent> = Vec::new();
 
     let mut result = TemplateContentMatch::with_content(
         template,
         MatchedContent::Section {
-            start_marker: best_match_element_ref,
-            end_marker: end_element,
+            start_marker: start_marker_ref,
+            end_marker: end_element_ref,
             content: section_content,
         },
     );
@@ -238,7 +212,7 @@ fn match_section<'a, 'map_lt>(
         }
     }
 
-    if index.elements.is_empty() && end_element.is_none() {
+    if index.elements.is_empty() && end_element_ref.is_none() {
         return None;
     }
 
@@ -246,42 +220,21 @@ fn match_section<'a, 'map_lt>(
 }
 
 /// Matches a TextChunk element in the template with content
-fn match_text_chunk<'a, 'map_lt>(
+fn match_text_chunk<'a>(
     template: &'a Element,
-    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
     index: &'a PdfIndex,
     inherited_metadata: &HashMap<String, Value>,
-    prev_match: Option<&TemplateContentMatch<'a>>,
+    _prev_match: Option<&TemplateContentMatch<'a>>,
+    start_element_index: usize,
 ) -> Option<TemplateContentMatch<'a>> {
-    if index.elements.is_empty() {
-        return None;
-    }
     
-    let prev_end_element: Option<&TextElement> = prev_match.and_then(|pm| match &pm.matched_content {
-        MatchedContent::Block(b) => b.lines.last().and_then(|l| l.elements.last()),
-        MatchedContent::Line(l) => l.elements.last(),
-        MatchedContent::Element(e) => Some(e),
-        MatchedContent::Section { end_marker, start_marker, .. } => {
-            end_marker.as_ref().copied().or_else(|| Some(*start_marker))
-        }
-        MatchedContent::TextChunk { content } => content.last().copied(),
-        MatchedContent::None => None,
-    });
-
-    if index.elements.is_empty() && prev_end_element.is_none() {
-        return None;
-    }
-    
-    let content = match prev_end_element {
-        Some(start_marker) => index.get_elements_between_markers(start_marker, None),
-        None => { 
-            if let Some(first_doc_element) = index.elements.first() {
-                index.get_elements_between_markers(first_doc_element, None)
-            } else {
-                Vec::new()
-            }
-        }
+    let content = if start_element_index < index.elements.len() {
+        index.elements[start_element_index..].iter().collect()
+    } else {
+        Vec::new()
     };
+
+    if content.is_empty() { return None; }
     
     let mut result = TemplateContentMatch::with_content(
         template,
@@ -376,42 +329,15 @@ fn score_match_line(line: &TextElement, index: &PdfIndex) -> f32 {
 }
 
 /// Extracts the content between a start element and an optional end element
-pub fn extract_section_content<'a, 'map_lt>(
-    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
-    start_page: u32,
+/// TODO: Update this function to handle Vec<PageContent> instead of just TextElement
+pub fn extract_section_content<'a>(
+    _page_map_view: &BTreeMap<u32, Vec<&'a TextElement>>,
+    _start_page: u32,
     _start_element: &TextElement,
-    end_element: Option<&TextElement>,
+    _end_element: Option<&TextElement>,
 ) -> Vec<&'a TextElement> {
-    let mut content = Vec::new();
-    let mut capturing = false;
-
-    for (page_num, elements_on_page) in _page_map_view {
-        if *page_num < start_page {
-            continue;
-        }
-        if let Some(end) = end_element {
-            if *page_num > end.page_number {
-                break;
-            }
-        }
-        for element_ref in elements_on_page {
-            if !capturing {
-                if (*element_ref).id == _start_element.id {
-                    capturing = true;
-                    content.push(*element_ref);
-                }
-            } else {
-                if let Some(end) = end_element {
-                    if (*element_ref).id == end.id {
-                        return content;
-                    }
-                }
-                content.push(*element_ref);
-            }
-        }
-    }
-
-    content
+    warn!("extract_section_content needs update to handle PageContent");
+    Vec::new()
 }
 
 // Add basic implementations for Table and Image matchers
@@ -449,12 +375,7 @@ fn match_table<'a, 'map_lt>(
             start_marker.text
         );
         
-        let table_content = extract_section_content(
-            _page_map_view,
-            start_marker.page_number,
-            start_marker,
-            end_marker,
-        );
+        let table_content: Vec<&PageContent> = Vec::new();
 
         let mut result = TemplateContentMatch::with_content(
             template,
@@ -472,7 +393,7 @@ fn match_table<'a, 'map_lt>(
             content_id = %start_marker.id,
             template_name = %template.name,
             score = 0.8,
-            "Table template matched content"
+            "Table template matched content (placeholder)"
         );
         return Some(result);
     }
@@ -480,60 +401,53 @@ fn match_table<'a, 'map_lt>(
     None
 }
 
-fn match_image<'a, 'map_lt>(
+fn match_image<'a>(
     template: &'a Element,
-    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
+    index: &'a PdfIndex,
     inherited_metadata: &HashMap<String, Value>,
+    start_image_index: usize,
 ) -> Option<TemplateContentMatch<'a>> {
-    println!("MATCHER: Processing Image template element");
+    println!("MATCHER: Processing Image template element, starting search from index {}", start_image_index);
 
-    let image_indicators = [
-        "figure",
-        "image",
-        "diagram",
-        "illustration",
-        "photo",
-        "picture",
-    ];
-
-    let potential_image_elements: Vec<&'a TextElement> = _page_map_view
-        .values()
-        .flatten()
-        .copied()
-        .filter(|element| {
-            let text = element.text.to_lowercase();
-            image_indicators
-                .iter()
-                .any(|indicator| text.contains(indicator))
-        })
-        .collect();
-
-    if !potential_image_elements.is_empty() {
-        let caption_element = potential_image_elements.first().copied()?;
-        println!(
-            "MATCHER: Found potential image caption: {}",
-            caption_element.text
-        );
+    index.images.get(start_image_index).map(|image_elem| {
+        println!("MATCHER: Found image with ID {}", image_elem.id);
         let mut result = TemplateContentMatch::with_content(
             template,
-            MatchedContent::Section {
-                start_marker: caption_element,
-                end_marker: None,
-                content: Vec::new(),
-            },
+            MatchedContent::Image(image_elem.clone()),
         );
         result.metadata = inherited_metadata.clone();
         event!(
             Level::DEBUG,
             target = TEMPLATE_MATCH,
             template_id = %Uuid::new_v4(),
-            content_id = %caption_element.id,
+            content_id = %image_elem.id,
             template_name = %template.name,
-            score = 0.7,
-            "Image template matched caption"
+            score = 0.9,
+            "Image template matched content"
         );
-        return Some(result);
-    }
+        result
+    })
+}
 
-    None
+// Helper to get the index of the last TextElement used by a match
+fn get_last_element_index<'a>(match_item: &TemplateContentMatch<'a>, index: &'a PdfIndex) -> Option<usize> {
+    match &match_item.matched_content {
+        MatchedContent::Section { end_marker, start_marker, .. } => 
+            end_marker.as_ref().copied().or(Some(*start_marker))
+                .and_then(|elem| index.element_id_to_index.get(&elem.id).copied()),
+        MatchedContent::TextChunk { content } => 
+            content.last().copied()
+                .and_then(|elem| index.element_id_to_index.get(&elem.id).copied()),
+        MatchedContent::Element(e) => index.element_id_to_index.get(&e.id).copied(),
+        MatchedContent::Image(_) => None, 
+        _ => None,
+    }
+}
+
+// Helper to get the index of the last ImageElement used by a match
+fn get_last_image_index<'a>(match_item: &TemplateContentMatch<'a>, index: &'a PdfIndex) -> Option<usize> {
+    match &match_item.matched_content {
+        MatchedContent::Image(img_elem) => index.image_id_to_index.get(&img_elem.id).copied(),
+        _ => None,
+    }
 }
