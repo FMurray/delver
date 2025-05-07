@@ -1,12 +1,10 @@
 use crate::dom::{Element, ElementType, MatchType, Value};
-use crate::layout::{elements_from_lines, group_text_into_lines, MatchContext, TextBlock, TextLine};
-use crate::logging::{MATCHER_OPERATIONS, TEMPLATE_MATCH};
+use crate::layout::{group_text_into_lines, TextBlock, TextLine};
+use crate::logging::TEMPLATE_MATCH;
 use crate::parse::TextElement;
 use crate::search_index::PdfIndex;
-use log::{error, info};
-use ordered_float::OrderedFloat;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use strsim::normalized_levenshtein;
 use tracing::{event, Level};
 use uuid::Uuid;

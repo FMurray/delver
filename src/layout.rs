@@ -1,12 +1,8 @@
 use indexmap::IndexMap;
-use lopdf::{Dictionary, Object};
+use lopdf::Object;
 use std::collections::BTreeMap;
-use strsim::normalized_levenshtein;
 use uuid::Uuid;
-use std::collections::HashMap;
 use std::fmt::Debug;
-
-use crate::geo::Rect;
 use crate::parse::TextElement;
 
 // Add this struct at the module level

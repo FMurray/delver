@@ -1,7 +1,6 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
-use crate::layout::{MatchContext, TextBlock, TextLine};
-use crate::matcher::{align_template_with_content, MatchedContent, TemplateContentMatch};
-use crate::parse::{get_refs, TextElement};
+use crate::matcher::{MatchedContent, TemplateContentMatch};
+use crate::parse::TextElement;
 use log::{error, info};
 use lopdf::Document;
 use pest::iterators::Pair;
