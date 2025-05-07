@@ -39,6 +39,11 @@ pub fn process_pdf(
     let doc = Document::load_mem(pdf_bytes)?;
     let pages_map = get_pdf_text(&doc)?;
 
+    let line_join_threshold = 5.0; // Default threshold
+    let block_join_threshold = 12.0; // Default threshold
+    let blocks =
+        group_text_into_lines_and_blocks(&pages_map, line_join_threshold, block_join_threshold);
+
     let match_context = get_refs(&doc)?;
 
     let mut all_chunks: Vec<ChunkOutput> = Vec::new();

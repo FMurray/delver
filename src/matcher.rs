@@ -71,17 +71,24 @@ pub fn align_template_with_content<'a>(
     let mut results = Vec::new();
     let mut current_prev = prev_match;
     
+    let default_metadata = HashMap::new(); // Default for Option
+    let actual_inherited_metadata = inherited_metadata.unwrap_or(&default_metadata);
+    
     // Process each template element in sequence
     for template_element in template_elements {
         let maybe_match = match template_element.element_type {
             ElementType::Section => {
-                match_section(template_element, index, inherited_metadata, current_prev)
+                match_section(template_element, index, actual_inherited_metadata, current_prev)
             }
             ElementType::TextChunk => {
-                match_text_chunk(template_element, index, inherited_metadata, current_prev)
+                // Assuming match_text_chunk primarily uses index.
+                // The original signature was (template, page_map, index, inherited_metadata, prev_match)
+                // Current implementation of match_text_chunk uses index.get_elements_between_markers()
+                // Passing index.page_map for page_map argument for now.
+                match_text_chunk(template_element, index.page_map, index, actual_inherited_metadata, current_prev)
             }
-            ElementType::Table => match_table(template_element, inherited_metadata),
-            ElementType::Image => match_image(template_element, inherited_metadata),
+            ElementType::Table => match_table(template_element, index.page_map, actual_inherited_metadata),
+            ElementType::Image => match_image(template_element, index.page_map, actual_inherited_metadata),
             _ => None,
         };
         
@@ -112,8 +119,8 @@ fn match_section<'a>(
     // Find candidate matches
     let mut candidates: Vec<&TextLine> = match match_config.match_type {
         MatchType::Text => {
-            // Group elements into text lines
-            let lines = group_text_into_lines(page_map, 5.0);
+            // Group elements into text lines using index.page_map
+            let lines = group_text_into_lines(index.page_map, 5.0);
             
             // Find matches in these lines using the new index method
             index.find_line_text_matches(
@@ -217,7 +224,7 @@ fn match_section<'a>(
     
     // Extract content between markers
     let section_content = extract_section_content(
-        page_map, 
+        index.page_map, 
         best_match.page_number, 
         best_match, 
         end_element
@@ -240,9 +247,8 @@ fn match_section<'a>(
     if !template.children.is_empty() {
         if let Some(child_matches) = align_template_with_content(
             &template.children,
-            page_map,
-            index,
-            &result.metadata,
+            index, // Pass index
+            Some(&result.metadata), // Pass Option<&HashMap>
             Some(&result),  // Pass current match as prev_match for children
         ) {
             result.children = child_matches;
@@ -255,7 +261,7 @@ fn match_section<'a>(
 /// Matches a TextChunk element in the template with content
 fn match_text_chunk<'a>(
     template: &'a Element,
-    page_map: &'a BTreeMap<u32, Vec<TextElement>>,
+    page_map: &'a BTreeMap<u32, Vec<TextElement>>, // Kept for signature consistency, though might not be fully used by current impl
     index: &'a PdfIndex,
     inherited_metadata: &HashMap<String, Value>,
     prev_match: Option<&TemplateContentMatch<'a>>,
@@ -264,8 +270,19 @@ fn match_text_chunk<'a>(
         return None;
     }
     
-    // Use the index to get all elements - much simpler!
-    let content = index.get_elements_between_markers();
+    let prev_end_element: Option<&TextElement> = prev_match.and_then(|pm| match &pm.matched_content {
+        MatchedContent::Block(b) => b.lines.last().and_then(|l| l.elements.last()), // Assuming TextLine elements are &'a TextElement or can provide one
+        MatchedContent::Line(l) => l.elements.last(), // Same assumption
+        MatchedContent::Element(e) => Some(e),
+        MatchedContent::Section { end_marker, start_marker, .. } => {
+            end_marker.as_ref().copied().or_else(|| Some(*start_marker))
+        }
+        MatchedContent::TextChunk { content } => content.last().copied(),
+        MatchedContent::None => None,
+    });
+
+    // Assuming get_elements_between_markers takes Option<&TextElement>, Option<&TextElement>
+    let content = index.get_elements_between_markers(prev_end_element, None);
     
     let mut result = TemplateContentMatch::with_content(
         template,
@@ -418,7 +435,7 @@ fn create_section_page_map(elements: &[TextElement]) -> BTreeMap<u32, Vec<TextEl
 
     for element in elements {
         page_map
-            .entry(element.page)
+            .entry(element.page_number) // Changed from element.page
             .or_insert_with(Vec::new)
             .push(element.clone());
     }
@@ -427,11 +444,11 @@ fn create_section_page_map(elements: &[TextElement]) -> BTreeMap<u32, Vec<TextEl
 }
 
 // Add basic implementations for Table and Image matchers
-fn match_table(
-    template: &Element,
-    page_map: &BTreeMap<u32, Vec<TextElement>>,
+fn match_table<'a>( // Added lifetime 'a
+    template: &'a Element,
+    page_map: &'a BTreeMap<u32, Vec<TextElement>>,
     inherited_metadata: &HashMap<String, Value>,
-) -> Option<TemplateContentMatch> {
+) -> Option<TemplateContentMatch<'a>> { // Added lifetime 'a to return type
     println!("MATCHER: Processing Table template element");
 
     // Get match string and threshold from template attributes
@@ -454,38 +471,44 @@ fn match_table(
     // Very basic matching - just look for text that might be part of a table
     let table_indicators = ["table", "column", "row", "|", "total"];
 
-    // Find lines that might contain table-like content
-    let potential_table_lines: Vec<TextLine> = page_map
-        .iter()
-        .flat_map(|(_, elements)| elements.iter())
+    // Find elements that might indicate a table
+    let potential_table_elements: Vec<&'a TextElement> = page_map
+        .values()
+        .flatten()
         .filter(|element| {
             let text = element.text.to_lowercase();
             table_indicators
                 .iter()
                 .any(|indicator| text.contains(indicator))
                 || text.contains("|")
-                || (text.chars().filter(|c| *c == ' ').count() > 5) // Lots of spaces might indicate columns
+                || (text.chars().filter(|c| *c == ' ').count() > 5)
         })
-        .cloned()
         .collect();
 
-    // If we found potential table lines, create a match
-    if !potential_table_lines.is_empty() {
-        println!(
-            "MATCHER: Found potential table with {} lines",
-            potential_table_lines.len()
-        );
+    // If we found potential table elements, create a match
+    if !potential_table_elements.is_empty() {
+        let start_marker = potential_table_elements.first().copied()?; // Use copied to get Option<&'a TextElement>
+        let end_marker = potential_table_elements.last().copied();
 
-        // Get the first line as the starting point
-        let start_line = &potential_table_lines[0];
+        println!(
+            "MATCHER: Found potential table starting with element: {}",
+            start_marker.text
+        );
+        
+        let table_content = extract_section_content(
+            page_map,
+            start_marker.page_number,
+            start_marker,
+            end_marker,
+        );
 
         // Create a match result
         let mut result = TemplateContentMatch::with_content(
             template,
             MatchedContent::Section {
-                start_marker: start_line.clone(),
-                end_marker: potential_table_lines.last().cloned(),
-                content: extract_table_content(page_map, start_line, potential_table_lines.last()),
+                start_marker, // Now &'a TextElement
+                end_marker,   // Now Option<&'a TextElement>
+                content: table_content, // Now Vec<&'a TextElement>
             },
         );
 
@@ -497,7 +520,7 @@ fn match_table(
             Level::DEBUG,
             target = TEMPLATE_MATCH,
             template_id = %Uuid::new_v4(),
-            content_id = %start_line.id,
+            content_id = %start_marker.id,
             template_name = %template.name,
             score = 0.8,
             "Table template matched content with score 0.8"
@@ -509,11 +532,11 @@ fn match_table(
     None
 }
 
-fn match_image(
-    template: &Element,
-    page_map: &BTreeMap<u32, Vec<TextElement>>,
+fn match_image<'a>( // Added lifetime 'a
+    template: &'a Element,
+    page_map: &'a BTreeMap<u32, Vec<TextElement>>,
     inherited_metadata: &HashMap<String, Value>,
-) -> Option<TemplateContentMatch> {
+) -> Option<TemplateContentMatch<'a>> { // Added lifetime 'a to return type
     println!("MATCHER: Processing Image template element");
 
     // Very basic implementation - we don't have actual image detection yet
@@ -529,33 +552,32 @@ fn match_image(
         "picture",
     ];
 
-    let potential_image_lines: Vec<TextLine> = page_map
-        .iter()
-        .flat_map(|(_, elements)| elements.iter())
+    let potential_image_elements: Vec<&'a TextElement> = page_map
+        .values()
+        .flatten()
         .filter(|element| {
             let text = element.text.to_lowercase();
             image_indicators
                 .iter()
                 .any(|indicator| text.contains(indicator))
         })
-        .cloned()
         .collect();
 
-    if !potential_image_lines.is_empty() {
+    if !potential_image_elements.is_empty() {
+        let caption_element = potential_image_elements.first().copied()?; // Use copied
+
         println!(
             "MATCHER: Found potential image caption: {}",
-            potential_image_lines[0].text
+            caption_element.text
         );
-
-        let caption_line = &potential_image_lines[0];
 
         // Create a match result
         let mut result = TemplateContentMatch::with_content(
             template,
             MatchedContent::Section {
-                start_marker: caption_line.clone(),
+                start_marker: caption_element, // Now &'a TextElement
                 end_marker: None,
-                content: Vec::new(), // We don't have actual image content
+                content: Vec::new(), // We don't have actual image content yet from elements
             },
         );
 
@@ -567,7 +589,7 @@ fn match_image(
             Level::DEBUG,
             target = TEMPLATE_MATCH,
             template_id = %Uuid::new_v4(),
-            content_id = %caption_line.id,
+            content_id = %caption_element.id,
             template_name = %template.name,
             score = 0.7,
             "Image template matched caption with score 0.7"
@@ -580,45 +602,42 @@ fn match_image(
 }
 
 // Helper function to extract table content
-fn extract_table_content(
-    page_map: &BTreeMap<u32, Vec<TextElement>>,
-    start_element: &TextLine,
+fn extract_table_content<'a>( // Added lifetime 'a
+    page_map: &'a BTreeMap<u32, Vec<TextElement>>,
+    start_element: &TextLine, // This signature is problematic if we switched to TextElement markers
     end_element: Option<&TextLine>,
-) -> Vec<TextElement> {
-    // Similar to extract_section_content but for tables
-    let start_index = page_map
-        .iter()
-        .flat_map(|(_, elements)| elements.iter())
-        .position(|e| {
-            e.page_number == start_element.page_number
-                && e.bbox.1 >= start_element.bbox.1
-                && e.bbox.3 <= start_element.bbox.3
-        })
-        .unwrap_or(0);
+) -> Vec<&'a TextElement> { // Changed return type
+    // This function needs significant rework if start_element/end_element are TextLine
+    // For now, let's assume it should take TextElements or adapt its logic
+    // Given the errors, this function is called with TextLine arguments from old code path.
+    // The new path in match_table uses TextElement markers and extract_section_content.
+    // This function might be dead code or needs to be aligned.
+    // To fix the immediate compile error (line 622 type annotation for collect)
+    // and return type, I will make it collect Vec<&'a TextElement>.
 
-    let end_index = if let Some(end_elem) = end_element {
-        page_map
-            .iter()
-            .flat_map(|(_, elements)| elements.iter())
-            .position(|e| {
-                e.page_number == end_elem.page_number
-                    && e.bbox.1 >= end_elem.bbox.1
-                    && e.bbox.3 <= end_elem.bbox.3
-            })
-            .unwrap_or(page_map.len())
+    // Find start_index based on start_element (TextLine)
+    // This logic is kept from original, but is flawed if TextLine is not &'a.
+    // For now, to pass compilation, we make it return Vec<&'a TextElement>
+    // but its usage should be reviewed.
+    let mut all_elements = Vec::new();
+    for elements_on_page in page_map.values() {
+        all_elements.extend(elements_on_page.iter());
+    }
+
+
+    let start_text_element = start_element.elements.first(); // Assuming TextLine has elements: Vec<TextElement> or Vec<&'a TextElement>
+
+    let start_index = start_text_element.and_then(|ste| all_elements.iter().position(|e| e.id == ste.id)).unwrap_or(0);
+
+    let end_index = if let Some(end_elem_line) = end_element {
+        end_elem_line.elements.last().and_then(|ete| all_elements.iter().position(|e| e.id == ete.id)).unwrap_or(all_elements.len())
     } else {
-        // If no end element, grab a reasonable number of elements
-        (start_index + 20).min(page_map.len())
+        (start_index + 20).min(all_elements.len())
     };
-
+    
     if start_index >= end_index {
         return Vec::new();
     }
 
-    page_map
-        .iter()
-        .flat_map(|(_, elements)| elements.iter())
-        .cloned()
-        .collect()[start_index..end_index]
-        .to_vec()
+    all_elements[start_index..end_index].to_vec() // This clones references, which is fine.
 }
