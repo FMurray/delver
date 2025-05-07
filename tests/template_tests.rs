@@ -1,5 +1,5 @@
 use delver_pdf::{
-    dom::{parse_template, process_template_element, Value},
+    dom::{parse_template, Value},
     parse::get_pdf_text,
 };
 use lopdf::Document;
