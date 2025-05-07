@@ -126,15 +126,18 @@ fn match_section<'a, 'map_lt>(
 ) -> Option<TemplateContentMatch<'a>> {
     let match_config = template.attributes.get("match")?.as_match_config()?;
     
-    let mut candidates: Vec<&TextLine> = match match_config.match_type {
+    let mut candidates: Vec<TextLine> = match match_config.match_type {
         MatchType::Text => {
             let owned_elements_for_grouping: Vec<TextElement> = index.elements.iter().map(|el_ref| el_ref.clone()).collect();
             let all_lines = group_text_into_lines(&owned_elements_for_grouping, 5.0);
             index.find_line_text_matches(
                 &match_config.pattern, 
                 match_config.threshold,
-                &all_lines
+                &all_lines 
             )
+            .into_iter()
+            .map(|line_ref| line_ref.clone())
+            .collect()
         },
         _ => return None,
     };
@@ -146,33 +149,28 @@ fn match_section<'a, 'map_lt>(
     if let Some(prev) = prev_match {
         let min_pos = match &prev.matched_content {
             MatchedContent::Section { end_marker, start_marker, .. } => {
-                if let Some(end) = end_marker {
-                    index.element_id_to_index.get(&end.id).cloned()
-                } else {
-                    index.element_id_to_index.get(&start_marker.id).cloned()
-                }
+                end_marker.as_ref().copied().or_else(|| Some(*start_marker))
+                    .and_then(|elem| index.element_id_to_index.get(&elem.id).copied())
             },
             MatchedContent::TextChunk { content } => {
-                content.last().and_then(|last| 
-                    index.element_id_to_index.get(&last.id).cloned())
+                content.last().copied()
+                    .and_then(|last| index.element_id_to_index.get(&last.id).copied())
             },
             _ => None
         };
         
         if let Some(pos) = min_pos {
-            candidates = candidates.into_iter()
-                .filter(|line| {
-                    if let Some(first_elem) = line.elements.first() {
-                        if let Some(&elem_idx) = index.element_id_to_index.get(&first_elem.id) {
-                            elem_idx > pos
-                        } else {
-                            false
-                        }
+            candidates.retain(|line| {
+                if let Some(first_elem) = line.elements.first() {
+                    if let Some(&elem_idx) = index.element_id_to_index.get(&first_elem.id) {
+                        elem_idx > pos
                     } else {
                         false
                     }
-                })
-                .collect();
+                } else {
+                    false
+                }
+            });
         }
     }
     
@@ -210,7 +208,7 @@ fn match_section<'a, 'map_lt>(
                     a.bbox.1.partial_cmp(&b.bbox.1).unwrap_or(std::cmp::Ordering::Equal)
                 }
             })
-            .map(|(elem, _)| elem)
+            .map(|(elem_ref_ref, _)| *elem_ref_ref)
     } else {
         None
     };

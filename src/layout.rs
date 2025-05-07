@@ -260,7 +260,10 @@ pub fn group_text_into_lines(
             if (last_y - elem.bbox.1).abs() < line_join_threshold {
                 current_line.push(elem.clone());
             } else {
-                lines.push(TextLine::from_elements(*page_number, current_line));
+                if let Some(first_elem) = current_line.first() {
+                    let current_page_number = first_elem.page_number;
+                    lines.push(TextLine::from_elements(current_page_number, current_line));
+                }
                 current_line = vec![elem.clone()];
                 last_y = elem.bbox.1;
             }
@@ -268,7 +271,10 @@ pub fn group_text_into_lines(
     }
 
     if !current_line.is_empty() {
-        lines.push(TextLine::from_elements(*page_number, current_line));
+        if let Some(first_elem) = current_line.first() {
+            let current_page_number = first_elem.page_number;
+            lines.push(TextLine::from_elements(current_page_number, current_line));
+        }
     }
 
     // Sort elements within each line
