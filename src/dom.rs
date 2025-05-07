@@ -1,7 +1,6 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
-use crate::layout::{MatchContext, TextBlock, TextLine};
-use crate::matcher::{align_template_with_content, MatchedContent, TemplateContentMatch};
-use crate::parse::{get_refs, TextElement};
+use crate::matcher::{MatchedContent, TemplateContentMatch};
+use crate::parse::TextElement;
 use log::{error, info};
 use lopdf::Document;
 use pest::iterators::Pair;
@@ -366,23 +365,24 @@ pub fn process_matched_content(matched: &Vec<TemplateContentMatch>) -> Vec<Chunk
     for match_item in matched {
         match &match_item.matched_content {
             MatchedContent::TextChunk { content } => {
-                // Convert elements to chunks directly
+                // content is &Vec<&'a TextElement>
+                // item in content.iter() is &&'a TextElement
+                let owned_content: Vec<TextElement> = content.iter().map(|el_ref_ref| (**el_ref_ref).clone()).collect();
                 chunks.extend(process_text_chunk_elements(
-                    content,
+                    &owned_content,
                     &match_item.template_element,
                     &match_item.metadata,
                 ));
             }
             MatchedContent::Section { content, .. } => {
-                // Process child matches first
                 for child in &match_item.children {
                     chunks.extend(process_matched_content(&vec![child.clone()]));
                 }
-
-                // If no children processed the content, process it as chunks
                 if chunks.is_empty() && match_item.template_element.children.is_empty() {
+                    // content is &Vec<&'a TextElement>
+                    let owned_content: Vec<TextElement> = content.iter().map(|el_ref_ref| (**el_ref_ref).clone()).collect();
                     chunks.extend(process_text_chunk_elements(
-                        content,
+                        &owned_content,
                         &match_item.template_element,
                         &match_item.metadata,
                     ));
@@ -437,52 +437,7 @@ fn process_text_chunk_elements(
                 .iter()
                 .map(|e| e.text.as_str())
                 .collect::<Vec<_>>()
-                .join(" ");
-
-            ChunkOutput {
-                text: chunk_text,
-                metadata: metadata.clone(),
-                chunk_index: i,
-            }
-        })
-        .collect()
-}
-
-// Helper function to process TextChunk elements
-fn process_text_chunk(
-    template_element: &Element,
-    section_text_elements: &[TextElement],
-    metadata: &HashMap<String, Value>,
-) -> Vec<ChunkOutput> {
-    let chunk_size = if let Some(Value::Number(n)) = template_element.attributes.get("chunkSize") {
-        *n as usize
-    } else {
-        500
-    };
-
-    let chunk_overlap =
-        if let Some(Value::Number(n)) = template_element.attributes.get("chunkOverlap") {
-            *n as usize
-        } else {
-            150
-        };
-
-    // Default to character-based chunking
-    let strategy = ChunkingStrategy::Characters {
-        max_chars: chunk_size,
-    };
-
-    let chunks = chunk_text_elements(section_text_elements, &strategy, chunk_overlap);
-
-    chunks
-        .iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let chunk_text = chunk
-                .iter()
-                .map(|e| e.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
+                .join("");
 
             ChunkOutput {
                 text: chunk_text,

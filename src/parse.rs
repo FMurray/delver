@@ -1,23 +1,18 @@
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fmt::Debug;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
-use std::thread::current;
 use uuid::Uuid;
 
-use crate::geo::{pre_translate,multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
+use crate::geo::{pre_translate, multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
 use crate::layout::MatchContext;
-// use crate::layout::MatchContext;
-use crate::logging::{PDF_BT, PDF_OPERATIONS, PDF_PARSING, PDF_TEXT_OBJECT};
 use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
+use tracing::{error, warn};
 
-use tracing::{error, event, instrument, trace, warn, Span};
-
-#[cfg(feature = "async")]
+#[cfg(feature = "extension-module")]
 use tokio::runtime::Builder;
 
 use crate::fonts::{canonicalize_font_name, FontMetrics, FONT_METRICS};
@@ -60,9 +55,6 @@ fn filter_func(object_id: (u32, u16), object: &mut Object) -> Option<((u32, u16)
         d.remove(b"XObject");
         // d.remove(b"MediaBox");
         d.remove(b"Annots");
-        if d.is_empty() {
-            return None;
-        }
     }
     Some((object_id, object.to_owned()))
 }
@@ -73,10 +65,9 @@ pub struct PdfText {
     pub errors: Vec<String>,
 }
 
-#[cfg(not(feature = "async"))]
+#[cfg(not(feature = "extension-module"))]
 pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    // Document::load_filtered(path, filter_func)
-    //     .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+    // Restore original logic
     if !cfg!(debug_assertions) {
         Document::load(path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     } else {
@@ -85,7 +76,7 @@ pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
     }
 }
 
-#[cfg(feature = "async")]
+#[cfg(feature = "extension-module")]
 fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
     Ok(Builder::new_current_thread()
         .build()
@@ -122,18 +113,18 @@ impl<'a> Default for GraphicsState<'a> {
 
 #[derive(Clone)]
 struct TextObjectState<'a> {
-    text_matrix: Matrix,      // Tm
-    text_line_matrix: Matrix, // Tlm
     font_name: Option<String>,
+    text_matrix: Matrix,
+    text_line_matrix: Matrix,
     glyphs: Vec<PositionedGlyph>,
     text_buffer: String,
     font_metrics: Option<&'static FontMetrics>,
-    current_encoding: Option<&'a Encoding<'a>>,
-    current_metrics: Option<&'static FontMetrics>,
+    _current_encoding: Option<&'a Encoding<'a>>,
+    _current_metrics: Option<&'static FontMetrics>,
     operator_log: Vec<String>,
-    char_bbox: Option<Rect>,
-    char_tx: f32,
-    char_ty: f32,
+    _char_bbox: Option<Rect>,
+    _char_tx: f32,
+    _char_ty: f32,
 }
 
 impl<'a> Default for TextObjectState<'a> {
@@ -145,23 +136,13 @@ impl<'a> Default for TextObjectState<'a> {
             glyphs: Vec::new(),
             text_buffer: String::new(),
             font_metrics: None,
-            current_encoding: None,
-            current_metrics: None,
+            _current_encoding: None,
+            _current_metrics: None,
             operator_log: Vec::new(),
-            char_tx: 0.0,
-            char_ty: 0.0,
-            char_bbox: None,
+            _char_bbox: None,
+            _char_tx: 0.0,
+            _char_ty: 0.0,
         }
-    }
-}
-
-impl<'a> TextObjectState<'a> {
-    fn reset(&mut self) {
-        self.text_matrix = IDENTITY_MATRIX;
-        self.text_line_matrix = self.text_matrix;
-        self.glyphs.clear();
-        self.text_buffer.clear();
-        self.operator_log.clear();
     }
 }
 
@@ -211,12 +192,12 @@ impl<'a> Default for TextState<'a> {
 
 #[derive(Debug, Clone)]
 struct PositionedGlyph {
-    cid: u32,
-    unicode: char,
-    text_matrix: Matrix,
-    device_matrix: Matrix,
+    _cid: u32,
+    _unicode: char,
+    _text_matrix: Matrix,
+    _device_matrix: Matrix,
     bbox: Rect,
-    advance: f32,
+    _advance: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -271,7 +252,6 @@ fn process_glyph(
 
     match operand {
         Object::String(bytes, _) => {
-
             // Current assumiptions:
             // 1. The encoding is either a one-byte encoding or a Unicode map encoding (WinAnsi, MacRoman, etc.)
             // 2. Font uses identity CMap (CID = byte value)
@@ -305,33 +285,19 @@ fn process_glyph(
                 let trm_temp = multiply_matrices(&tsm, &tos.text_matrix);
                 let trm = multiply_matrices(&trm_temp, &ctm);
                 
-                
                 let char_bbox = glyph_bound(metrics, cid, &trm);
 
-                // Append the character to the text buffer.
-                // if let Some(last_char) = text_object_state.text_buffer.chars().last() {
-                //     if !(last_char == ' ' && ch == ' ') {
-                //         text_object_state.text_buffer.push(ch);
-                //     }
-                // } else {
-                //     text_object_state.text_buffer.push(ch);
-                // }
-
-                // Save the current text-space baseline position.
-                // let base_x = text_object_state.text_matrix.e += advance * text_state.scale;
-                
                 tos.glyphs.push(PositionedGlyph {
-                    cid,
-                    unicode: ch,
-                    text_matrix: tos.text_matrix,
-                    device_matrix: trm,
+                    _cid: cid,
+                    _unicode: ch,
+                    _text_matrix: tos.text_matrix,
+                    _device_matrix: trm,
                     bbox: char_bbox,
-                    advance
+                    _advance: advance
                 });
 
-                if !(ch == ' ' && tos.text_buffer.ends_with(' ')) {
-                    tos.text_buffer.push(ch);
-                }
+                // Only add the character to the text buffer
+                tos.text_buffer.push(ch);
             }
         }
         Object::Integer(i) => {
@@ -345,8 +311,8 @@ fn process_glyph(
         Object::Array(arr) => {
             collect_text_glyphs(tos, ts, arr, ctm)?;
         }
-    _ => {}
-}
+        _ => {}
+    }
     Ok(())
 }
 
@@ -833,7 +799,6 @@ pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
 
     let context = MatchContext {
         destinations,
-        fonts: None,
     };
 
     Ok(context)

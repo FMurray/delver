@@ -1,12 +1,8 @@
 use indexmap::IndexMap;
-use log::info;
-use lopdf::Dictionary;
 use lopdf::Object;
-use rayon::prelude::*;
 use std::collections::BTreeMap;
-use strsim::normalized_levenshtein;
 use uuid::Uuid;
-
+use std::fmt::Debug;
 use crate::parse::TextElement;
 
 // Add this struct at the module level
@@ -33,7 +29,7 @@ impl TextLine {
         let mut line_min_y = f32::MAX;
         let mut line_max_x = f32::MIN;
         let mut line_max_y = f32::MIN;
-        let mut combined_text = String::new();
+        let mut combined_text = String::with_capacity(items.iter().map(|e| e.text.len()).sum());
 
         for (_, it) in items.iter().enumerate() {
             line_min_x = line_min_x.min(it.bbox.0);
@@ -232,7 +228,7 @@ pub fn group_text_into_lines(
     text_elements: &Vec<TextElement>,
     line_join_threshold: f32,
 ) -> Vec<TextLine> {
-    let mut all_lines = Vec::new();
+    let all_lines = Vec::new();
 
     let mut elements = text_elements.clone();
     elements.sort_by(|a, b| {
@@ -260,7 +256,10 @@ pub fn group_text_into_lines(
             if (last_y - elem.bbox.1).abs() < line_join_threshold {
                 current_line.push(elem.clone());
             } else {
-                lines.push(TextLine::from_elements(*page_number, current_line));
+                if let Some(first_elem) = current_line.first() {
+                    let current_page_number = first_elem.page_number;
+                    lines.push(TextLine::from_elements(current_page_number, current_line));
+                }
                 current_line = vec![elem.clone()];
                 last_y = elem.bbox.1;
             }
@@ -268,7 +267,10 @@ pub fn group_text_into_lines(
     }
 
     if !current_line.is_empty() {
-        lines.push(TextLine::from_elements(*page_number, current_line));
+        if let Some(first_elem) = current_line.first() {
+            let current_page_number = first_elem.page_number;
+            lines.push(TextLine::from_elements(current_page_number, current_line));
+        }
     }
 
     // Sort elements within each line

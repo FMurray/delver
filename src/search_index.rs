@@ -1,9 +1,8 @@
 use crate::{
-    geo::Rect,
     layout::{MatchContext, TextLine},
     parse::TextElement,
 };
-use lopdf::{Document, Object};
+use lopdf::Object;
 use multi_index_map::MultiIndexMap;
 use rstar::{RTree, RTreeObject, AABB};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -11,7 +10,7 @@ use uuid::Uuid;
 
 // Wrapper for TextElement to implement RTreeObject
 #[derive(Clone, Debug)]
-struct SpatialElement {
+pub struct SpatialElement {
     element: TextElement,
 }
 

@@ -1,23 +1,14 @@
 use std::fmt::Write;
-use std::sync::Once;
 use std::sync::{Arc, Mutex};
-use tracing::level_filters::LevelFilter;
-use tracing::{Subscriber, Value};
+use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt::format::DefaultFields;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{
-    filter::EnvFilter, fmt::FormattedFields, layer::SubscriberExt, util::SubscriberInitExt, Layer,
-};
-use tracing_subscriber::{registry, Registry};
+use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 use serde_json;
 use std::collections::HashMap;
-use tracing_tree::HierarchicalLayer;
 use uuid::Uuid;
-
-use crate::dom::ElementType;
 
 // Define log targets as constants
 pub const PDF_OPERATIONS: &str = "pdf_ops";
@@ -39,30 +30,14 @@ pub const REL_PARENT: &str = "parent";
 pub const REL_CHILDREN: &str = "children";
 pub const REL_TYPE: &str = "rel_type";
 
-// Add these constants at the top
-const DEBUG_TARGETS: &[&str] = &[
-    PDF_OPERATIONS,
-    PDF_TEXT_OBJECT,
-    PDF_TEXT_BLOCK,
-    PDF_BT,
-    "delver_pdf::parse",
-    MATCHER_OPERATIONS,
-    TEMPLATE_MATCH,
-];
-
 enum EntityType {
-    Element,
     Line,
-    Block,
     Template, // Add a new entity type for templates
-    Match,    // Add a new entity type for matches
 }
 
 #[derive(Clone, Default)]
 pub struct DebugDataStore {
     message_arena: Arc<Mutex<Vec<String>>>,
-    elements: Arc<Mutex<HashMap<Uuid, usize>>>,
-    lines: Arc<Mutex<HashMap<Uuid, (Uuid, Vec<usize>)>>>,
     events: Arc<Mutex<HashMap<Uuid, Vec<usize>>>>,
     lineage: Arc<Mutex<LineageStore>>,
     // Add template-match tracking
@@ -114,7 +89,7 @@ impl DebugDataStore {
         events
     }
 
-    pub fn record_relationship(&self, parent: Option<Uuid>, children: Vec<Uuid>, rel_type: &str) {
+    pub fn record_relationship(&self, parent: Option<Uuid>, children: Vec<Uuid>, _rel_type: &str) {
         let mut lineage = self.lineage.lock().unwrap();
 
         if let Some(parent_id) = parent {
@@ -202,7 +177,7 @@ impl DebugDataStore {
         EntityEvents { messages, children }
     }
 
-    fn record_entity(&self, entity_id: Uuid, entity_type: EntityType, message: String) {
+    fn record_entity(&self, entity_id: Uuid, _entity_type: EntityType, message: String) {
         let mut arena = self.message_arena.lock().unwrap();
         let idx = arena.len();
         arena.push(message.clone());
@@ -349,28 +324,6 @@ impl DebugDataStore {
         self.get_children(*template_id)
     }
 
-    // Helper to get entity name
-    fn get_entity_name(&self, id: &Uuid) -> Option<String> {
-        let events = self.events.lock().unwrap();
-        if let Some(indices) = events.get(id) {
-            if !indices.is_empty() {
-                let messages = self.message_arena.lock().unwrap();
-                let idx = indices[0];
-                let message = &messages[idx];
-                // Extract name from message string
-                if let Some(start) = message.find("template_name = ") {
-                    let name_part = &message[start + "template_name = ".len()..];
-                    if let Some(end) = name_part.find(';') {
-                        return Some(name_part[..end].trim().to_string());
-                    } else {
-                        return Some(name_part.trim().to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
     // Add method to get content text by ID
     pub fn get_content_by_id(&self, content_id: &Uuid) -> Option<String> {
         // Use events collection to find content
@@ -424,7 +377,7 @@ pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
     let debug_layer = DebugLayer::new(store);
 
     // Create a non-blocking file appender to get the WorkerGuard
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let (_non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
 
     // Create a filter that explicitly allows our targets
     let filter = tracing_subscriber::filter::filter_fn(|metadata| {
@@ -537,7 +490,7 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
                     templates.insert(template_id, name);
                 }
             }
-            (_, Some(line_id), Some(template_id), Some(match_id)) => {
+            (_, Some(line_id), Some(template_id), Some(_match_id)) => {
                 println!(
                     "CAPTURE: Found template match between template={} and line={}",
                     template_id, line_id
@@ -568,7 +521,7 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
             }
             // Standard element case
             (Some(e_id), _, _, _) => {
-                self.store.record_entity(e_id, EntityType::Element, message);
+                self.store.record_entity(e_id, EntityType::Line, message);
             }
             // Standard line case
             (_, Some(l_id), _, _) => {
@@ -578,7 +531,7 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
             _ => {
                 if let Some(e_id) = *id_visitor.element_id {
                     self.store
-                        .record_entity(e_id, EntityType::Element, message.clone());
+                        .record_entity(e_id, EntityType::Line, message.clone());
                 }
                 if let Some(l_id) = *id_visitor.line_id {
                     self.store
@@ -678,34 +631,6 @@ impl tracing::field::Visit for RelationshipVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let value = format!("{:?}", value);
         self.record_str(field, &value)
-    }
-}
-
-struct RecordContentIDVisitor<'a>(&'a mut Option<Uuid>, &'a mut f32, &'a mut Option<String>);
-
-impl<'a> tracing::field::Visit for RecordContentIDVisitor<'a> {
-    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        if field.name() == "score" {
-            *self.1 = value as f32;
-            println!("VISITOR: Found score: {}", value);
-        }
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "template_name" {
-            *self.2 = Some(value.to_string());
-            println!("VISITOR: Found template_name: {}", value);
-        }
-    }
-
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let value = format!("{:?}", value);
-        if field.name() == "content_id" {
-            if let Ok(id) = Uuid::parse_str(&value.trim_matches('"')) {
-                *self.0 = Some(id);
-                println!("VISITOR: Found content_id: {}", id);
-            }
-        }
     }
 }
 

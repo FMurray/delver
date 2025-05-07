@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub mod setup;
 use crate::setup::create_test_pdf;
-use delver::parse::{get_pdf_text, get_refs, load_pdf, TextElement};
+use delver_pdf::parse::{get_pdf_text, get_refs, load_pdf, TextElement};
 
 mod common;
 
@@ -45,7 +45,8 @@ fn test_get_pdf_text() {
     ];
 
     let extracted_texts: Vec<&str> = text_elements
-        .iter()
+        .values()
+        .flatten()
         .map(|element| element.text.as_str())
         .collect();
 
@@ -58,7 +59,7 @@ fn test_get_pdf_text() {
     }
 
     // Test font properties
-    for element in text_elements {
+    for element in text_elements.values().flatten() {
         match element.text.as_str() {
             "Hello World!" => assert_eq!(element.font_size, 48.0),
             text if text.starts_with("Subheading") => assert_eq!(element.font_size, 24.0),
@@ -101,10 +102,11 @@ fn create_sample_text_element() -> TextElement {
     TextElement {
         text: String::from("Sample text"),
         page_number: 1,
-        page_id: (1, 0),
         font_size: 12.0,
         font_name: Some(String::from("Courier")),
-        position: (100.0, 200.0),
+        bbox: (100.0, 200.0, 150.0, 210.0),
+        id: uuid::Uuid::new_v4(),
+        operators: Vec::new(),
     }
 }
 
@@ -114,8 +116,7 @@ fn test_text_element_display() {
     let display_string = format!("{}", element);
 
     assert!(display_string.contains("Sample text"));
-    assert!(display_string.contains("Page Number: 1"));
-    assert!(display_string.contains("Font Size: 12.00"));
+    assert!(display_string.contains("12pt"));
     assert!(display_string.contains("Courier"));
-    assert!(display_string.contains("100.00, 200.00"));
+    assert!(display_string.contains("100.0, 200.0, 150.0, 210.0"));
 }

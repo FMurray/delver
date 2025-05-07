@@ -10,14 +10,12 @@ pub mod parse;
 pub mod search_index;
 
 use crate::dom::{parse_template, process_matched_content, ChunkOutput};
-use crate::layout::{group_text_into_lines_and_blocks, MatchContext, TextBlock, TextLine};
+use crate::layout::{group_text_into_lines_and_blocks, TextBlock};
 use crate::matcher::align_template_with_content;
 use crate::parse::{get_pdf_text, get_refs};
-use logging::{PDF_TEXT_BLOCK, PDF_TEXT_OBJECT};
 use lopdf::Document;
 use search_index::PdfIndex;
-use std::collections::HashMap;
-use tracing::event;
+use anyhow::Result;
 
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
@@ -33,11 +31,16 @@ use pyo3::prelude::*;
 pub fn process_pdf(
     pdf_bytes: &[u8],
     template_str: &str,
-) -> Result<(String, Vec<TextBlock>, Document), Box<dyn std::error::Error>> {
+) -> Result<(String, Vec<TextBlock>, Document)> {
     let dom = parse_template(template_str)?;
 
     let doc = Document::load_mem(pdf_bytes)?;
     let pages_map = get_pdf_text(&doc)?;
+
+    let line_join_threshold = 5.0; // Default threshold
+    let block_join_threshold = 12.0; // Default threshold
+    let blocks =
+        group_text_into_lines_and_blocks(&pages_map, line_join_threshold, block_join_threshold);
 
     let match_context = get_refs(&doc)?;
 
@@ -64,7 +67,7 @@ fn process_pdf_file(pdf_path: String, template_path: String) -> PyResult<String>
     let template_str = std::fs::read_to_string(template_path)?;
 
     // Process using existing function
-    let json = process_pdf(&pdf_bytes, &template_str)
+    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     Ok(json)
