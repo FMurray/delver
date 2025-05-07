@@ -12,6 +12,7 @@ use std::sync::{Arc, Weak};
 use std::{collections::HashMap, io::Error};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use image; // Add image crate import
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum EmbeddingModel {
@@ -547,12 +548,18 @@ fn process_image_element(
                 let embedding_model = EmbeddingModel::from(model_str.as_str());
 
                 match &image_bytes_result {
-                     Ok(_bytes) => {
-                        // TODO: Implement actual call to external embedding model
-                        // let embedding = generate_embedding(&embedding_model, bytes);
-                        println!("Placeholder: Call external embedding model ('{:?}')", embedding_model);
-                        image_output.embedding = Some(vec![0.1, 0.2, 0.3]); // Placeholder embedding
-                        // Optionally store model used: image_output.embedding_model = Some(embedding_model);
+                     Ok(bytes) => {
+                        // Call the placeholder embedding function
+                        match generate_embedding(&embedding_model, bytes) {
+                            Ok(embedding) => {
+                                image_output.embedding = Some(embedding);
+                                println!("Successfully generated placeholder embedding using {:?}.", embedding_model);
+                            }
+                            Err(e) => {
+                                warn!("Embedding generation failed for model {:?}: {}", embedding_model, e);
+                                image_output.embedding = None;
+                            }
+                        }
                      }
                      Err(e) => {
                          if e != "Bytes not needed" {
@@ -623,9 +630,48 @@ fn process_text_chunk_elements(
 
 fn decode_image_object(image_object: &Object) -> Result<Vec<u8>, String> {
     if let Ok(stream) = image_object.as_stream() {
-        // Access the raw decoded bytes directly from the stream's content field
-        Ok(stream.content.clone()) // Clone the Vec<u8>
+        Ok(stream.content.clone()) 
     } else {
         Err("Image object is not a stream".to_string())
+    }
+}
+
+// Placeholder function for generating embeddings
+fn generate_embedding(
+    model: &EmbeddingModel,
+    image_bytes: &[u8],
+) -> Result<Vec<f32>, String> {
+    match model {
+        EmbeddingModel::Clip => {
+            // --- Placeholder Logic --- 
+            println!(
+                "Placeholder: Simulating CLIP embedding generation for image ({} bytes)",
+                image_bytes.len()
+            );
+            // Basic validation: Try to guess format and check dimensions (optional)
+            match image::guess_format(image_bytes) {
+                Ok(format) => {
+                    println!("Placeholder: Detected image format: {:?}", format);
+                    match image::load_from_memory(image_bytes) {
+                        Ok(img) => {
+                             println!(
+                                "Placeholder: Image dimensions {}x{}",
+                                img.width(),
+                                img.height()
+                            );
+                            // In real implementation, send `image_bytes` or processed image to CLIP API
+                            // Here, return a dummy vector
+                             Ok(vec![0.5; 512]) // Example: Return a 512-dimension vector of 0.5s
+                        }
+                        Err(e) => Err(format!("Placeholder: Failed to load image: {}", e)),
+                    }
+                }
+                Err(_) => Err("Placeholder: Could not guess image format".to_string()),
+            }
+            // --- End Placeholder Logic ---
+        }
+        EmbeddingModel::Unknown(name) => {
+            Err(format!("Embedding model '{}' not implemented", name))
+        }
     }
 }
