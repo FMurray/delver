@@ -1,8 +1,8 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
 use crate::matcher::{MatchedContent, TemplateContentMatch};
-use crate::parse::{TextElement, PageContent};
-use log::{error, info};
-use lopdf::Document;
+use crate::parse::{TextElement, PageContent, ImageElement};
+use log::{error, info, warn};
+use lopdf::{Document, Stream, Dictionary as LoPdfDictionary, Object};
 use pest::iterators::Pair;
 use pest::Parser as PestParser;
 use pest_derive::Parser as PestParserDerive;
@@ -10,6 +10,30 @@ use serde::Serialize;
 use std::io::ErrorKind;
 use std::sync::{Arc, Weak};
 use std::{collections::HashMap, io::Error};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum EmbeddingModel {
+    Clip,
+    Unknown(String),
+}
+
+impl From<&str> for EmbeddingModel {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "clip" => EmbeddingModel::Clip,
+            _ => EmbeddingModel::Unknown(s.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LLMConfig {
+    pub model: String,
+    pub prompt: String,
+    pub target_schema: Option<String>,
+}
 
 #[derive(PestParserDerive)]
 #[grammar = "template.pest"]
@@ -448,7 +472,6 @@ fn process_image_element(
     let mut image_output = ImageOutput {
         id: image_element.id.to_string(),
         page_number: image_element.page_number,
-        // Manually convert geo::Rect to tuple
         bbox: (
             image_element.bbox.x0,
             image_element.bbox.y0,
@@ -462,27 +485,82 @@ fn process_image_element(
         metadata: metadata.clone(),
     };
 
-    // Iterate through children of the Image template element (e.g., ImageBytes, ImageCaption)
+    // Attempt to decode image bytes once if needed by any child
+    let needs_bytes = template_element.children.iter().any(|child| {
+        matches!(child.element_type, ElementType::ImageBytes | ElementType::ImageSummary | ElementType::ImageEmbedding)
+    });
+    
+    let image_bytes_result = if needs_bytes {
+        decode_image_object(&image_element.image_object)
+    } else {
+        Err("Bytes not needed".to_string()) // Indicate bytes weren't requested
+    };
+
+    // Iterate through children of the Image template element
     for child_template in &template_element.children {
         match child_template.element_type {
             ElementType::ImageBytes => {
-                println!("Placeholder: Need to implement image decoding for ImageBytes");
-                image_output.bytes_base64 = Some("PLACEHOLDER_BASE64_IMAGE_DATA".to_string());
+                 match &image_bytes_result {
+                    Ok(bytes) => {
+                        image_output.bytes_base64 = Some(BASE64_STANDARD.encode(bytes));
+                        println!("Successfully decoded and encoded image bytes for ImageBytes.");
+                    }
+                    Err(e) => {
+                         if e != "Bytes not needed" { // Don't warn if bytes weren't requested
+                            warn!("Could not get image bytes for ImageBytes: {}", e);
+                         }
+                         image_output.bytes_base64 = None; // Ensure it's None on error
+                    }
+                 }
             }
             ElementType::ImageCaption => {
+                // TODO: Implement actual caption finding logic
+                // This likely involves searching nearby TextElements in the PdfIndex
+                // based on the image_element.bbox and page_number.
                 println!("Placeholder: Need to implement caption finding for ImageCaption");
                 image_output.caption = Some("PLACEHOLDER_IMAGE_CAPTION".to_string());
             }
             ElementType::ImageSummary => {
                 let model = child_template.attributes.get("model").and_then(|v| v.as_string()).unwrap_or_default();
                 let prompt = child_template.attributes.get("prompt").and_then(|v| v.as_string()).unwrap_or_default();
-                println!("Placeholder: Call external summary model ('{}') with prompt: {}", model, prompt);
-                image_output.summary = Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", model));
+                let target_schema = child_template.attributes.get("targetSchema").and_then(|v| v.as_string());
+                
+                let config = LLMConfig { model, prompt, target_schema };
+
+                match &image_bytes_result {
+                    Ok(_bytes) => {
+                        // TODO: Implement actual call to external LLM for summary
+                        // let summary = call_llm_summary(&config, bytes);
+                        println!("Placeholder: Call external summary model ('{:?}')", config);
+                        image_output.summary = Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", config.model));
+                    }
+                    Err(e) => {
+                        if e != "Bytes not needed" {
+                           warn!("Could not get image bytes for ImageSummary: {}", e);
+                        }
+                        image_output.summary = None;
+                    }
+                }
             }
             ElementType::ImageEmbedding => {
-                let model = child_template.attributes.get("model").and_then(|v| v.as_string()).unwrap_or_default();
-                 println!("Placeholder: Call external embedding model ('{}')", model);
-                image_output.embedding = Some(vec![0.1, 0.2, 0.3]); // Placeholder embedding
+                let model_str = child_template.attributes.get("model").and_then(|v| v.as_string()).unwrap_or("clip".to_string());
+                let embedding_model = EmbeddingModel::from(model_str.as_str());
+
+                match &image_bytes_result {
+                     Ok(_bytes) => {
+                        // TODO: Implement actual call to external embedding model
+                        // let embedding = generate_embedding(&embedding_model, bytes);
+                        println!("Placeholder: Call external embedding model ('{:?}')", embedding_model);
+                        image_output.embedding = Some(vec![0.1, 0.2, 0.3]); // Placeholder embedding
+                        // Optionally store model used: image_output.embedding_model = Some(embedding_model);
+                     }
+                     Err(e) => {
+                         if e != "Bytes not needed" {
+                            warn!("Could not get image bytes for ImageEmbedding: {}", e);
+                         }
+                         image_output.embedding = None;
+                     }
+                }
             }
             _ => {}
         }
@@ -491,7 +569,6 @@ fn process_image_element(
     ProcessedOutput::Image(image_output)
 }
 
-// Helper function to convert elements to text chunks (remains largely the same)
 fn process_text_chunk_elements(
     elements: &[TextElement],
     template_element: &Element,
@@ -542,4 +619,15 @@ fn process_text_chunk_elements(
             }
         })
         .collect()
+}
+
+fn decode_image_object(image_object: &Object) -> Result<Vec<u8>, String> {
+    if let Ok(stream) = image_object.as_stream() {
+        match stream.decode() {
+            Ok(decoded_bytes) => Ok(decoded_bytes),
+            Err(e) => Err(format!("Failed to decode image stream: {}", e)),
+        }
+    } else {
+        Err("Image object is not a stream".to_string())
+    }
 }
