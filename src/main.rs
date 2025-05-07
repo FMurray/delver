@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::Parser;
+use anyhow::Result;
 
 use delver_pdf::logging::{init_debug_logging, DebugDataStore};
 use delver_pdf::process_pdf;
@@ -52,7 +53,7 @@ impl Args {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     let args = Args::parse_args();
 
     // Initialize debug data store

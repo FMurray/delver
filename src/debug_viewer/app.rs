@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use uuid::Uuid;
+use anyhow::{Context as _, Result};
 
 /// Main debug viewer application
 pub struct DebugViewer {
@@ -53,7 +54,7 @@ impl DebugViewer {
         mut doc: Document,
         blocks: &[TextBlock],
         debug_store: DebugDataStore,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self> {
         // Create PDF renderer
         let pdfium = Pdfium::new(
             Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
@@ -73,7 +74,7 @@ impl DebugViewer {
             let page: PdfPage = document
                 .pages()
                 .get(page_index)
-                .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+                .map_err(|e| anyhow::anyhow!("Failed to get page {}: {}", page_index, e))?;
 
             let width = page.width().value as i32;
             let height = page.height().value as i32;
@@ -88,7 +89,7 @@ impl DebugViewer {
 
             let bitmap: PdfBitmap = page
                 .render_with_config(&render_config)
-                .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+                .map_err(|e| anyhow::anyhow!("Failed to render page {}: {}", page_index, e))?;
 
             // Convert to RGBA - use as_rgba_bytes() which handles format conversion
             let pixels = bitmap.as_rgba_bytes();
@@ -297,7 +298,7 @@ pub fn launch_viewer(
     doc: &Document,
     blocks: &[TextBlock],
     debug_store: DebugDataStore,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 1000.0])
@@ -312,10 +313,13 @@ pub fn launch_viewer(
             // Install image loaders
             egui_extras::install_image_loaders(&cc.egui_ctx);
 
-            let viewer = DebugViewer::new(&cc.egui_ctx, doc.clone(), blocks, debug_store).unwrap();
+            let viewer = DebugViewer::new(&cc.egui_ctx, doc.clone(), blocks, debug_store)
+                .context("Failed to create DebugViewer")
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             Ok(Box::new(viewer) as Box<dyn eframe::App>)
         }),
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!("eframe::run_native failed: {:?}", e))?;
 
     Ok(())
 }

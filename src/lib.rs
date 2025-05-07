@@ -18,6 +18,7 @@ use lopdf::Document;
 use search_index::PdfIndex;
 use std::collections::HashMap;
 use tracing::event;
+use anyhow::Result;
 
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
@@ -33,7 +34,7 @@ use pyo3::prelude::*;
 pub fn process_pdf(
     pdf_bytes: &[u8],
     template_str: &str,
-) -> Result<(String, Vec<TextBlock>, Document), Box<dyn std::error::Error>> {
+) -> Result<(String, Vec<TextBlock>, Document)> {
     let dom = parse_template(template_str)?;
 
     let doc = Document::load_mem(pdf_bytes)?;
@@ -69,7 +70,7 @@ fn process_pdf_file(pdf_path: String, template_path: String) -> PyResult<String>
     let template_str = std::fs::read_to_string(template_path)?;
 
     // Process using existing function
-    let json = process_pdf(&pdf_bytes, &template_str)
+    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     Ok(json)

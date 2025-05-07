@@ -46,6 +46,7 @@ ordered-float = "5.0.0"
 rstar = "0.12.2"
 multi_index_map = "0.11.0"
 geo = "0.29.3"
+anyhow = "1.0.98"
 
 [dev-dependencies]
 flamegraph = "0.6.7"
