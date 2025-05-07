@@ -219,7 +219,7 @@ struct PositionedGlyph {
     advance: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TextElement {
     pub id: Uuid,
     pub text: String,
@@ -866,7 +866,7 @@ pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
 }
 
 /// Represents a single line of text on the page after grouping TextElements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TextLine {
     pub id: Uuid,
     pub text: String,
@@ -920,10 +920,8 @@ impl TextLine {
     }
 }
 
-
-
 /// Represents a "block" of consecutive lines that are close in vertical spacing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TextBlock {
     pub id: Uuid,
     pub page_number: u32,
@@ -963,7 +961,6 @@ impl TextBlock {
         block
     }
 }
-
 
 /// Example grouping function that demonstrates how to:
 /// 1) Separate text by page
@@ -1052,7 +1049,6 @@ pub fn group_text_into_lines_and_blocks(
 
     all_blocks
 }
-
 
 /// The transformed bounding box as a `Rect`.
 pub fn glyph_bound(font: &FontMetrics, glyph_id: u32, trm: &Matrix) -> Rect {
