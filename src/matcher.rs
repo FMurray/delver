@@ -11,8 +11,6 @@ use strsim::normalized_levenshtein;
 use tracing::{event, Level};
 use uuid::Uuid;
 
-const ENABLE_MATCHER_LOGGING: bool = true;
-
 #[derive(Debug, Clone)]
 pub struct TemplateContentMatch<'a> {
     pub template_element: &'a Element,
@@ -418,20 +416,6 @@ pub fn extract_section_content<'a, 'map_lt>(
     content
 }
 
-// Convert a flat list of elements back into a page map for child processing
-fn create_section_page_map(elements: &[TextElement]) -> BTreeMap<u32, Vec<TextElement>> {
-    let mut page_map = BTreeMap::new();
-
-    for element in elements {
-        page_map
-            .entry(element.page_number)
-            .or_insert_with(Vec::new)
-            .push(element.clone());
-    }
-
-    page_map
-}
-
 // Add basic implementations for Table and Image matchers
 fn match_table<'a, 'map_lt>(
     template: &'a Element,
@@ -554,13 +538,4 @@ fn match_image<'a, 'map_lt>(
     }
 
     None
-}
-
-// Helper function to extract table content
-fn extract_table_content<'a, 'map_lt>(
-    _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a TextElement>>,
-    _start_element: &TextLine,
-    _end_element: Option<&TextLine>,
-) -> Vec<&'a TextElement> {
-    Vec::new()
 }

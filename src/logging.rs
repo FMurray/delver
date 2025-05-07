@@ -1,23 +1,14 @@
 use std::fmt::Write;
-use std::sync::Once;
 use std::sync::{Arc, Mutex};
-use tracing::level_filters::LevelFilter;
 use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt::format::DefaultFields;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{
-    filter::EnvFilter, fmt::FormattedFields, layer::SubscriberExt, util::SubscriberInitExt, Layer,
-};
-use tracing_subscriber::{registry, Registry};
+use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 use serde_json;
 use std::collections::HashMap;
-use tracing_tree::HierarchicalLayer;
 use uuid::Uuid;
-
-use crate::dom::ElementType;
 
 // Define log targets as constants
 pub const PDF_OPERATIONS: &str = "pdf_ops";
@@ -39,17 +30,6 @@ pub const REL_PARENT: &str = "parent";
 pub const REL_CHILDREN: &str = "children";
 pub const REL_TYPE: &str = "rel_type";
 
-// Add these constants at the top
-const DEBUG_TARGETS: &[&str] = &[
-    PDF_OPERATIONS,
-    PDF_TEXT_OBJECT,
-    PDF_TEXT_BLOCK,
-    PDF_BT,
-    "delver_pdf::parse",
-    MATCHER_OPERATIONS,
-    TEMPLATE_MATCH,
-];
-
 enum EntityType {
     Line,
     Template, // Add a new entity type for templates
@@ -58,8 +38,6 @@ enum EntityType {
 #[derive(Clone, Default)]
 pub struct DebugDataStore {
     message_arena: Arc<Mutex<Vec<String>>>,
-    elements: Arc<Mutex<HashMap<Uuid, usize>>>,
-    lines: Arc<Mutex<HashMap<Uuid, (Uuid, Vec<usize>)>>>,
     events: Arc<Mutex<HashMap<Uuid, Vec<usize>>>>,
     lineage: Arc<Mutex<LineageStore>>,
     // Add template-match tracking
@@ -344,28 +322,6 @@ impl DebugDataStore {
     // Get content matches for a template
     pub fn get_content_matches_for_template(&self, template_id: &Uuid) -> Vec<Uuid> {
         self.get_children(*template_id)
-    }
-
-    // Helper to get entity name
-    fn get_entity_name(&self, id: &Uuid) -> Option<String> {
-        let events = self.events.lock().unwrap();
-        if let Some(indices) = events.get(id) {
-            if !indices.is_empty() {
-                let messages = self.message_arena.lock().unwrap();
-                let idx = indices[0];
-                let message = &messages[idx];
-                // Extract name from message string
-                if let Some(start) = message.find("template_name = ") {
-                    let name_part = &message[start + "template_name = ".len()..];
-                    if let Some(end) = name_part.find(';') {
-                        return Some(name_part[..end].trim().to_string());
-                    } else {
-                        return Some(name_part.trim().to_string());
-                    }
-                }
-            }
-        }
-        None
     }
 
     // Add method to get content text by ID
@@ -675,34 +631,6 @@ impl tracing::field::Visit for RelationshipVisitor<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let value = format!("{:?}", value);
         self.record_str(field, &value)
-    }
-}
-
-struct RecordContentIDVisitor<'a>(&'a mut Option<Uuid>, &'a mut f32, &'a mut Option<String>);
-
-impl<'a> tracing::field::Visit for RecordContentIDVisitor<'a> {
-    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        if field.name() == "score" {
-            *self.1 = value as f32;
-            println!("VISITOR: Found score: {}", value);
-        }
-    }
-
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "template_name" {
-            *self.2 = Some(value.to_string());
-            println!("VISITOR: Found template_name: {}", value);
-        }
-    }
-
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let value = format!("{:?}", value);
-        if field.name() == "content_id" {
-            if let Ok(id) = Uuid::parse_str(&value.trim_matches('"')) {
-                *self.0 = Some(id);
-                println!("VISITOR: Found content_id: {}", id);
-            }
-        }
     }
 }
 

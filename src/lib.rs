@@ -13,10 +13,8 @@ use crate::dom::{parse_template, process_matched_content, ChunkOutput};
 use crate::layout::{group_text_into_lines_and_blocks, TextBlock};
 use crate::matcher::align_template_with_content;
 use crate::parse::{get_pdf_text, get_refs};
-use crate::logging::{PDF_OPERATIONS, PDF_PARSING};
 use lopdf::Document;
 use search_index::PdfIndex;
-use tracing::warn;
 use anyhow::Result;
 
 #[cfg(feature = "extension-module")]

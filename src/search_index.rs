@@ -1,5 +1,4 @@
 use crate::{
-    geo::Rect,
     layout::{MatchContext, TextLine},
     parse::TextElement,
 };
@@ -11,7 +10,7 @@ use uuid::Uuid;
 
 // Wrapper for TextElement to implement RTreeObject
 #[derive(Clone, Debug)]
-struct SpatialElement {
+pub struct SpatialElement {
     element: TextElement,
 }
 

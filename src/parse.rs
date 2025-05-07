@@ -1,23 +1,18 @@
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fmt::Debug;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
-use std::thread::current;
 use uuid::Uuid;
 
-use crate::geo::{pre_translate,multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
+use crate::geo::{pre_translate, multiply_matrices, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
 use crate::layout::MatchContext;
-// use crate::layout::MatchContext;
-use crate::logging::{PDF_BT, PDF_OPERATIONS, PDF_PARSING, PDF_TEXT_OBJECT};
 use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
+use tracing::{error, warn};
 
-use tracing::{error, event, instrument, trace, warn, Span};
-
-#[cfg(feature = "async")]
+#[cfg(feature = "extension-module")]
 use tokio::runtime::Builder;
 
 use crate::fonts::{canonicalize_font_name, FontMetrics, FONT_METRICS};
@@ -70,7 +65,7 @@ pub struct PdfText {
     pub errors: Vec<String>,
 }
 
-#[cfg(not(feature = "async"))]
+#[cfg(not(feature = "extension-module"))]
 pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
     // Restore original logic
     if !cfg!(debug_assertions) {
@@ -81,7 +76,7 @@ pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
     }
 }
 
-#[cfg(feature = "async")]
+#[cfg(feature = "extension-module")]
 fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
     Ok(Builder::new_current_thread()
         .build()
@@ -134,25 +129,6 @@ struct TextObjectState<'a> {
 
 impl<'a> Default for TextObjectState<'a> {
     fn default() -> Self {
-        TextObjectState {
-            font_name: None,
-            text_matrix: IDENTITY_MATRIX,
-            text_line_matrix: IDENTITY_MATRIX,
-            glyphs: Vec::new(),
-            text_buffer: String::new(),
-            font_metrics: None,
-            _current_encoding: None,
-            _current_metrics: None,
-            operator_log: Vec::new(),
-            _char_bbox: None,
-            _char_tx: 0.0,
-            _char_ty: 0.0,
-        }
-    }
-}
-
-impl<'a> TextObjectState<'a> {
-    fn new() -> Self {
         TextObjectState {
             font_name: None,
             text_matrix: IDENTITY_MATRIX,
