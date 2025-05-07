@@ -437,7 +437,7 @@ fn process_text_chunk_elements(
                 .iter()
                 .map(|e| e.text.as_str())
                 .collect::<Vec<_>>()
-                .join(" ");
+                .join("");
 
             ChunkOutput {
                 text: chunk_text,

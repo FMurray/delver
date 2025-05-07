@@ -252,7 +252,6 @@ fn process_glyph(
 
     match operand {
         Object::String(bytes, _) => {
-
             // Current assumiptions:
             // 1. The encoding is either a one-byte encoding or a Unicode map encoding (WinAnsi, MacRoman, etc.)
             // 2. Font uses identity CMap (CID = byte value)
@@ -286,21 +285,8 @@ fn process_glyph(
                 let trm_temp = multiply_matrices(&tsm, &tos.text_matrix);
                 let trm = multiply_matrices(&trm_temp, &ctm);
                 
-                
                 let char_bbox = glyph_bound(metrics, cid, &trm);
 
-                // Append the character to the text buffer.
-                // if let Some(last_char) = text_object_state.text_buffer.chars().last() {
-                //     if !(last_char == ' ' && ch == ' ') {
-                //         text_object_state.text_buffer.push(ch);
-                //     }
-                // } else {
-                //     text_object_state.text_buffer.push(ch);
-                // }
-
-                // Save the current text-space baseline position.
-                // let base_x = text_object_state.text_matrix.e += advance * text_state.scale;
-                
                 tos.glyphs.push(PositionedGlyph {
                     _cid: cid,
                     _unicode: ch,
@@ -310,9 +296,8 @@ fn process_glyph(
                     _advance: advance
                 });
 
-                if !(ch == ' ' && tos.text_buffer.ends_with(' ')) {
-                    tos.text_buffer.push(ch);
-                }
+                // Only add the character to the text buffer
+                tos.text_buffer.push(ch);
             }
         }
         Object::Integer(i) => {
@@ -326,8 +311,8 @@ fn process_glyph(
         Object::Array(arr) => {
             collect_text_glyphs(tos, ts, arr, ctm)?;
         }
-    _ => {}
-}
+        _ => {}
+    }
     Ok(())
 }
 

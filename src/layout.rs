@@ -29,7 +29,7 @@ impl TextLine {
         let mut line_min_y = f32::MAX;
         let mut line_max_x = f32::MIN;
         let mut line_max_y = f32::MIN;
-        let mut combined_text = String::new();
+        let mut combined_text = String::with_capacity(items.iter().map(|e| e.text.len()).sum());
 
         for (_, it) in items.iter().enumerate() {
             line_min_x = line_min_x.min(it.bbox.0);
