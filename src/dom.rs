@@ -623,10 +623,8 @@ fn process_text_chunk_elements(
 
 fn decode_image_object(image_object: &Object) -> Result<Vec<u8>, String> {
     if let Ok(stream) = image_object.as_stream() {
-        match stream.decode() {
-            Ok(decoded_bytes) => Ok(decoded_bytes),
-            Err(e) => Err(format!("Failed to decode image stream: {}", e)),
-        }
+        // Access the raw decoded bytes directly from the stream's content field
+        Ok(stream.content.clone()) // Clone the Vec<u8>
     } else {
         Err("Image object is not a stream".to_string())
     }
