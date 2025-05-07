@@ -366,23 +366,24 @@ pub fn process_matched_content(matched: &Vec<TemplateContentMatch>) -> Vec<Chunk
     for match_item in matched {
         match &match_item.matched_content {
             MatchedContent::TextChunk { content } => {
-                // Convert elements to chunks directly
+                // content is &Vec<&'a TextElement>
+                // item in content.iter() is &&'a TextElement
+                let owned_content: Vec<TextElement> = content.iter().map(|el_ref_ref| (**el_ref_ref).clone()).collect();
                 chunks.extend(process_text_chunk_elements(
-                    content,
+                    &owned_content,
                     &match_item.template_element,
                     &match_item.metadata,
                 ));
             }
             MatchedContent::Section { content, .. } => {
-                // Process child matches first
                 for child in &match_item.children {
                     chunks.extend(process_matched_content(&vec![child.clone()]));
                 }
-
-                // If no children processed the content, process it as chunks
                 if chunks.is_empty() && match_item.template_element.children.is_empty() {
+                    // content is &Vec<&'a TextElement>
+                    let owned_content: Vec<TextElement> = content.iter().map(|el_ref_ref| (**el_ref_ref).clone()).collect();
                     chunks.extend(process_text_chunk_elements(
-                        content,
+                        &owned_content,
                         &match_item.template_element,
                         &match_item.metadata,
                     ));

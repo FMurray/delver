@@ -833,7 +833,6 @@ pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
 
     let context = MatchContext {
         destinations,
-        fonts: None,
     };
 
     Ok(context)
