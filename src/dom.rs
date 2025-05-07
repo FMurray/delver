@@ -24,6 +24,7 @@ pub struct Root {
 #[derive(Debug, Clone)]
 pub struct Element {
     pub name: String,
+    pub element_type: ElementType,
     pub attributes: HashMap<String, Value>,
     pub children: Vec<Element>,
     pub parent: Option<Weak<Element>>,
@@ -32,6 +33,18 @@ pub struct Element {
 }
 
 impl Element {
+    pub fn new(name: String, element_type: ElementType) -> Self {
+        Element {
+            name,
+            element_type,
+            attributes: HashMap::new(),
+            children: Vec::new(),
+            parent: None,
+            prev_sibling: None,
+            next_sibling: None,
+        }
+    }
+
     pub fn previous_sibling(&self) -> Option<Arc<Element>> {
         self.prev_sibling.as_ref().and_then(|w| w.upgrade())
     }
@@ -58,11 +71,14 @@ pub struct DocumentElement {
     pub metadata: HashMap<String, String>, // Additional info like font size, position
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum ElementType {
     Section,
     Paragraph,
     TextChunk,
+    Table,
+    Image,
+    Unknown,
     // Add other types as needed
 }
 
@@ -79,6 +95,117 @@ pub struct ChunkOutput {
     pub text: String,
     pub metadata: HashMap<String, Value>,
     pub chunk_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchType {
+    Text,           // Simple text matching
+    Semantic,       // Vector embedding similarity
+    Regex,          // Regular expression matching
+    Custom(String), // For future extension
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchConfig {
+    pub match_type: MatchType,
+    pub pattern: String,                 // Text to match or regex pattern
+    pub threshold: f64,                  // Similarity threshold (0.0-1.0)
+    pub options: HashMap<String, Value>, // Additional match-specific options
+}
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self {
+            match_type: MatchType::Text,
+            pattern: String::new(),
+            threshold: 0.6,
+            options: HashMap::new(),
+        }
+    }
+}
+
+impl Value {
+    // Add a helper to extract match config from attributes
+    pub fn as_match_config(&self) -> Option<MatchConfig> {
+        if let Value::String(s) = self {
+            Some(MatchConfig {
+                match_type: MatchType::Text,
+                pattern: s.clone(),
+                threshold: 0.6,
+                options: HashMap::new(),
+            })
+        } else if let Value::Array(values) = self {
+            if values.len() >= 2 {
+                let pattern = values[0].as_string()?;
+                let threshold = values[1].as_number().map_or(600, |n| n) as f64 / 1000.0;
+
+                let match_type = if values.len() >= 3 {
+                    match values[2].as_string() {
+                        Some(t) if t == "semantic" => MatchType::Semantic,
+                        Some(t) if t == "regex" => MatchType::Regex,
+                        Some(t) => MatchType::Custom(t),
+                        None => MatchType::Text,
+                    }
+                } else {
+                    MatchType::Text
+                };
+
+                let mut options = HashMap::new();
+                if values.len() >= 4 {
+                    if let Value::Array(opts) = &values[3] {
+                        for i in (0..opts.len()).step_by(2) {
+                            if i + 1 < opts.len() {
+                                if let (Some(key), value) = (opts[i].as_string(), &opts[i + 1]) {
+                                    options.insert(key, (*value).clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Some(MatchConfig {
+                    match_type,
+                    pattern,
+                    threshold,
+                    options,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    // Existing methods...
+    pub fn as_string(&self) -> Option<String> {
+        match self {
+            Value::String(s) => Some(s.clone()),
+            Value::Identifier(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn as_number(&self) -> Option<i64> {
+        match self {
+            Value::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_boolean(&self) -> Option<bool> {
+        match self {
+            Value::Boolean(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<Vec<Value>> {
+        match self {
+            Value::Array(a) => Some(a.clone()),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_template(template_str: &str) -> Result<Root, Error> {
@@ -130,6 +257,16 @@ fn process_element(pair: Pair<Rule>) -> Element {
     let mut inner_rules = element_pair.into_inner();
     let identifier = inner_rules.next().unwrap().as_str().to_string();
 
+    // Determine element type based on identifier
+    let element_type = match identifier.as_str() {
+        "Section" => ElementType::Section,
+        "Paragraph" => ElementType::Paragraph,
+        "TextChunk" => ElementType::TextChunk,
+        "Table" => ElementType::Table,
+        "Image" => ElementType::Image,
+        _ => ElementType::Unknown,
+    };
+
     let mut attributes = HashMap::new();
     let mut children = Vec::new();
 
@@ -152,6 +289,7 @@ fn process_element(pair: Pair<Rule>) -> Element {
 
     Element {
         name: identifier,
+        element_type,
         attributes,
         children,
         parent: None,
@@ -221,60 +359,37 @@ fn process_value(pair: Pair<Rule>) -> Value {
     }
 }
 
-pub fn process_template_element(
-    template_element: &Element,
-    text_lines: &[TextLine],
-    text_elements: &[TextElement],
-    doc: &Document,
-    inherited_metadata: &HashMap<String, Value>,
-) -> Vec<ChunkOutput> {
-    let context = get_refs(doc).unwrap();
-    let mut all_chunks = Vec::new();
-
-    // Use the matcher to align the template with content
-    if let Some(matched) = align_template_with_content(
-        template_element,
-        text_lines,
-        text_elements,
-        &context,
-        inherited_metadata,
-    ) {
-        // Process the matched content to generate chunks
-        all_chunks.extend(process_matched_content(&matched));
-    }
-
-    all_chunks
-}
-
 // Process the matched content to generate chunks
-pub fn process_matched_content(matched: &TemplateContentMatch) -> Vec<ChunkOutput> {
+pub fn process_matched_content(matched: &Vec<TemplateContentMatch>) -> Vec<ChunkOutput> {
     let mut chunks = Vec::new();
 
-    match &matched.matched_content {
-        MatchedContent::Chunk { content } => {
-            // Convert elements to chunks directly
-            chunks.extend(process_text_chunk_elements(
-                content,
-                &matched.template_element,
-                &matched.metadata,
-            ));
-        }
-        MatchedContent::Section { content, .. } => {
-            // Process child matches first
-            for child in &matched.children {
-                chunks.extend(process_matched_content(child));
-            }
-
-            // If no children processed the content, process it as chunks
-            if chunks.is_empty() && matched.template_element.children.is_empty() {
+    for match_item in matched {
+        match &match_item.matched_content {
+            MatchedContent::TextChunk { content } => {
+                // Convert elements to chunks directly
                 chunks.extend(process_text_chunk_elements(
                     content,
-                    &matched.template_element,
-                    &matched.metadata,
+                    &match_item.template_element,
+                    &match_item.metadata,
                 ));
             }
+            MatchedContent::Section { content, .. } => {
+                // Process child matches first
+                for child in &match_item.children {
+                    chunks.extend(process_matched_content(&vec![child.clone()]));
+                }
+
+                // If no children processed the content, process it as chunks
+                if chunks.is_empty() && match_item.template_element.children.is_empty() {
+                    chunks.extend(process_text_chunk_elements(
+                        content,
+                        &match_item.template_element,
+                        &match_item.metadata,
+                    ));
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
 
     chunks
@@ -286,7 +401,6 @@ fn process_text_chunk_elements(
     template_element: &Element,
     metadata: &HashMap<String, Value>,
 ) -> Vec<ChunkOutput> {
-    // Similar to the existing process_text_chunk function
     let chunk_size = template_element
         .attributes
         .get("chunkSize")

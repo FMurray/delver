@@ -198,6 +198,20 @@ fn display_template_structure(viewer: &DebugViewer, ui: &mut egui::Ui, template_
     } else {
         ui.label("No template structure available");
     }
+
+    // Add this debug section
+    ui.separator();
+    ui.label("Template relationships:");
+    let children = viewer.debug_data.get_children(template_id);
+    ui.label(format!("Child elements: {}", children.len()));
+
+    // Check if any of these children are in the matches store
+    let matches = viewer.debug_data.template_matches.lock().unwrap();
+    let matched_children = children
+        .iter()
+        .filter(|id| matches.contains_key(id))
+        .count();
+    ui.label(format!("Children with match data: {}", matched_children));
 }
 
 // Helper function to navigate to a matching element
@@ -231,19 +245,49 @@ fn navigate_to_match(viewer: &mut DebugViewer, content_id: Uuid) {
     }
 }
 
-// Collect all template matches from the debug data
+// Update the collect_template_matches function with more diagnostics
 fn collect_template_matches(viewer: &DebugViewer) -> HashMap<Uuid, Vec<(Uuid, f32)>> {
     let mut result = HashMap::new();
 
-    // For each line in all blocks, check if it has a template match
-    for block in &viewer.blocks {
-        for line in &block.lines {
-            if let Some((template_id, score)) = viewer.debug_data.get_matching_template(line.id) {
-                result
-                    .entry(template_id)
-                    .or_insert_with(Vec::new)
-                    .push((line.id, score));
-            }
+    // Print diagnostic information
+    println!("DEBUG: Collecting template matches...");
+
+    // Directly inspect all matches
+    let all_matches = viewer.debug_data.debug_dump_all_matches();
+    println!("DEBUG: Raw matches in store: {}", all_matches.len());
+    for (content_id, template_id, score) in &all_matches {
+        println!(
+            "DEBUG: Match: content={}, template={}, score={:.2}",
+            content_id, template_id, score
+        );
+
+        // Add this match to our result
+        result
+            .entry(*template_id)
+            .or_insert_with(Vec::new)
+            .push((*content_id, *score));
+    }
+
+    // Get template names for reference
+    let templates_lock = viewer.debug_data.template_names.lock().unwrap();
+    let templates_count = templates_lock.len();
+    println!("DEBUG: Found {} templates in store", templates_count);
+    for (id, name) in templates_lock.iter() {
+        println!("DEBUG: Template {} = '{}'", id, name);
+
+        // Check children directly
+        let children = viewer.debug_data.get_children(*id);
+        println!("DEBUG: Template '{}' has {} children", name, children.len());
+
+        // Check if this template ID is in our result
+        if result.contains_key(id) {
+            println!(
+                "DEBUG: Template {} is in results with {} matches",
+                id,
+                result[id].len()
+            );
+        } else {
+            println!("DEBUG: Template {} is NOT in results", id);
         }
     }
 
@@ -252,19 +296,8 @@ fn collect_template_matches(viewer: &DebugViewer) -> HashMap<Uuid, Vec<(Uuid, f3
         matches.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     }
 
+    println!("DEBUG: Returning {} template match groups", result.len());
     result
-}
-
-// Get text content for a line
-fn get_content_text(viewer: &DebugViewer, line_id: Uuid) -> Option<String> {
-    for block in &viewer.blocks {
-        for line in &block.lines {
-            if line.id == line_id {
-                return Some(line.text.clone());
-            }
-        }
-    }
-    None
 }
 
 // Helper functions for diagnostics
@@ -274,12 +307,27 @@ fn count_all_template_matches(store: &DebugDataStore) -> usize {
 }
 
 fn list_all_templates(store: &DebugDataStore) -> Option<Vec<Uuid>> {
-    let names = store.template_names.lock().unwrap();
-    if names.is_empty() {
+    let templates = store.get_templates();
+    if templates.is_empty() {
         None
     } else {
-        Some(names.keys().cloned().collect())
+        Some(templates.into_iter().map(|(id, _)| id).collect())
     }
+}
+
+// Update the get_content_text function to use the debug data store
+fn get_content_text(viewer: &DebugViewer, line_id: Uuid) -> Option<String> {
+    // First try to get from blocks (as before)
+    for block in &viewer.blocks {
+        for line in &block.lines {
+            if line.id == line_id {
+                return Some(line.text.clone());
+            }
+        }
+    }
+
+    // If not found, try the debug data store
+    viewer.debug_data.get_content_by_id(&line_id)
 }
 
 fn count_content_items(viewer: &DebugViewer) -> usize {

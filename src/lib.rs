@@ -7,6 +7,7 @@ pub mod layout;
 pub mod logging;
 pub mod matcher;
 pub mod parse;
+pub mod search_index;
 
 use crate::dom::{parse_template, process_matched_content, ChunkOutput};
 use crate::layout::{group_text_into_lines_and_blocks, MatchContext, TextBlock, TextLine};
@@ -14,6 +15,7 @@ use crate::matcher::align_template_with_content;
 use crate::parse::{get_pdf_text, get_refs};
 use logging::{PDF_TEXT_BLOCK, PDF_TEXT_OBJECT};
 use lopdf::Document;
+use search_index::PdfIndex;
 use std::collections::HashMap;
 use tracing::event;
 
@@ -32,53 +34,20 @@ pub fn process_pdf(
     pdf_bytes: &[u8],
     template_str: &str,
 ) -> Result<(String, Vec<TextBlock>, Document), Box<dyn std::error::Error>> {
-    // 1. Parse the template
     let dom = parse_template(template_str)?;
 
-    // 2. Load and parse the PDF
     let doc = Document::load_mem(pdf_bytes)?;
     let pages_map = get_pdf_text(&doc)?;
 
-    // 3. Get the document context for matching
     let match_context = get_refs(&doc)?;
 
-    // 4. Group text elements into lines and blocks
-    let line_join_threshold = 5.0;
-    let block_join_threshold = 12.0;
-    let blocks =
-        group_text_into_lines_and_blocks(&pages_map, line_join_threshold, block_join_threshold);
-
-    // 5. Extract a flat list of all lines for matching
-    let text_lines: Vec<TextLine> = blocks
-        .iter()
-        .flat_map(|block| block.lines.clone())
-        .collect();
-
-    // 6. Get a flat list of all text elements for content extraction
-    let text_elements: Vec<_> = pages_map
-        .values()
-        .flat_map(|elements| elements.clone())
-        .collect();
-
-    // 7. Process the template DOM against the content
     let mut all_chunks: Vec<ChunkOutput> = Vec::new();
 
-    for template_element in &dom.elements {
-        // Empty initial metadata
-        let metadata = HashMap::new();
+    let index = PdfIndex::new(&pages_map, &match_context);
 
-        // Match template to content
-        if let Some(matched_content) = align_template_with_content(
-            template_element,
-            &text_lines,
-            &text_elements,
-            &match_context,
-            &metadata,
-        ) {
-            // Process the matched content into chunks
-            let chunks = process_matched_content(&matched_content);
-            all_chunks.extend(chunks);
-        }
+    if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None) {
+        let chunks = process_matched_content(&matched_content);
+        all_chunks.extend(chunks);
     }
 
     // 8. Convert chunks to JSON

@@ -1,3 +1,5 @@
+use geo::Point;
+
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq)]
 pub struct Rect {
     pub x0: f32,
@@ -34,6 +36,15 @@ impl From<(u32, u32, u32, u32)> for Rect {
             x1: value.2 as f32,
             y1: value.3 as f32,
         }
+    }
+}
+
+impl Into<geo::Rect<f32>> for Rect {
+    fn into(self) -> geo::Rect<f32> {
+        geo::Rect::new(
+            geo::Point::new(self.x0, self.y0),
+            geo::Point::new(self.x1, self.y1),
+        )
     }
 }
 

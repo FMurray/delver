@@ -201,114 +201,7 @@ impl DebugViewer {
         }
     }
 
-    pub fn test_template_matching(&mut self) {
-        // Add this to clear the console to make logs more visible
-        println!("\n\n=== TEMPLATE MATCHING TEST ===\n");
-
-        // Create a basic template
-        use crate::dom::{Element, Value};
-        use crate::layout::MatchContext;
-        use crate::matcher::align_template_with_content;
-        use std::collections::HashMap;
-        use uuid::Uuid;
-
-        // Create a simple test template with unique ID for easy tracking
-        let test_template_id = Uuid::new_v4();
-        println!("TEST: Creating test template with ID: {}", test_template_id);
-
-        let mut template = Element {
-            name: "Section".to_string(),
-            attributes: HashMap::new(),
-            children: Vec::new(),
-            parent: None,
-            prev_sibling: None,
-            next_sibling: None,
-        };
-
-        // Add a match attribute (using a common term likely to be in any document)
-        template
-            .attributes
-            .insert("match".to_string(), Value::String("the".to_string()));
-        template
-            .attributes
-            .insert("threshold".to_string(), Value::Number(500)); // Very low threshold: 0.5
-
-        // Create a match context
-        let context = MatchContext::default();
-
-        // Log trace IDs before matching
-        println!("TEST: Checking debug data before matching");
-        let trace_count_before = self.debug_data.count_all_traces();
-        println!("TEST: Total traces before: {}", trace_count_before);
-
-        // Try matching with some lines from the document
-        let sample_lines = if !self.blocks.is_empty() {
-            self.blocks
-                .iter()
-                .flat_map(|block| block.lines.iter().cloned())
-                .take(50) // Take more lines for better chance of match
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
-        println!(
-            "TEST: Using {} sample lines, first line: {:?}",
-            sample_lines.len(),
-            sample_lines
-                .first()
-                .map(|l| l.text.clone())
-                .unwrap_or_default()
-        );
-
-        // Get all text elements
-        let text_elements = self
-            .blocks
-            .iter()
-            .flat_map(|block| block.lines.iter())
-            .flat_map(|line| line.elements.iter().cloned())
-            .take(100) // Limit to avoid overwhelming
-            .collect::<Vec<_>>();
-
-        // Directly log a tracing event and check if it's captured
-        use crate::logging::{MATCHER_OPERATIONS, TEMPLATE_MATCH};
-        use tracing::{event, Level};
-
-        println!("TEST: Sending direct tracing event");
-        event!(
-            Level::DEBUG,
-            target = MATCHER_OPERATIONS,
-            template_id = %test_template_id,
-            template_name = "TestTemplate",
-            "TEST: Direct tracing event"
-        );
-
-        // Try matching
-        println!("TEST: Running align_template_with_content...");
-        let result = align_template_with_content(
-            &template,
-            &sample_lines,
-            &text_elements.as_slice(),
-            &context,
-            &HashMap::new(),
-        );
-
-        // Print result
-        println!("TEST: Template matching result: {:?}", result.is_some());
-
-        // Check if traces were added
-        println!("TEST: Checking debug data after matching");
-        let trace_count_after = self.debug_data.count_all_traces();
-        println!("TEST: Total traces after: {}", trace_count_after);
-        println!(
-            "TEST: Difference: {}",
-            trace_count_after - trace_count_before
-        );
-    }
-
-    // Update the method that displays template matches
     fn display_template_matches(&self, ui: &mut egui::Ui) {
-        // Get data with proper locking discipline - don't hold locks longer than needed
         let total_matches;
         let templates_copy;
 
@@ -384,10 +277,6 @@ impl eframe::App for DebugViewer {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Top controls
             ui_controls::show_controls(self, ui);
-            // Add to your UI code somewhere
-            if ui.button("Test Template Matching").clicked() {
-                self.test_template_matching();
-            }
 
             // Render the PDF with all visualizations
             rendering::render_pdf_view(self, ui);

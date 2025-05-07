@@ -748,7 +748,7 @@ fn get_page_text_elements(
         ctm: page_ctm,
         text_state: TextState::default(),
     }];
-
+    
     let fonts = match doc.get_page_fonts(page_id) {
         Ok(f) => f,
         Err(e) => {

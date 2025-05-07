@@ -215,32 +215,29 @@ impl DebugDataStore {
             .push(idx);
     }
 
-    // Add a new method to record template matches
     pub fn record_template_match(&self, template_id: Uuid, content_id: Uuid, score: f32) {
-        println!(
-            "STORE: Recording template match: template={}, content={}, score={:.2}",
-            template_id, content_id, score
-        );
-
-        // Save score information
         let mut matches = self.template_matches.lock().unwrap();
         matches.insert(content_id, (template_id, score));
 
-        // Use existing relationship tracking
         self.record_relationship(Some(template_id), vec![content_id], "template_match");
     }
 
     // Get matches for a specific template
     pub fn get_template_matches(&self, template_id: Uuid) -> Vec<(Uuid, f32)> {
         let matches = self.template_matches.lock().unwrap();
-        matches
+
+        let children = self.get_children(template_id);
+
+        children
             .iter()
-            .filter_map(|(content_id, (t_id, score))| {
-                if *t_id == template_id {
-                    Some((*content_id, *score))
-                } else {
-                    None
-                }
+            .filter_map(|content_id| {
+                matches.get(content_id).map(|(t_id, score)| {
+                    if *t_id == template_id {
+                        (*content_id, *score)
+                    } else {
+                        (*content_id, *score)
+                    }
+                })
             })
             .collect()
     }
@@ -325,26 +322,14 @@ impl DebugDataStore {
 
     // Add a method to get all templates
     pub fn get_templates(&self) -> Vec<(Uuid, String)> {
-        let mut templates = Vec::new();
+        // Collect template IDs from template_names
+        let templates = self.template_names.lock().unwrap();
 
-        // Look through template matches
-        let matches = self.template_matches.lock().unwrap();
-        for (_, (template_id, _)) in matches.iter() {
-            // Get template name if available
-            let name = self
-                .template_names
-                .lock()
-                .unwrap()
-                .get(template_id)
-                .cloned()
-                .unwrap_or_else(|| format!("Template {}", template_id));
-
-            if !templates.iter().any(|(id, _)| id == template_id) {
-                templates.push((*template_id, name));
-            }
-        }
-
+        // Return a list of (template_id, name) pairs
         templates
+            .iter()
+            .map(|(id, name)| (*id, name.clone()))
+            .collect()
     }
 
     // Count matches for a template using existing relationship tracking
@@ -388,28 +373,27 @@ impl DebugDataStore {
 
     // Add method to get content text by ID
     pub fn get_content_by_id(&self, content_id: &Uuid) -> Option<String> {
-        // First check message events associated with this ID
+        // Use events collection to find content
         let events = self.events.lock().unwrap();
         if let Some(indices) = events.get(content_id) {
             if !indices.is_empty() {
                 let messages = self.message_arena.lock().unwrap();
-                let idx = indices[0];
-                let message = &messages[idx];
-                // Look for a content string
-                if let Some(start) = message.find("content = ") {
-                    let content_part = &message[start + "content = ".len()..];
-                    if let Some(end) = content_part.find(';') {
-                        return Some(content_part[..end].trim().to_string());
-                    } else {
-                        return Some(content_part.trim().to_string());
-                    }
-                }
-                return Some(message.to_string());
+                let message = &messages[indices[0]];
+                return Some(message.clone());
             }
         }
 
-        // If no direct message, return the UUID as a string
+        // If no direct message, return the UUID as string
         Some(content_id.to_string())
+    }
+
+    // In the DebugDataStore implementation, add this method to directly inspect the matches
+    pub fn debug_dump_all_matches(&self) -> Vec<(Uuid, Uuid, f32)> {
+        let matches = self.template_matches.lock().unwrap();
+        matches
+            .iter()
+            .map(|(content_id, (template_id, score))| (*content_id, *template_id, *score))
+            .collect()
     }
 }
 
@@ -486,67 +470,144 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
         };
         event.record(&mut id_visitor);
 
+        // Collect IDs from parent spans if available
+        if let Some(scope) = ctx.event_scope(event) {
+            for span in scope.from_root() {
+                if let Some(data) = span.extensions().get::<SpanData>() {
+                    if let Some(e_id) = data.element_id {
+                        *id_visitor.element_id = id_visitor.element_id.or(Some(e_id));
+                    }
+                    if let Some(l_id) = data.line_id {
+                        *id_visitor.line_id = id_visitor.line_id.or(Some(l_id));
+                    }
+                    if let Some(t_id) = data.template_id {
+                        *id_visitor.template_id = id_visitor.template_id.or(Some(t_id));
+                    }
+                    if let Some(m_id) = data.match_id {
+                        *id_visitor.match_id = id_visitor.match_id.or(Some(m_id));
+                    }
+                }
+            }
+        }
+
+        // println!(
+        //     "EXTRACTED: element_id={:?}, line_id={:?}, template_id={:?}, match_id={:?}",
+        //     id_visitor.element_id, id_visitor.line_id, id_visitor.template_id, id_visitor.match_id
+        // );
+
+        // Capture message from the event
         let mut message = String::new();
         let mut message_visitor = MessageVisitor(&mut message);
         event.record(&mut message_visitor);
 
-        let idx = {
-            let mut messages = self.store.message_arena.lock().unwrap();
-            let idx = messages.len();
-            messages.push(message);
-            idx
+        // Handle entity recording based on ID types
+        match (
+            *id_visitor.element_id,
+            *id_visitor.line_id,
+            *id_visitor.template_id,
+            *id_visitor.match_id,
+        ) {
+            // Template registration (template without a match)
+            (_, _, Some(template_id), None) => {
+                println!(
+                    "CAPTURE: Found template_id={} in registration event",
+                    template_id
+                );
+                self.store
+                    .record_entity(template_id, EntityType::Template, message.clone());
+
+                // Extract template name if this is a registration
+                // Find template name in message
+                let mut template_name = None;
+                if let Some(name_start) = message.find("template_name = ") {
+                    if let Some(name_end) = message[name_start..].find(';') {
+                        let raw_name = &message[name_start + 16..name_start + name_end];
+                        let name = raw_name.trim_matches('"');
+                        template_name = Some(name.to_string());
+                    }
+                }
+
+                // Store template name if available
+                if let Some(name) = template_name {
+                    println!(
+                        "REGISTRATION: Recording template: {} = {}",
+                        template_id, name
+                    );
+                    let mut templates = self.store.template_names.lock().unwrap();
+                    templates.insert(template_id, name);
+                }
+            }
+            (_, Some(line_id), Some(template_id), Some(match_id)) => {
+                println!(
+                    "CAPTURE: Found template match between template={} and line={}",
+                    template_id, line_id
+                );
+
+                // Extract score from the event
+                let mut score = 0.0;
+                if let Some(score_start) = message.find("score = ") {
+                    if let Some(score_end) = message[score_start..].find(';') {
+                        if let Ok(s) = message[score_start + 8..score_start + score_end]
+                            .trim()
+                            .parse::<f32>()
+                        {
+                            score = s;
+                        }
+                    }
+                }
+
+                println!("MATCH: Recording template match with score {}", score);
+
+                // Record template match with score
+                self.store
+                    .record_template_match(template_id, line_id, score);
+
+                // Record relationship between template and line
+                self.store
+                    .record_relationship(Some(template_id), vec![line_id], "template_match");
+            }
+            // Standard element case
+            (Some(e_id), _, _, _) => {
+                self.store.record_entity(e_id, EntityType::Element, message);
+            }
+            // Standard line case
+            (_, Some(l_id), _, _) => {
+                self.store.record_entity(l_id, EntityType::Line, message);
+            }
+            // Other combinations - record all available entities
+            _ => {
+                if let Some(e_id) = *id_visitor.element_id {
+                    self.store
+                        .record_entity(e_id, EntityType::Element, message.clone());
+                }
+                if let Some(l_id) = *id_visitor.line_id {
+                    self.store
+                        .record_entity(l_id, EntityType::Line, message.clone());
+                }
+                // Let in this position unstable?
+                // if let Some(t_id) = *id_visitor.template_id
+                //     && event.metadata().target() != TEMPLATE_MATCH
+                // {
+                //     // Only record template here if not already handled in specific patterns
+                //     self.store
+                //         .record_entity(t_id, EntityType::Template, message.clone());
+                // }
+            }
+        }
+
+        // Handle relationships using RelationshipVisitor
+        let mut rel_parent = None;
+        let mut rel_children = Vec::new();
+        let mut rel_visitor = RelationshipVisitor {
+            parent: &mut rel_parent,
+            children: &mut rel_children,
         };
 
-        // // Handle template match events
-        // if event.metadata().target() == TEMPLATE_MATCH {
-        //     println!("TEMPLATE_MATCH event detected!");
-        //     let mut content_id = None;
-        //     let mut score = 0.0;
-        //     event.record(&mut RecordContentIDVisitor(&mut content_id, &mut score));
+        event.record(&mut rel_visitor);
 
-        //     if let (Some(template_id), Some(content_id)) = (*id_visitor.template_id, content_id) {
-        //         println!(
-        //             "CAPTURE: Recording template match: template={}, content={}, score={}",
-        //             template_id, content_id, score
-        //         );
-
-        //         self.store
-        //             .record_template_match(template_id, content_id, score);
-
-        //         // Record in events collection
-        //         let mut events = self.store.events.lock().unwrap();
-        //         events.entry(template_id).or_insert_with(Vec::new).push(idx);
-        //         events.entry(content_id).or_insert_with(Vec::new).push(idx);
-        //     } else {
-        //         println!(
-        //             "CAPTURE: Missing IDs - template_id: {:?}, content_id: {:?}",
-        //             *id_visitor.template_id, content_id
-        //         );
-        //     }
-        // } else {
-        //     // For other events, store them in events collection
-        //     if let Some(id) = *id_visitor.element_id {
-        //         let mut events = self.store.events.lock().unwrap();
-        //         events.entry(id).or_insert_with(Vec::new).push(idx);
-        //     }
-
-        //     if let Some(id) = *id_visitor.line_id {
-        //         let mut events = self.store.events.lock().unwrap();
-        //         events.entry(id).or_insert_with(Vec::new).push(idx);
-        //     }
-        // }
-
-        if let Some(id) = *id_visitor.element_id {
-            let mut events = self.store.events.lock().unwrap();
-            events.entry(id).or_insert_with(Vec::new).push(idx);
+        if !rel_children.is_empty() {
+            self.store.record_relationship(rel_parent, rel_children, "");
         }
-
-        if let Some(id) = *id_visitor.line_id {
-            let mut events = self.store.events.lock().unwrap();
-            events.entry(id).or_insert_with(Vec::new).push(idx);
-        }
-
-        // No trace_count increment
     }
 }
 
@@ -620,13 +681,20 @@ impl tracing::field::Visit for RelationshipVisitor<'_> {
     }
 }
 
-struct RecordContentIDVisitor<'a>(&'a mut Option<Uuid>, &'a mut f32);
+struct RecordContentIDVisitor<'a>(&'a mut Option<Uuid>, &'a mut f32, &'a mut Option<String>);
 
 impl<'a> tracing::field::Visit for RecordContentIDVisitor<'a> {
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
         if field.name() == "score" {
             *self.1 = value as f32;
             println!("VISITOR: Found score: {}", value);
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "template_name" {
+            *self.2 = Some(value.to_string());
+            println!("VISITOR: Found template_name: {}", value);
         }
     }
 

@@ -13,7 +13,6 @@ use crate::parse::TextElement;
 #[derive(Debug, Default)]
 pub struct MatchContext {
     pub destinations: IndexMap<String, Object>,
-    pub fonts: Option<BTreeMap<Vec<u8>, Dictionary>>,
 }
 
 /// Represents a single line of text on the page after grouping TextElements.
@@ -64,6 +63,27 @@ impl TextLine {
 
         line
     }
+
+    /// Get all elements in this line
+    pub fn elements(&self) -> &[TextElement] {
+        &self.elements
+    }
+
+    /// Get the first element in this line
+    pub fn first_element(&self) -> Option<&TextElement> {
+        self.elements.first()
+    }
+}
+
+impl<'a> From<&'a TextLine> for Vec<&'a TextElement> {
+    fn from(line: &'a TextLine) -> Self {
+        line.elements.iter().collect()
+    }
+}
+
+// Collection utility for multiple lines
+pub fn elements_from_lines<'a>(lines: &[&'a TextLine]) -> Vec<&'a TextElement> {
+    lines.iter().flat_map(|line| line.elements.iter()).collect()
 }
 
 /// Represents a "block" of consecutive lines that are close in vertical spacing.
@@ -206,3 +226,60 @@ pub fn is_horizontally_aligned(elem1: &TextElement, elem2: &TextElement, thresho
 }
 
 // Other spatial utilities as needed
+
+/// Group text elements into lines without creating blocks
+pub fn group_text_into_lines(
+    text_elements: &Vec<TextElement>,
+    line_join_threshold: f32,
+) -> Vec<TextLine> {
+    let mut all_lines = Vec::new();
+
+    let mut elements = text_elements.clone();
+    elements.sort_by(|a, b| {
+        b.bbox
+            .1
+            .partial_cmp(&a.bbox.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.bbox
+                    .0
+                    .partial_cmp(&b.bbox.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut lines = Vec::new();
+    let mut current_line = Vec::new();
+    let mut last_y = f32::MAX;
+
+    for elem in elements {
+        if current_line.is_empty() {
+            current_line.push(elem.clone());
+            last_y = elem.bbox.1;
+        } else {
+            if (last_y - elem.bbox.1).abs() < line_join_threshold {
+                current_line.push(elem.clone());
+            } else {
+                lines.push(TextLine::from_elements(*page_number, current_line));
+                current_line = vec![elem.clone()];
+                last_y = elem.bbox.1;
+            }
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(TextLine::from_elements(*page_number, current_line));
+    }
+
+    // Sort elements within each line
+    for line in &mut lines {
+        line.elements.sort_by(|a, b| {
+            a.bbox
+                .0
+                .partial_cmp(&b.bbox.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    all_lines
+}
