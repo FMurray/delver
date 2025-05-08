@@ -534,7 +534,6 @@ fn handle_operator<'a>(
     text_object_state: &mut TextObjectState,
     page_elements: &mut Vec<PageContent>, // Changed type
     page_number: u32,
-    page_resources: &'a Dictionary, // Pass page resources
     page_objects: &PageObjects, // Replace doc with preloaded objects
     encodings: &'a BTreeMap<Vec<u8>, Encoding<'a>>,
 ) -> Result<(), LopdfError> {
@@ -846,7 +845,6 @@ fn get_page_elements(
                 &mut text_object_state,
                 &mut page_elements,
                 page_number,
-                resources, // Pass page resources
                 &page_objects,
                 &encodings,
             ) {
