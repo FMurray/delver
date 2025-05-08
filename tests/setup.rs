@@ -59,17 +59,32 @@ pub fn create_test_pdf_with_config(config: PdfConfig) -> Result<(), std::io::Err
     // Build operations vector
     let mut operations = vec![];
 
+    // Use US Letter page dimensions (612.0 x 792.0) to match test expectations
+    let page_width = 612.0; // US Letter width in points (matches test assertions)
+    let _page_height = 792.0; // US Letter height in points
+    let x_center = page_width / 2.0;
+    
+    // More accurate width calculation for Helvetica - based on actual widths
+    // Helvetica average character width is roughly 0.3-0.4 * font size
+    let approx_width_per_char = match config.font_name.as_str() {
+        "Helvetica" => config.title_font_size * 0.3, // Helvetica is narrower
+        _ => config.title_font_size * 0.4,           // For other fonts
+    };
+    let approx_title_width = config.title.len() as f32 * approx_width_per_char;
+    let title_x = x_center - (approx_title_width / 2.0);
+    
     // Add title
     operations.extend(vec![
-        Operation::new("BT", vec![]),
-        Operation::new("Tf", vec!["F1".into(), config.title_font_size.into()]),
-        Operation::new("Td", vec![100.into(), 600.into()]),
-        Operation::new("Tj", vec![Object::string_literal(config.title)]),
-        Operation::new("ET", vec![]),
+        Operation::new("BT", vec![]), // Begin text
+        Operation::new("Tf", vec!["F1".into(), config.title_font_size.into()]), // Set font
+        // Position at calculated center position
+        Operation::new("Td", vec![title_x.into(), 700.into()]), 
+        Operation::new("Tj", vec![Object::string_literal(config.title)]), // Draw text
+        Operation::new("ET", vec![]), // End text
     ]);
 
     // Add each section
-    let mut y_position = 550.0;
+    let mut y_position = 650.0;
     for section in config.sections {
         // Add heading
         operations.extend(vec![
@@ -101,14 +116,14 @@ pub fn create_test_pdf_with_config(config: PdfConfig) -> Result<(), std::io::Err
         "Type" => "Page",
         "Parent" => pages_id,
         "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
     });
 
     let pages = dictionary! {
         "Type" => "Pages",
         "Kids" => vec![page_id.into()],
         "Count" => 1,
-        "Resources" => resources_id,
-        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
     };
 
     doc.objects.insert(pages_id, Object::Dictionary(pages));
@@ -119,7 +134,8 @@ pub fn create_test_pdf_with_config(config: PdfConfig) -> Result<(), std::io::Err
     });
 
     doc.trailer.set("Root", catalog_id);
-    doc.compress();
+    // Don't compress for test PDFs to avoid potential issues
+    // doc.compress();
 
     doc.save(&config.output_path).unwrap();
 

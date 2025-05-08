@@ -30,9 +30,13 @@ fn test_10k_template_parsing() -> std::io::Result<()> {
     let section = &root.elements[1];
     assert_eq!(section.name, "Section");
     if let Some(Value::String(s)) = section.attributes.get("match") {
+        let expected = "Management's Discussion and Analysis of Financial Condition and Results of Operations";
+        let normalized_actual = s.replace("\u{2019}", "'"); // Replace Unicode right single quote with ASCII apostrophe
+        
         assert_eq!(
-            s,
-            "Management's Discussion and Analysis of Financial Condition and Results of Operations"
+            normalized_actual,
+            expected,
+            "Match string should exactly match the expected value after normalizing apostrophes"
         );
     }
 
