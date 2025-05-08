@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 pub mod setup;
 use crate::setup::create_test_pdf;
-use delver_pdf::parse::{get_pdf_text, get_refs, load_pdf, TextElement};
+use delver_pdf::parse::{get_page_content, get_refs, load_pdf, TextElement, PageContent};
 
 mod common;
 
@@ -28,11 +28,11 @@ fn test_get_pdf_text() {
 
     // Run test
     let doc = load_pdf("tests/example.pdf").unwrap();
-    let text_elements = get_pdf_text(&doc).unwrap();
+    let pages_map = get_page_content(&doc).unwrap();
 
     assert!(
-        !text_elements.is_empty(),
-        "Should extract text elements from PDF"
+        !pages_map.is_empty(),
+        "Should extract content from PDF"
     );
 
     // Test specific content from setup.rs
@@ -44,10 +44,16 @@ fn test_get_pdf_text() {
         "This is the second section text.",
     ];
 
-    let extracted_texts: Vec<&str> = text_elements
+    let extracted_texts: Vec<&str> = pages_map
         .values()
         .flatten()
-        .map(|element| element.text.as_str())
+        .filter_map(|content| {
+            if let PageContent::Text(text_elem) = content {
+                Some(text_elem.text.as_str())
+            } else {
+                None
+            }
+        })
         .collect();
 
     for expected in expected_texts {
@@ -59,11 +65,13 @@ fn test_get_pdf_text() {
     }
 
     // Test font properties
-    for element in text_elements.values().flatten() {
-        match element.text.as_str() {
-            "Hello World!" => assert_eq!(element.font_size, 48.0),
-            text if text.starts_with("Subheading") => assert_eq!(element.font_size, 24.0),
-            _ => assert_eq!(element.font_size, 12.0),
+    for content in pages_map.values().flatten() {
+        if let PageContent::Text(element) = content {
+            match element.text.as_str() {
+                "Hello World!" => assert_eq!(element.font_size, 48.0),
+                text if text.starts_with("Subheading") => assert_eq!(element.font_size, 24.0),
+                _ => assert_eq!(element.font_size, 12.0),
+            }
         }
     }
 

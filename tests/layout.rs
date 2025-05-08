@@ -1,5 +1,5 @@
 use lopdf::Document;
-use delver_pdf::parse::{get_pdf_text, get_refs, TextElement};
+use delver_pdf::parse::{get_page_content, get_refs, TextElement, PageContent};
 use delver_pdf::layout::*;
 use delver_pdf::matcher::{perform_matching, select_best_match, extract_section_content};
 
@@ -40,8 +40,17 @@ fn test_detect_headings() {
 
     // Load the PDF and extract text elements
     let doc = Document::load("tests/heading_test.pdf").unwrap();
-    let text_elements_map = get_pdf_text(&doc).unwrap();
-    let all_text_elements: Vec<TextElement> = text_elements_map.values().flatten().cloned().collect();
+    let pages_map = get_page_content(&doc).unwrap();
+    let all_text_elements: Vec<TextElement> = pages_map.values()
+        .flatten()
+        .filter_map(|content| {
+            if let PageContent::Text(text_elem) = content {
+                Some(text_elem.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
 
     // Create a match context
     let context = get_refs(&doc).unwrap();
