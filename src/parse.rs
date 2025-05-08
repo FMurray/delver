@@ -347,8 +347,16 @@ fn collect_text_glyphs(
 
 #[tracing::instrument()]
 fn finalize_text_run(tos: &mut TextObjectState, ts: &TextState, page_number: u32) -> Option<PageContent> {
-    if tos.glyphs.is_empty() || tos.text_buffer.trim().is_empty() {
-        return None; // Don't create empty text elements
+    if tos.glyphs.is_empty() {
+        return Some(PageContent::Text(TextElement {
+            id: Uuid::new_v4(),
+            text: String::new(),
+            font_size: ts.size,
+            font_name: Some(ts.fontname.clone()),
+            bbox: (0.0, 0.0, 0.0, 0.0),
+            page_number,
+            operators: Vec::new(),
+        }));
     }
 
     let mut x_min = f32::MAX;
