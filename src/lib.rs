@@ -40,13 +40,16 @@ pub fn process_pdf(
 
     let mut text_pages_map: BTreeMap<u32, Vec<TextElement>> = BTreeMap::new();
     for (page_num, contents) in &pages_map {
-        let text_elements: Vec<TextElement> = contents.iter().filter_map(|content| {
-            if let PageContent::Text(text_elem) = content {
-                Some(text_elem.clone())
-            } else {
-                None
-            }
-        }).collect();
+        // Extract text elements and collect them
+        let text_elements: Vec<TextElement> = contents.iter()
+            .filter_map(|content| {
+                match content {
+                    PageContent::Text(text_elem) => Some(text_elem.clone()),
+                    _ => None
+                }
+            })
+            .collect();
+            
         if !text_elements.is_empty() {
             text_pages_map.insert(*page_num, text_elements);
         }
