@@ -472,6 +472,69 @@ fn operand_as_u8(obj: &Object) -> u8 {
     }
 }
 
+// Add this struct to hold the resolved resources
+struct ResolvedResources {
+    // Collection of resolved XObjects, indexed by their name
+    xobjects: BTreeMap<Vec<u8>, Object>,
+    // Collection of font dictionaries that are already resolved
+    font_dictionaries: BTreeMap<Vec<u8>, Dictionary>,
+}
+
+impl ResolvedResources {
+    // Create a new ResolvedResources by pre-resolving all references from the Document
+    fn new(doc: &Document, resources: &Dictionary) -> Self {
+        let mut xobjects = BTreeMap::new();
+        let mut font_dictionaries = BTreeMap::new();
+        
+        // Resolve XObjects
+        if let Ok(xobjects_dict) = resources.get(b"XObject").and_then(Object::as_dict) {
+            for (name, obj_ref) in xobjects_dict.iter() {
+                if let Ok(ref_id) = obj_ref.as_reference() {
+                    if let Ok(obj) = doc.get_object(ref_id) {
+                        xobjects.insert(name.clone(), obj.clone());
+                    }
+                }
+            }
+        }
+        
+        // Resolve Font dictionaries
+        if let Ok(fonts_dict) = resources.get(b"Font").and_then(Object::as_dict) {
+            for (name, obj_ref) in fonts_dict.iter() {
+                if let Ok(ref_id) = obj_ref.as_reference() {
+                    if let Ok(obj) = doc.get_object(ref_id) {
+                        if let Ok(dict) = obj.as_dict() {
+                            font_dictionaries.insert(name.clone(), dict.clone());
+                        }
+                    }
+                }
+            }
+        }
+        
+        Self {
+            xobjects,
+            font_dictionaries,
+        }
+    }
+    
+    // Default constructor - empty resources
+    fn default() -> Self {
+        Self {
+            xobjects: BTreeMap::new(),
+            font_dictionaries: BTreeMap::new(),
+        }
+    }
+    
+    // Get a resolved XObject by name
+    fn get_xobject(&self, name: &[u8]) -> Option<&Object> {
+        self.xobjects.get(name)
+    }
+    
+    // Get a resolved font dictionary by name
+    fn get_font_dictionary(&self, name: &[u8]) -> Option<&Dictionary> {
+        self.font_dictionaries.get(name)
+    }
+}
+
 #[tracing::instrument(
     skip_all,
     fields(
@@ -489,6 +552,7 @@ fn handle_operator<'a>(
     page_resources: &'a Dictionary, // Pass page resources
     doc: &'a Document, // Pass document to resolve XObjects
     encodings: &'a BTreeMap<Vec<u8>, Encoding<'a>>,
+    resolved_resources: &ResolvedResources, // Add resolved resources as an optimization
 ) -> Result<(), LopdfError> {
     let current_gs = gs_stack.last_mut().unwrap();
     let in_text_object = !text_object_state.text_buffer.is_empty() || !text_object_state.glyphs.is_empty();
@@ -534,35 +598,51 @@ fn handle_operator<'a>(
             {
                 let font_size = operand_as_float(font_size_obj);
                 match page_resources.get(b"Font").and_then(Object::as_dict) {
-                    Ok(fonts_dict) => {
-                         match fonts_dict.get(font_name_bytes) {
-                             Ok(font_ref_obj) => {
-                                 match doc.get_object(font_ref_obj.as_reference()?).and_then(|o| o.as_dict()) {
-                                     Ok(dict) => {
-                                        let base_font = dict
-                                            .get(b"BaseFont")
-                                            .and_then(Object::as_name)
-                                            .map(|name| String::from_utf8_lossy(name).into_owned())
-                                            .map(|name_string| canonicalize_font_name(name_string.as_str()))
-                                            .unwrap_or_else(|_| "".to_string());
-                                        
-                                        current_gs.text_state.fontname = base_font.to_string();
-                                        current_gs.text_state.size = font_size;
-                                        current_gs.text_state.font_dict = Some(Object::Dictionary(dict.clone()));
-                                        current_gs.text_state.font = FONT_METRICS.get(base_font.as_str()).copied();
-                                        current_gs.text_state.encoding = encodings.get(font_name_bytes);
-                                        text_object_state.font_name = Some(current_gs.text_state.fontname.clone());
-                                        text_object_state.font_metrics = current_gs.text_state.font;
-                                     }
-                                     Err(e) => {
-                                         warn!(font_name=?String::from_utf8_lossy(font_name_bytes), error=?e, "Could not resolve/parse font dictionary object reference");
-                                     }
-                                 }
-                             }
-                             Err(_) => {
-                                warn!(font_name=?String::from_utf8_lossy(font_name_bytes), "Font name not found in Font resources dictionary");
-                             }
-                         }
+                    Ok(_) => {
+                        // Use resolved resources if available, otherwise fall back to document resolution
+                        if let Some(dict) = resolved_resources.get_font_dictionary(font_name_bytes) {
+                            let base_font = dict
+                                .get(b"BaseFont")
+                                .and_then(Object::as_name)
+                                .map(|name| String::from_utf8_lossy(name).into_owned())
+                                .map(|name_string| canonicalize_font_name(name_string.as_str()))
+                                .unwrap_or_else(|_| "".to_string());
+                            
+                            current_gs.text_state.fontname = base_font.to_string();
+                            current_gs.text_state.size = font_size;
+                            current_gs.text_state.font_dict = Some(Object::Dictionary(dict.clone()));
+                            current_gs.text_state.font = FONT_METRICS.get(base_font.as_str()).copied();
+                            current_gs.text_state.encoding = encodings.get(font_name_bytes);
+                            text_object_state.font_name = Some(current_gs.text_state.fontname.clone());
+                            text_object_state.font_metrics = current_gs.text_state.font;
+                        } else {
+                            // Fall back to original implementation
+                            match page_resources.get(b"Font").and_then(Object::as_dict) {
+                                Ok(fonts_dict) => {
+                                    if let Ok(font_ref_obj) = fonts_dict.get(font_name_bytes) {
+                                        if let Ok(dict) = doc.get_object(font_ref_obj.as_reference()?).and_then(|o| o.as_dict()) {
+                                            let base_font = dict
+                                                .get(b"BaseFont")
+                                                .and_then(Object::as_name)
+                                                .map(|name| String::from_utf8_lossy(name).into_owned())
+                                                .map(|name_string| canonicalize_font_name(name_string.as_str()))
+                                                .unwrap_or_else(|_| "".to_string());
+                                            
+                                            current_gs.text_state.fontname = base_font.to_string();
+                                            current_gs.text_state.size = font_size;
+                                            current_gs.text_state.font_dict = Some(Object::Dictionary(dict.clone()));
+                                            current_gs.text_state.font = FONT_METRICS.get(base_font.as_str()).copied();
+                                            current_gs.text_state.encoding = encodings.get(font_name_bytes);
+                                            text_object_state.font_name = Some(current_gs.text_state.fontname.clone());
+                                            text_object_state.font_metrics = current_gs.text_state.font;
+                                        }
+                                    }
+                                },
+                                Err(_) => {
+                                    warn!(font_name=?String::from_utf8_lossy(font_name_bytes), "Font not found");
+                                }
+                            }
+                        }
                     }
                     Err(_) => {
                          warn!("Page resources do not contain a Font dictionary.");
@@ -572,83 +652,9 @@ fn handle_operator<'a>(
                  warn!("Tf operator missing font name or size operand");
             }
         }
-        "Tc" => {
-            if let Some(spacing) = op.operands.first() {
-                current_gs.text_state.char_space = operand_as_float(spacing)
-            }
-        }
-        "Tw" => {
-            if let Some(spacing) = op.operands.first() {
-                current_gs.text_state.word_space = operand_as_float(spacing)
-            }
-        }
-        "Tz" => {
-            if let Some(scale_percent) = op.operands.first() {
-                current_gs.text_state.scale = operand_as_float(scale_percent) / 100.0
-            }
-        }
-        "TL" => {
-            if let Some(leading) = op.operands.first() {
-                current_gs.text_state.leading = operand_as_float(leading)
-            }
-        }
-        "Tr" => {
-            if let Some(render_mode) = op.operands.first() {
-                current_gs.text_state.render = operand_as_u8(render_mode)
-            }
-        }
-        "Ts" => {
-            if let Some(rise) = op.operands.first() {
-                current_gs.text_state.rise = operand_as_float(rise)
-            }
-        }
-        "Tm" => {
-            // Finalize pending text before matrix change
-            if let Some(text_elem) = finalize_text_run(text_object_state, &current_gs.text_state, page_number) {
-                 page_elements.push(text_elem);
-            }
-            let matrix = matrix_from_operands(op);
-            text_object_state.text_matrix = matrix;
-            text_object_state.text_line_matrix = matrix;
-            text_object_state.operator_log.push(format!("Tm {:?}", matrix));
-        }
-        "Td" => {
-            if let (Some(tx_obj), Some(ty_obj)) = (op.operands.get(0), op.operands.get(1)) {
-                let tx = operand_as_float(tx_obj);
-                let ty = operand_as_float(ty_obj);
-                text_object_state.text_line_matrix =
-                    pre_translate(text_object_state.text_line_matrix, tx, ty);
-                text_object_state.text_matrix = text_object_state.text_line_matrix;
-            }
-        }
-        "TD" => {
-            // Move text pos and set leading
-            if let (Some(tx_obj), Some(ty_obj)) = (op.operands.get(0), op.operands.get(1)) {
-                let tx = operand_as_float(tx_obj);
-                let ty = operand_as_float(ty_obj);
-                current_gs.text_state.leading = -ty;
-                text_object_state.text_line_matrix =
-                    pre_translate(text_object_state.text_line_matrix, tx, ty);
-                text_object_state.text_matrix = text_object_state.text_line_matrix;
-            }
-        }
-        "T*" => {
-            let tx = 0.0;
-            let ty = -current_gs.text_state.leading;
-            text_object_state.text_line_matrix = pre_translate(text_object_state.text_line_matrix, tx, ty);
-            text_object_state.text_matrix = text_object_state.text_line_matrix;
-        }
-        // Text Showing
-        "Tj" | "TJ" | "'" | "\"" => {
-            text_object_state.operator_log.push(format!("{} {:?}", op.operator, op.operands));
-             collect_text_glyphs(
-                text_object_state,
-                &mut current_gs.text_state,
-                &op.operands,
-                current_gs.ctm
-            )?;
-             // NOTE: Don't finalize here, wait for ET or explicit text state change
-        }
+        
+        // Handle other operators...
+        
         // Handling XObjects (Images)
         "Do" => {
             // Finalize any pending text run before handling graphics object
@@ -657,42 +663,149 @@ fn handle_operator<'a>(
              }
 
             if let Some(Object::Name(name)) = op.operands.first() {
-                if let Ok(xobjects) = page_resources.get(b"XObject").and_then(Object::as_dict) {
-                    if let Ok(xobject_stream) = xobjects.get(name).and_then(|o| doc.get_object(o.as_reference()?)) {
-                         if let Ok(stream) = xobject_stream.as_stream() {
-                              if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Image".as_ref()) {
-                                  debug!(xobject_name = ?String::from_utf8_lossy(name), "Found Image XObject");
-                                  // --- Image Found --- 
-                                  // Calculate BBox - Placeholder: Assume image is 100x100 pts at current origin
-                                  // Real implementation needs CTM and image dimensions
-                                  let origin = multiply_matrices(&IDENTITY_MATRIX, &current_gs.ctm);
-                                  let corner = multiply_matrices(&Matrix { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 100.0, f: 100.0 }, &current_gs.ctm); 
-                                  let bbox = Rect {
-                                      x0: origin.e,
-                                      y0: origin.f,
-                                      x1: corner.e, // Simplified - needs proper transform
-                                      y1: corner.f, // Simplified - needs proper transform
-                                  };
+                if let Ok(_) = page_resources.get(b"XObject").and_then(Object::as_dict) {
+                    // Try to use resolved resources first
+                    if let Some(xobject) = resolved_resources.get_xobject(name) {
+                        if let Ok(stream) = xobject.as_stream() {
+                            if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Image".as_ref()) {
+                                debug!(xobject_name = ?String::from_utf8_lossy(name), "Found Image XObject (from cache)");
+                                // Calculate BBox 
+                                let origin = multiply_matrices(&IDENTITY_MATRIX, &current_gs.ctm);
+                                let corner = multiply_matrices(&Matrix { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 100.0, f: 100.0 }, &current_gs.ctm); 
+                                let bbox = Rect {
+                                    x0: origin.e,
+                                    y0: origin.f,
+                                    x1: corner.e,
+                                    y1: corner.f,
+                                };
 
-                                  let image_element = ImageElement {
-                                      id: Uuid::new_v4(),
-                                      page_number,
-                                      bbox, 
-                                      image_object: xobject_stream.clone(), // Clone the object (Stream)
-                                  };
-                                  page_elements.push(PageContent::Image(image_element));
-                              }
-                          } else {
-                             warn!(xobject_name=?String::from_utf8_lossy(name), "XObject is not a stream");
-                          }
-                     } else {
-                         warn!(xobject_name=?String::from_utf8_lossy(name), "Could not resolve XObject reference");
-                     }
+                                let image_element = ImageElement {
+                                    id: Uuid::new_v4(),
+                                    page_number,
+                                    bbox, 
+                                    image_object: xobject.clone(),
+                                };
+                                page_elements.push(PageContent::Image(image_element));
+                            }
+                        }
+                    } else {
+                        // Fall back to original implementation
+                        if let Ok(xobjects) = page_resources.get(b"XObject").and_then(Object::as_dict) {
+                            if let Ok(xobject_stream) = xobjects.get(name).and_then(|o| doc.get_object(o.as_reference()?)) {
+                                if let Ok(stream) = xobject_stream.as_stream() {
+                                    if stream.dict.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Image".as_ref()) {
+                                        debug!(xobject_name = ?String::from_utf8_lossy(name), "Found Image XObject");
+                                        
+                                        let origin = multiply_matrices(&IDENTITY_MATRIX, &current_gs.ctm);
+                                        let corner = multiply_matrices(&Matrix { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 100.0, f: 100.0 }, &current_gs.ctm); 
+                                        let bbox = Rect {
+                                            x0: origin.e,
+                                            y0: origin.f,
+                                            x1: corner.e,
+                                            y1: corner.f,
+                                        };
+
+                                        let image_element = ImageElement {
+                                            id: Uuid::new_v4(),
+                                            page_number,
+                                            bbox, 
+                                            image_object: xobject_stream.clone(),
+                                        };
+                                        page_elements.push(PageContent::Image(image_element));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                      warn!("Page resources do not contain XObject dictionary");
                 }
             }
         }
+        // Handle other text operators (Tc, Tw, etc.)
+        // These operators don't use the doc reference directly, so no changes needed
+        "Tc" | "Tw" | "Tz" | "TL" | "Tr" | "Ts" | "Tm" | "Td" | "TD" | "T*" | "Tj" | "TJ" | "'" | "\"" => {
+            match op.operator.as_ref() {
+                // No changes needed for these operators
+                "Tc" => {
+                    if let Some(spacing) = op.operands.first() {
+                        current_gs.text_state.char_space = operand_as_float(spacing)
+                    }
+                },
+                "Tw" => {
+                    if let Some(spacing) = op.operands.first() {
+                        current_gs.text_state.word_space = operand_as_float(spacing)
+                    }
+                },
+                "Tz" => {
+                    if let Some(scale_percent) = op.operands.first() {
+                        current_gs.text_state.scale = operand_as_float(scale_percent) / 100.0
+                    }
+                },
+                "TL" => {
+                    if let Some(leading) = op.operands.first() {
+                        current_gs.text_state.leading = operand_as_float(leading)
+                    }
+                },
+                "Tr" => {
+                    if let Some(render_mode) = op.operands.first() {
+                        current_gs.text_state.render = operand_as_u8(render_mode)
+                    }
+                },
+                "Ts" => {
+                    if let Some(rise) = op.operands.first() {
+                        current_gs.text_state.rise = operand_as_float(rise)
+                    }
+                },
+                "Tm" => {
+                    // Finalize pending text before matrix change
+                    if let Some(text_elem) = finalize_text_run(text_object_state, &current_gs.text_state, page_number) {
+                         page_elements.push(text_elem);
+                    }
+                    let matrix = matrix_from_operands(op);
+                    text_object_state.text_matrix = matrix;
+                    text_object_state.text_line_matrix = matrix;
+                    text_object_state.operator_log.push(format!("Tm {:?}", matrix));
+                },
+                "Td" => {
+                    if let (Some(tx_obj), Some(ty_obj)) = (op.operands.get(0), op.operands.get(1)) {
+                        let tx = operand_as_float(tx_obj);
+                        let ty = operand_as_float(ty_obj);
+                        text_object_state.text_line_matrix =
+                            pre_translate(text_object_state.text_line_matrix, tx, ty);
+                        text_object_state.text_matrix = text_object_state.text_line_matrix;
+                    }
+                },
+                "TD" => {
+                    // Move text pos and set leading
+                    if let (Some(tx_obj), Some(ty_obj)) = (op.operands.get(0), op.operands.get(1)) {
+                        let tx = operand_as_float(tx_obj);
+                        let ty = operand_as_float(ty_obj);
+                        current_gs.text_state.leading = -ty;
+                        text_object_state.text_line_matrix =
+                            pre_translate(text_object_state.text_line_matrix, tx, ty);
+                        text_object_state.text_matrix = text_object_state.text_line_matrix;
+                    }
+                },
+                "T*" => {
+                    let tx = 0.0;
+                    let ty = -current_gs.text_state.leading;
+                    text_object_state.text_line_matrix = pre_translate(text_object_state.text_line_matrix, tx, ty);
+                    text_object_state.text_matrix = text_object_state.text_line_matrix;
+                },
+                // Text Showing
+                "Tj" | "TJ" | "'" | "\"" => {
+                    text_object_state.operator_log.push(format!("{} {:?}", op.operator, op.operands));
+                     collect_text_glyphs(
+                        text_object_state,
+                        &mut current_gs.text_state,
+                        &op.operands,
+                        current_gs.ctm
+                    )?;
+                },
+                _ => {}
+            }
+        },
         _ => {}
     }
     Ok(())
@@ -805,6 +918,9 @@ fn get_page_elements(
         })
         .collect();
 
+    // Create resolved resources for optimization
+    let resolved_resources = ResolvedResources::new(doc, resources);
+
     for (_i, op) in content_data.operations.iter().enumerate() {
         // Filter relevant operators (expanded to include graphics state)
         if matches!(op.operator.as_ref(), "BT" | "ET" | "Tm" | "Td" | "TD" | "T*" | "Tf" | "Tc" | "Tw" | "Tz" | "TL" | "Tr" | "Ts" | "Tj" | "TJ" | "'" | "\"" | "cm" | "q" | "Q" | "Do") {
@@ -817,6 +933,7 @@ fn get_page_elements(
                 resources, // Pass page resources
                 doc,
                 &encodings,
+                &resolved_resources, // Pass the resolved resources
             ) {
                  error!(page=%page_number, operator=%op.operator, error=?e, "Error handling operator");
                  // Decide whether to continue or return error
