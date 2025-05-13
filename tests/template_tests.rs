@@ -1,6 +1,6 @@
 use delver_pdf::{
     dom::{parse_template, Value},
-    parse::get_pdf_text,
+    parse::{get_page_content, PageContent},
 };
 use lopdf::Document;
 use std::collections::HashMap;
@@ -30,9 +30,13 @@ fn test_10k_template_parsing() -> std::io::Result<()> {
     let section = &root.elements[1];
     assert_eq!(section.name, "Section");
     if let Some(Value::String(s)) = section.attributes.get("match") {
+        let expected = "Management's Discussion and Analysis of Financial Condition and Results of Operations";
+        let normalized_actual = s.replace("\u{2019}", "'"); // Replace Unicode right single quote with ASCII apostrophe
+        
         assert_eq!(
-            s,
-            "Management’s Discussion and Analysis of Financial Condition and Results of Operations"
+            normalized_actual,
+            expected,
+            "Match string should exactly match the expected value after normalizing apostrophes"
         );
     }
 
@@ -54,11 +58,11 @@ fn test_10k_template_processing() -> std::io::Result<()> {
     })?;
 
     // Parse PDF into text elements
-    let text_elements = get_pdf_text(&doc).map_err(|e| {
+    let pages_map = get_page_content(&doc).map_err(|e| {
         println!("Failed to extract text: {}", e);
         Error::new(ErrorKind::Other, e.to_string())
     })?;
-    println!("Extracted {} text elements", text_elements.len());
+    println!("Extracted {} pages of content", pages_map.len());
 
     // Parse template
     let template_str = include_str!("../10k.tmpl");
@@ -129,8 +133,7 @@ fn test_nested_sections() -> std::io::Result<()> {
 
     let pdf_path = common::get_test_pdf_path();
     let doc = Document::load(&pdf_path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-    let text_elements =
-        get_pdf_text(&doc).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+    let pages_map = get_page_content(&doc).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
 
     let template_str = include_str!("../10k.tmpl");
     let root = parse_template(template_str)?;

@@ -47,6 +47,8 @@ rstar = "0.12.2"
 multi_index_map = "0.11.0"
 geo = "0.29.3"
 anyhow = "1.0.98"
+base64 = "0.22.1"
+image = "0.25.6"
 
 [dev-dependencies]
 flamegraph = "0.6.7"

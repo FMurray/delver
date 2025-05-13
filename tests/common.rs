@@ -14,6 +14,7 @@ pub fn cleanup_all() {
         "tests/example.pdf",
         "tests/custom.pdf",
         "tests/heading_test.pdf",
+        "tests/coordinate_test.pdf",
     ];
 
     for file in test_files {
