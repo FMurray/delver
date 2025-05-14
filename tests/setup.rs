@@ -2,6 +2,8 @@ use lopdf::content::{Content, Operation};
 use lopdf::dictionary;
 use lopdf::{Document, Object, Stream};
 use std::path::Path;
+
+#[derive(Clone)]
 pub struct PdfConfig {
     pub title: String,
     pub sections: Vec<Section>,
@@ -12,6 +14,7 @@ pub struct PdfConfig {
     pub output_path: String,
 }
 
+#[derive(Clone)]
 pub struct Section {
     pub heading: String,
     pub content: String,
@@ -63,7 +66,7 @@ pub fn create_test_pdf_with_config(config: PdfConfig) -> Result<(), std::io::Err
     let page_width = 612.0; // US Letter width in points (matches test assertions)
     let _page_height = 792.0; // US Letter height in points
     let x_center = page_width / 2.0;
-    
+
     // More accurate width calculation for Helvetica - based on actual widths
     // Helvetica average character width is roughly 0.3-0.4 * font size
     let approx_width_per_char = match config.font_name.as_str() {
@@ -72,15 +75,15 @@ pub fn create_test_pdf_with_config(config: PdfConfig) -> Result<(), std::io::Err
     };
     let approx_title_width = config.title.len() as f32 * approx_width_per_char;
     let title_x = x_center - (approx_title_width / 2.0);
-    
+
     // Add title
     operations.extend(vec![
         Operation::new("BT", vec![]), // Begin text
         Operation::new("Tf", vec!["F1".into(), config.title_font_size.into()]), // Set font
         // Position at calculated center position
-        Operation::new("Td", vec![title_x.into(), 700.into()]), 
+        Operation::new("Td", vec![title_x.into(), 700.into()]),
         Operation::new("Tj", vec![Object::string_literal(config.title)]), // Draw text
-        Operation::new("ET", vec![]), // End text
+        Operation::new("ET", vec![]),                                     // End text
     ]);
 
     // Add each section

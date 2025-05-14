@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use clap::Parser;
 use anyhow::Result;
+use clap::Parser;
 
 use delver_pdf::logging::{init_debug_logging, DebugDataStore};
 use delver_pdf::process_pdf;

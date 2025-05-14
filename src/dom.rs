@@ -1,18 +1,18 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
 use crate::matcher::{MatchedContent, TemplateContentMatch};
-use crate::parse::{TextElement, PageContent, ImageElement};
+use crate::parse::{ImageElement, PageContent, TextElement};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use image;
 use log::{error, info, warn};
-use lopdf::{Document, Stream, Dictionary as LoPdfDictionary, Object};
+use lopdf::{Dictionary as LoPdfDictionary, Document, Object, Stream};
 use pest::iterators::Pair;
 use pest::Parser as PestParser;
 use pest_derive::Parser as PestParserDerive;
 use serde::Serialize;
 use std::io::ErrorKind;
 use std::sync::{Arc, Weak};
-use std::{collections::HashMap, io::Error};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use image; // Add image crate import
+use std::{collections::HashMap, io::Error}; // Add image crate import
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum EmbeddingModel {
@@ -95,6 +95,10 @@ pub struct DocumentElement {
     pub metadata: HashMap<String, String>, // Additional info like font size, position
 }
 
+/// Types of elements that can be matched against the document
+/// Implements PartialEq and PartialOrd for sorting so that
+/// elements are matched in a deterministic order.
+/// Elements which can contain other elements should be enumerated first.
 #[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum ElementType {
     Section,
@@ -412,52 +416,115 @@ fn process_value(pair: Pair<Rule>) -> Value {
 }
 
 // Process the matched content to generate chunks or image data
-pub fn process_matched_content(matched: &Vec<TemplateContentMatch>) -> Vec<ProcessedOutput> {
+pub fn process_matched_content(matched_items: &Vec<TemplateContentMatch>) -> Vec<ProcessedOutput> {
     let mut output_elements = Vec::new();
 
-    for match_item in matched {
-        match &match_item.matched_content {
-            MatchedContent::TextChunk { content } => {
-                let owned_content: Vec<TextElement> = content.iter().map(|el_ref_ref| (**el_ref_ref).clone()).collect();
-                let chunk_outputs = process_text_chunk_elements(
-                    &owned_content,
-                    &match_item.template_element,
-                    &match_item.metadata,
-                );
-                for chunk_output in chunk_outputs {
-                    output_elements.push(ProcessedOutput::Text(chunk_output));
+    for match_item in matched_items {
+        match &match_item.template_element.element_type {
+            ElementType::TextChunk | ElementType::Paragraph => {
+                let text_elements_to_chunk: Vec<TextElement> = match_item
+                    .matched_content
+                    .iter()
+                    .filter_map(|mc_ref| match mc_ref {
+                        MatchedContent::Text(text_elem_ref) => Some((*text_elem_ref).clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                if !text_elements_to_chunk.is_empty() {
+                    let chunk_outputs = process_text_chunk_elements(
+                        &text_elements_to_chunk,
+                        &match_item.template_element,
+                        &match_item.metadata,
+                    );
+                    for chunk_output in chunk_outputs {
+                        output_elements.push(ProcessedOutput::Text(chunk_output));
+                    }
                 }
             }
-            MatchedContent::Section { content, .. } => {
+            ElementType::Section => {
                 if !match_item.children.is_empty() {
                     output_elements.extend(process_matched_content(&match_item.children));
                 } else {
-                    // Filter for Text elements only before collecting
-                    let owned_content: Vec<TextElement> = content.iter().filter_map(|pc| match pc {
-                        PageContent::Text(t) => Some((*t).clone()),
-                        _ => None,
-                    }).collect();
-                    
-                    if !owned_content.is_empty() {
+                    let section_text_elements: Vec<TextElement> = match_item
+                        .matched_content
+                        .iter()
+                        .filter_map(|mc_ref| match mc_ref {
+                            MatchedContent::Text(text_elem_ref) => Some((*text_elem_ref).clone()),
+                            _ => None,
+                        })
+                        .collect();
+
+                    if !section_text_elements.is_empty() {
                         let chunk_outputs = process_text_chunk_elements(
-                            &owned_content,
+                            &section_text_elements,
                             &match_item.template_element,
                             &match_item.metadata,
                         );
                         for chunk_output in chunk_outputs {
                             output_elements.push(ProcessedOutput::Text(chunk_output));
                         }
-                    } // else: Section contained only non-text, produce no output
+                    }
                 }
             }
-            MatchedContent::Image(image_element) => {
-                 output_elements.push(process_image_element(
-                     image_element,
-                     &match_item.template_element,
-                     &match_item.metadata,
-                 ));
+            ElementType::Image => {
+                let mut image_processed = false;
+                for mc_ref in &match_item.matched_content {
+                    if let MatchedContent::Image(image_elem_ref) = mc_ref {
+                        output_elements.push(process_image_element(
+                            image_elem_ref,
+                            &match_item.template_element,
+                            &match_item.metadata,
+                        ));
+                        image_processed = true;
+                        break;
+                    }
+                }
+                if !image_processed {
+                    warn!(
+                        "Image template element '{}' did not find any MatchedContent::Image.",
+                        match_item.template_element.name
+                    );
+                }
             }
-            _ => {} 
+            ElementType::Table => {
+                warn!(
+                    "Processing for ElementType::Table in process_matched_content is simplified."
+                );
+                let table_text_elements: Vec<TextElement> = match_item
+                    .matched_content
+                    .iter()
+                    .filter_map(|mc_ref| match mc_ref {
+                        MatchedContent::Text(text_elem_ref) => Some((*text_elem_ref).clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !table_text_elements.is_empty() {
+                    let chunk_outputs = process_text_chunk_elements(
+                        &table_text_elements,
+                        &match_item.template_element,
+                        &match_item.metadata,
+                    );
+                    for chunk_output in chunk_outputs {
+                        output_elements.push(ProcessedOutput::Text(chunk_output));
+                    }
+                }
+            }
+            ElementType::ImageSummary
+            | ElementType::ImageBytes
+            | ElementType::ImageCaption
+            | ElementType::ImageEmbedding => {
+                warn!(
+                    "Encountered {:?} as a top-level matched element. These are typically processed as children of an Image element.",
+                    match_item.template_element.element_type
+                );
+            }
+            ElementType::Unknown => {
+                warn!(
+                    "Encountered ElementType::Unknown for template element: {}",
+                    match_item.template_element.name
+                );
+            }
         }
     }
 
@@ -488,9 +555,12 @@ fn process_image_element(
 
     // Attempt to decode image bytes once if needed by any child
     let needs_bytes = template_element.children.iter().any(|child| {
-        matches!(child.element_type, ElementType::ImageBytes | ElementType::ImageSummary | ElementType::ImageEmbedding)
+        matches!(
+            child.element_type,
+            ElementType::ImageBytes | ElementType::ImageSummary | ElementType::ImageEmbedding
+        )
     });
-    
+
     let image_bytes_result = if needs_bytes {
         decode_image_object(&image_element.image_object)
     } else {
@@ -501,18 +571,19 @@ fn process_image_element(
     for child_template in &template_element.children {
         match child_template.element_type {
             ElementType::ImageBytes => {
-                 match &image_bytes_result {
+                match &image_bytes_result {
                     Ok(bytes) => {
                         image_output.bytes_base64 = Some(BASE64_STANDARD.encode(bytes));
                         println!("Successfully decoded and encoded image bytes for ImageBytes.");
                     }
                     Err(e) => {
-                         if e != "Bytes not needed" { // Don't warn if bytes weren't requested
+                        if e != "Bytes not needed" {
+                            // Don't warn if bytes weren't requested
                             warn!("Could not get image bytes for ImageBytes: {}", e);
-                         }
-                         image_output.bytes_base64 = None; // Ensure it's None on error
+                        }
+                        image_output.bytes_base64 = None; // Ensure it's None on error
                     }
-                 }
+                }
             }
             ElementType::ImageCaption => {
                 // TODO: Implement actual caption finding logic
@@ -522,51 +593,77 @@ fn process_image_element(
                 image_output.caption = Some("PLACEHOLDER_IMAGE_CAPTION".to_string());
             }
             ElementType::ImageSummary => {
-                let model = child_template.attributes.get("model").and_then(|v| v.as_string()).unwrap_or_default();
-                let prompt = child_template.attributes.get("prompt").and_then(|v| v.as_string()).unwrap_or_default();
-                let target_schema = child_template.attributes.get("targetSchema").and_then(|v| v.as_string());
-                
-                let config = LLMConfig { model, prompt, target_schema };
+                let model = child_template
+                    .attributes
+                    .get("model")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let prompt = child_template
+                    .attributes
+                    .get("prompt")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let target_schema = child_template
+                    .attributes
+                    .get("targetSchema")
+                    .and_then(|v| v.as_string());
+
+                let config = LLMConfig {
+                    model,
+                    prompt,
+                    target_schema,
+                };
 
                 match &image_bytes_result {
                     Ok(_bytes) => {
                         // TODO: Implement actual call to external LLM for summary
                         // let summary = call_llm_summary(&config, bytes);
                         println!("Placeholder: Call external summary model ('{:?}')", config);
-                        image_output.summary = Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", config.model));
+                        image_output.summary =
+                            Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", config.model));
                     }
                     Err(e) => {
                         if e != "Bytes not needed" {
-                           warn!("Could not get image bytes for ImageSummary: {}", e);
+                            warn!("Could not get image bytes for ImageSummary: {}", e);
                         }
                         image_output.summary = None;
                     }
                 }
             }
             ElementType::ImageEmbedding => {
-                let model_str = child_template.attributes.get("model").and_then(|v| v.as_string()).unwrap_or("clip".to_string());
+                let model_str = child_template
+                    .attributes
+                    .get("model")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or("clip".to_string());
                 let embedding_model = EmbeddingModel::from(model_str.as_str());
 
                 match &image_bytes_result {
-                     Ok(bytes) => {
+                    Ok(bytes) => {
                         // Call the placeholder embedding function
                         match generate_embedding(&embedding_model, bytes) {
                             Ok(embedding) => {
                                 image_output.embedding = Some(embedding);
-                                println!("Successfully generated placeholder embedding using {:?}.", embedding_model);
+                                println!(
+                                    "Successfully generated placeholder embedding using {:?}.",
+                                    embedding_model
+                                );
                             }
                             Err(e) => {
-                                warn!("Embedding generation failed for model {:?}: {}", embedding_model, e);
+                                warn!(
+                                    "Embedding generation failed for model {:?}: {}",
+                                    embedding_model, e
+                                );
                                 image_output.embedding = None;
                             }
                         }
-                     }
-                     Err(e) => {
-                         if e != "Bytes not needed" {
+                    }
+                    Err(e) => {
+                        if e != "Bytes not needed" {
                             warn!("Could not get image bytes for ImageEmbedding: {}", e);
-                         }
-                         image_output.embedding = None;
-                     }
+                        }
+                        image_output.embedding = None;
+                    }
                 }
             }
             _ => {}
@@ -630,20 +727,17 @@ fn process_text_chunk_elements(
 
 fn decode_image_object(image_object: &Object) -> Result<Vec<u8>, String> {
     if let Ok(stream) = image_object.as_stream() {
-        Ok(stream.content.clone()) 
+        Ok(stream.content.clone())
     } else {
         Err("Image object is not a stream".to_string())
     }
 }
 
 // Placeholder function for generating embeddings
-fn generate_embedding(
-    model: &EmbeddingModel,
-    image_bytes: &[u8],
-) -> Result<Vec<f32>, String> {
+fn generate_embedding(model: &EmbeddingModel, image_bytes: &[u8]) -> Result<Vec<f32>, String> {
     match model {
         EmbeddingModel::Clip => {
-            // --- Placeholder Logic --- 
+            // --- Placeholder Logic ---
             println!(
                 "Placeholder: Simulating CLIP embedding generation for image ({} bytes)",
                 image_bytes.len()
@@ -654,14 +748,14 @@ fn generate_embedding(
                     println!("Placeholder: Detected image format: {:?}", format);
                     match image::load_from_memory(image_bytes) {
                         Ok(img) => {
-                             println!(
+                            println!(
                                 "Placeholder: Image dimensions {}x{}",
                                 img.width(),
                                 img.height()
                             );
                             // In real implementation, send `image_bytes` or processed image to CLIP API
                             // Here, return a dummy vector
-                             Ok(vec![0.5; 512]) // Example: Return a 512-dimension vector of 0.5s
+                            Ok(vec![0.5; 512]) // Example: Return a 512-dimension vector of 0.5s
                         }
                         Err(e) => Err(format!("Placeholder: Failed to load image: {}", e)),
                     }
@@ -670,8 +764,6 @@ fn generate_embedding(
             }
             // --- End Placeholder Logic ---
         }
-        EmbeddingModel::Unknown(name) => {
-            Err(format!("Embedding model '{}' not implemented", name))
-        }
+        EmbeddingModel::Unknown(name) => Err(format!("Embedding model '{}' not implemented", name)),
     }
 }
