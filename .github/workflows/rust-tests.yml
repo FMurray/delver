@@ -1,0 +1,26 @@
+name: Cargo Tests
+
+on:
+  pull_request:
+    branches: [ '*' ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+      
+      - name: Run Tests
+        run: cargo test --verbose 
