@@ -1,15 +1,14 @@
 mod generated;
 
-pub use generated::*;
 
 // use crate::geo::Rect;
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
-use once_cell::sync::Lazy;
 
 pub mod canonicalize;
 pub use canonicalize::canonicalize_font_name;
+pub use generated::*;
 
 // Re-export the generated types
 // pub use super::FontMetrics;
@@ -46,10 +45,13 @@ pub struct FontMetrics {
 // });
 
 /// Types of font name transformations
+#[allow(dead_code)] // Used in font transformation logic
 enum FontTransform {
     /// Replace the entire name with a different one
+    #[allow(dead_code)] // Fields are used in font transformation logic
     ExactMatch(String, String),
     /// Replace a prefix and keep the rest
+    #[allow(dead_code)] // Fields are used in font transformation logic
     PrefixReplace {
         prefix: String,
         replacement: String,
@@ -57,21 +59,27 @@ enum FontTransform {
         post_processors: Vec<PostProcessor>,
     },
     /// Apply a custom transformation function
+    #[allow(dead_code)] // Reserved for future custom transformations
     Custom(fn(&str) -> Option<String>),
 }
 
 /// Post-processing operations that can be chained
+#[allow(dead_code)] // Used in font transformation logic
 enum PostProcessor {
     /// Remove a suffix if present
+    #[allow(dead_code)] // Used in font transformation logic
     RemoveSuffix(String),
     /// Map specific variants to canonical names
+    #[allow(dead_code)] // Used in font transformation logic
     MapVariant(HashMap<String, String>),
     /// Strip any leading character (like a dash)
+    #[allow(dead_code)] // Used in font transformation logic
     TrimLeadingChar(char),
 }
 
 lazy_static! {
     /// List of transformation rules applied in order
+    #[allow(dead_code)] // Used in font transformation logic
     static ref FONT_TRANSFORMS: Vec<FontTransform> = {
         // Times New Roman variants mapping
         let mut times_variants = HashMap::new();

@@ -5,7 +5,6 @@ mod fonts;
 mod canonicalize;
 use canonicalize::canonicalize_font_name;
 
-use rusttype::{point, Font, Scale};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

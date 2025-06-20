@@ -2,10 +2,13 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 
 /// Types of font name transformations
+#[allow(dead_code)] // Used in font transformation logic
 pub enum FontTransform {
     /// Replace the entire name with a different one
+    #[allow(dead_code)] // Fields are used in canonicalize_font_name
     ExactMatch(String, String),
     /// Replace a prefix and keep the rest
+    #[allow(dead_code)] // Fields are used in font transformation logic
     PrefixReplace {
         prefix: String,
         replacement: String,
@@ -13,16 +16,21 @@ pub enum FontTransform {
         post_processors: Vec<PostProcessor>,
     },
     /// Apply a custom transformation function
+    #[allow(dead_code)] // Reserved for future custom transformations
     Custom(fn(&str) -> Option<String>),
 }
 
 /// Post-processing operations that can be chained
+#[allow(dead_code)] // Used in font transformation logic
 pub enum PostProcessor {
     /// Remove a suffix if present
+    #[allow(dead_code)] // Used in font transformation logic
     RemoveSuffix(String),
     /// Map specific variants to canonical names
+    #[allow(dead_code)] // Used in font transformation logic
     MapVariant(HashMap<String, String>),
     /// Strip any leading character (like a dash)
+    #[allow(dead_code)] // Used in font transformation logic
     TrimLeadingChar(char),
 }
 
@@ -76,6 +84,7 @@ lazy_static! {
 }
 
 /// Returns the canonical font name used as lookup key by applying transformation rules.
+#[allow(dead_code)] // Used in font name canonicalization
 pub fn canonicalize_font_name(raw: &str) -> String {
     // Try each transformation in order
     for transform in FONT_TRANSFORMS.iter() {
@@ -135,6 +144,7 @@ pub fn canonicalize_font_name(raw: &str) -> String {
 }
 
 // Example custom transformation function
+#[allow(dead_code)] // Reserved for future use
 pub fn _handle_symbol_fonts(name: &str) -> Option<String> {
     if name.contains("Symbol") || name.contains("Zapf") {
         // Symbol fonts often need special handling
