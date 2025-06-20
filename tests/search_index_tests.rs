@@ -275,4 +275,329 @@ mod pdf_index_tests {
             "Reference count should be empty initially"
         );
     }
+
+    #[test]
+    fn test_get_elements_between_markers() {
+        let (page_map, mock_match_context) = basic_page_map_and_context();
+        let index = PdfIndex::new(&page_map, &mock_match_context);
+
+        // Get references to specific elements by their content
+        let hello_world_element = index
+            .all_ordered_content
+            .iter()
+            .find(|pc| {
+                if let PageContent::Text(te) = pc {
+                    te.text == "Hello World"
+                } else {
+                    false
+                }
+            })
+            .expect("Should find 'Hello World' element");
+
+        let section_title_element = index
+            .all_ordered_content
+            .iter()
+            .find(|pc| {
+                if let PageContent::Text(te) = pc {
+                    te.text == "Section Title"
+                } else {
+                    false
+                }
+            })
+            .expect("Should find 'Section Title' element");
+
+        let another_page_element = index
+            .all_ordered_content
+            .iter()
+            .find(|pc| {
+                if let PageContent::Text(te) = pc {
+                    te.text == "Another page"
+                } else {
+                    false
+                }
+            })
+            .expect("Should find 'Another page' element");
+
+        let image_element = index
+            .all_ordered_content
+            .iter()
+            .find(|pc| matches!(pc, PageContent::Image(_)))
+            .expect("Should find image element");
+
+        // Test 1: Get elements between two text elements (should include start, exclude end)
+        let elements_between =
+            index.get_elements_between_markers(hello_world_element, Some(another_page_element));
+
+        // This should include: "Hello World", "Section Title", and the image element
+        // but exclude "Another page" since it's the end marker
+        assert_eq!(
+            elements_between.len(),
+            3,
+            "Should return 3 elements between Hello World and Another page"
+        );
+
+        // Verify the elements are in order and correct
+        if let PageContent::Text(te) = elements_between[0] {
+            assert_eq!(te.text, "Hello World");
+        } else {
+            panic!("First element should be 'Hello World' text");
+        }
+
+        if let PageContent::Text(te) = elements_between[1] {
+            assert_eq!(te.text, "Section Title");
+        } else {
+            panic!("Second element should be 'Section Title' text");
+        }
+
+        assert!(
+            matches!(elements_between[2], PageContent::Image(_)),
+            "Third element should be an image"
+        );
+
+        // Test 2: Get elements from start to end of document (no end marker)
+        let elements_to_end = index.get_elements_between_markers(section_title_element, None);
+
+        // This should include: "Section Title", image, and "Another page"
+        assert_eq!(
+            elements_to_end.len(),
+            3,
+            "Should return 3 elements from Section Title to end"
+        );
+
+        if let PageContent::Text(te) = elements_to_end[0] {
+            assert_eq!(te.text, "Section Title");
+        } else {
+            panic!("First element should be 'Section Title' text");
+        }
+
+        if let PageContent::Text(te) = elements_to_end[2] {
+            assert_eq!(te.text, "Another page");
+        } else {
+            panic!("Last element should be 'Another page' text");
+        }
+
+        // Test 3: Get elements between same element (should return just that element)
+        let same_element =
+            index.get_elements_between_markers(hello_world_element, Some(hello_world_element));
+        assert_eq!(
+            same_element.len(),
+            0,
+            "Should return empty when start and end are the same element"
+        );
+
+        // Test 4: Get elements with non-existent start element (should return empty)
+        let non_existent_element = create_mock_text_element(
+            Uuid::new_v4(),
+            "Non-existent",
+            "Arial",
+            12.0,
+            1,
+            0.0,
+            0.0,
+            100.0,
+            12.0,
+        );
+        let empty_result =
+            index.get_elements_between_markers(&non_existent_element, Some(hello_world_element));
+        assert_eq!(
+            empty_result.len(),
+            0,
+            "Should return empty when start element doesn't exist in index"
+        );
+
+        // Test 5: Get elements where end comes before start (should return empty)
+        let reverse_order =
+            index.get_elements_between_markers(another_page_element, Some(hello_world_element));
+        assert_eq!(
+            reverse_order.len(),
+            0,
+            "Should return empty when end element comes before start element"
+        );
+
+        // Test 6: Get elements starting from image element
+        let from_image = index.get_elements_between_markers(image_element, None);
+        assert_eq!(
+            from_image.len(),
+            2,
+            "Should return 2 elements from image to end (image + 'Another page')"
+        );
+        assert!(
+            matches!(from_image[0], PageContent::Image(_)),
+            "First element should be the image"
+        );
+        if let PageContent::Text(te) = from_image[1] {
+            assert_eq!(te.text, "Another page");
+        } else {
+            panic!("Second element should be 'Another page' text");
+        }
+    }
+
+    #[test]
+    fn test_get_elements_between_markers_debug_real_scenario() {
+        let (page_map, mock_match_context) = basic_page_map_and_context();
+        let index = PdfIndex::new(&page_map, &mock_match_context);
+
+        // Create a scenario that mimics what we see in the logs
+        // Start marker: Text(' Discussion and Analysis of Financial Condition and Results of Operations.', ID: 376a150e-6e4f-462d-86d8-c85c81d4532d)
+        // End marker: Text('Quantitative and Qualitative Disclosures About Market Risk', ID: e5d5bfb1-8b62-4f36-bdda-fff34a08313c)
+
+        let start_id = uuid::Uuid::parse_str("376a150e-6e4f-462d-86d8-c85c81d4532d").unwrap();
+        let end_id = uuid::Uuid::parse_str("e5d5bfb1-8b62-4f36-bdda-fff34a08313c").unwrap();
+
+        let fake_start_element = create_mock_text_element(
+            start_id,
+            " Discussion and Analysis of Financial Condition and Results of Operations.",
+            "Arial",
+            12.0,
+            1,
+            50.0,
+            600.0,
+            400.0,
+            12.0,
+        );
+
+        let fake_end_element = create_mock_text_element(
+            end_id,
+            "Quantitative and Qualitative Disclosures About Market Risk",
+            "Arial",
+            12.0,
+            1,
+            50.0,
+            400.0,
+            350.0,
+            12.0,
+        );
+
+        // Test what happens when we pass elements that are NOT in the index
+        let result =
+            index.get_elements_between_markers(&fake_start_element, Some(&fake_end_element));
+
+        // This should return empty because the elements aren't in the index
+        assert_eq!(
+            result.len(),
+            0,
+            "Should return empty when elements aren't in the index"
+        );
+
+        // Verify that these IDs indeed don't exist in the index
+        assert!(
+            !index.element_id_to_index.contains_key(&start_id),
+            "Start ID should not exist in test index"
+        );
+        assert!(
+            !index.element_id_to_index.contains_key(&end_id),
+            "End ID should not exist in test index"
+        );
+
+        // Test what happens when we look up elements by text content and they don't exist
+        let start_by_text = index.all_ordered_content.iter().find(|pc| {
+            if let PageContent::Text(te) = pc {
+                te.text.contains("Discussion and Analysis")
+            } else {
+                false
+            }
+        });
+        assert!(
+            start_by_text.is_none(),
+            "Should not find start text in test index"
+        );
+
+        let end_by_text = index.all_ordered_content.iter().find(|pc| {
+            if let PageContent::Text(te) = pc {
+                te.text.contains("Quantitative and Qualitative")
+            } else {
+                false
+            }
+        });
+        assert!(
+            end_by_text.is_none(),
+            "Should not find end text in test index"
+        );
+
+        // Print debug info about what's actually in the index
+        println!(
+            "Index contains {} elements:",
+            index.all_ordered_content.len()
+        );
+        for (i, element) in index.all_ordered_content.iter().enumerate() {
+            match element {
+                PageContent::Text(te) => println!("  {}: Text('{}', ID: {})", i, te.text, te.id),
+                PageContent::Image(ie) => println!("  {}: Image(ID: {})", i, ie.id),
+            }
+        }
+
+        println!(
+            "element_id_to_index contains {} mappings:",
+            index.element_id_to_index.len()
+        );
+        for (id, idx) in &index.element_id_to_index {
+            println!("  {} -> {}", id, idx);
+        }
+    }
+
+    #[test]
+    fn test_boundary_candidate_id_mismatch() {
+        let (page_map, mock_match_context) = basic_page_map_and_context();
+        let index = PdfIndex::new(&page_map, &mock_match_context);
+
+        // Test the find_text_matches function with text that actually exists
+        let matches = index.find_text_matches("Hello World", 0.8, None);
+
+        println!("Found {} text matches for 'Hello World'", matches.len());
+        for (element, score) in &matches {
+            let id = element.id();
+            println!(
+                "  Match: '{}' (ID: {}, score: {})",
+                element.text().unwrap_or(""),
+                id,
+                score
+            );
+
+            // The crucial test: can we find this element by ID in the index?
+            let found_by_id = index.get_element_by_id(&id);
+            match found_by_id {
+                Some(found_element) => {
+                    println!(
+                        "    ✓ Found by ID: '{}'",
+                        found_element.text().unwrap_or("")
+                    );
+                    assert_eq!(element.id(), found_element.id(), "IDs should match");
+                }
+                None => {
+                    println!("    ✗ NOT found by ID in index!");
+                    panic!("Element with ID {} not found in index", id);
+                }
+            }
+        }
+
+        // Also test with less specific text
+        let partial_matches = index.find_text_matches("Hello", 0.6, None);
+        println!("Found {} text matches for 'Hello'", partial_matches.len());
+
+        // Test with a cloned element (this simulates what happens in score_candidate)
+        if let Some((first_element, _)) = matches.first() {
+            let cloned_element = (*first_element).clone(); // Fix the clone warning
+            let cloned_id = cloned_element.id();
+
+            println!("Testing cloned element with ID: {}", cloned_id);
+            let found_cloned_by_id = index.get_element_by_id(&cloned_id);
+            match found_cloned_by_id {
+                Some(found_element) => {
+                    println!(
+                        "  ✓ Cloned element found by ID: '{}'",
+                        found_element.text().unwrap_or("")
+                    );
+                    assert_eq!(
+                        cloned_element.id(),
+                        found_element.id(),
+                        "Cloned element IDs should match"
+                    );
+                }
+                None => {
+                    println!("  ✗ Cloned element NOT found by ID in index!");
+                    panic!("Cloned element with ID {} not found in index", cloned_id);
+                }
+            }
+        }
+    }
 }

@@ -631,24 +631,82 @@ impl PdfIndex {
         start_element: &PageContent,
         end_element: Option<&PageContent>,
     ) -> Vec<&PageContent> {
-        let start_idx_inclusive = match self.element_id_to_index.get(&start_element.id()) {
-            Some(&idx) => idx,
-            None => return Vec::new(), // Start element not found in index
+        let start_id = start_element.id();
+        let end_id = end_element.map(|e| e.id());
+
+        println!(
+            "[get_elements_between_markers] Looking for start_id: {}",
+            start_id
+        );
+        if let Some(end_id) = end_id {
+            println!(
+                "[get_elements_between_markers] Looking for end_id: {}",
+                end_id
+            );
+        } else {
+            println!("[get_elements_between_markers] No end element specified");
+        }
+
+        println!(
+            "[get_elements_between_markers] element_id_to_index contains {} mappings",
+            self.element_id_to_index.len()
+        );
+
+        let start_idx_inclusive = match self.element_id_to_index.get(&start_id) {
+            Some(&idx) => {
+                println!(
+                    "[get_elements_between_markers] Found start_id at index: {}",
+                    idx
+                );
+                idx
+            }
+            None => {
+                println!(
+                    "[get_elements_between_markers] Start element ID {} not found in index",
+                    start_id
+                );
+                // Let's also check what IDs are actually in the index
+                println!("[get_elements_between_markers] Available IDs in index:");
+                for (id, idx) in &self.element_id_to_index {
+                    println!("  {} -> {}", id, idx);
+                }
+                return Vec::new(); // Start element not found in index
+            }
         };
 
         let end_idx_exclusive = match end_element {
-            Some(end) => match self.element_id_to_index.get(&end.id()) {
-                Some(&idx) => idx,                      // This index is exclusive for the slice
-                None => self.all_ordered_content.len(), // End element not found, go to end of document
-            },
-            None => self.all_ordered_content.len(), // No end element, go to end of document
+            Some(end) => {
+                let end_id = end.id();
+                match self.element_id_to_index.get(&end_id) {
+                    Some(&idx) => {
+                        println!(
+                            "[get_elements_between_markers] Found end_id at index: {}",
+                            idx
+                        );
+                        idx // This index is exclusive for the slice
+                    }
+                    None => {
+                        println!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
+                        self.all_ordered_content.len() // End element not found, go to end of document
+                    }
+                }
+            }
+            None => {
+                println!("[get_elements_between_markers] No end element, using document end");
+                self.all_ordered_content.len() // No end element, go to end of document
+            }
         };
+
+        println!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
+                 start_idx_inclusive, end_idx_exclusive, self.all_ordered_content.len());
 
         // Now, start_idx_inclusive will be used directly for the slice start.
         // Ensure start_idx_inclusive is not past end_idx_exclusive or bounds.
         if start_idx_inclusive >= end_idx_exclusive
             || start_idx_inclusive >= self.all_ordered_content.len()
         {
+            println!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
+                     start_idx_inclusive, end_idx_exclusive, self.all_ordered_content.len());
             return Vec::new();
         }
 
@@ -656,10 +714,22 @@ impl PdfIndex {
         // end_idx_exclusive can be self.all_ordered_content.len(), which is fine for slicing.
         let effective_end_idx = std::cmp::min(end_idx_exclusive, self.all_ordered_content.len());
 
+        println!(
+            "[get_elements_between_markers] Effective slice: [{}..{}]",
+            start_idx_inclusive, effective_end_idx
+        );
+
         // Slice is [start_idx_inclusive..effective_end_idx]
-        self.all_ordered_content[start_idx_inclusive..effective_end_idx]
+        let result: Vec<&PageContent> = self.all_ordered_content
+            [start_idx_inclusive..effective_end_idx]
             .iter()
-            .collect()
+            .collect();
+
+        println!(
+            "[get_elements_between_markers] Returning {} elements",
+            result.len()
+        );
+        result
     }
 
     /// Get elements after a specific marker element

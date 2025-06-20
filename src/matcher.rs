@@ -92,21 +92,12 @@ pub fn align_template_with_content<'a>(
         return None;
     }
 
-    // Work with references from the original slice for sorting to maintain lifetime 'a
-    let mut elements_to_process_refs: Vec<&'a Element> = template_elements.iter().collect();
-    elements_to_process_refs.sort_by(|a, b| {
-        a.element_type
-            .partial_cmp(&b.element_type)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
     println!(
-        "MATCHER: align_template_with_content called for {} elements (sorted). Context: {}",
-        elements_to_process_refs.len(),
+        "MATCHER: align_template_with_content called for {} elements. Context: {}",
+        template_elements.len(),
         parent_or_prev_sibling_match_context.map_or("None", |m| m.template_element.name.as_str())
     );
 
-    let mut results: Vec<TemplateContentMatch<'a>> = Vec::new();
     let default_metadata = HashMap::new();
     let actual_inherited_metadata = inherited_metadata.unwrap_or(&default_metadata);
 
@@ -123,82 +114,186 @@ pub fn align_template_with_content<'a>(
         }
     }
 
-    let mut current_search_cursor: usize;
-    let mut prev_match_for_current_iter = parent_or_prev_sibling_match_context;
+    // Determine starting search position and constraints based on context
+    let (start_search_index, max_content_boundary) =
+        if let Some(context_match) = parent_or_prev_sibling_match_context {
+            // Simple invariant: if context has section_boundaries, we're processing children
+            // Otherwise, we're processing siblings
+            if let Some(section_boundaries) = &context_match.section_boundaries {
+                // Child elements are constrained to parent section boundaries
+                let start_idx = index
+                    .element_id_to_index
+                    .get(&section_boundaries.start_marker.id())
+                    .copied()
+                    .unwrap_or(0);
+                let end_idx = section_boundaries
+                    .end_marker
+                    .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
+                    .unwrap_or(index.all_ordered_content.len());
 
-    if let Some(context_match) = parent_or_prev_sibling_match_context {
-        let is_parent_context = !elements_to_process_refs.is_empty() &&
-            context_match.template_element.children.iter()
-                // Compare references directly using ptr::eq
-                .any(|child_tpl_in_parent_ref| std::ptr::eq(child_tpl_in_parent_ref, elements_to_process_refs[0]));
-
-        if is_parent_context {
-            current_search_cursor = context_match.section_boundaries.as_ref()
-                .and_then(|sb| index.element_id_to_index.get(&sb.start_marker.id()))
-                .copied()
-                .unwrap_or(0); 
-            println!("  Parent context ('{}'). First child ('{}') starts search at parent's start_marker index: {}", 
-                     context_match.template_element.name, elements_to_process_refs[0].name, current_search_cursor);
+                println!(
+                    "MATCHER: Processing children within section boundaries {} to {}",
+                    start_idx, end_idx
+                );
+                (start_idx, end_idx)
+            } else {
+                // Sibling elements start after previous match
+                let sibling_start = get_next_match_index(Some(context_match), index);
+                (sibling_start, index.all_ordered_content.len())
+            }
         } else {
-            current_search_cursor = get_next_match_index(Some(context_match), index);
-            println!("  Sibling context. Element '{}' starts search after '{}' at index: {}", 
-                     elements_to_process_refs.get(0).map_or("N/A",|e_ref|e_ref.name.as_str()), context_match.template_element.name, current_search_cursor);
-        }
-    } else {
-        current_search_cursor = 0;
-        println!("  No context. Element '{}' starts search at index: 0", elements_to_process_refs.get(0).map_or("N/A",|e_ref|e_ref.name.as_str()));
-    }
+            (0, index.all_ordered_content.len())
+        };
 
-    // Iterate over references to Elements with lifetime 'a
-    for template_element_ref in elements_to_process_refs {
-        println!(
-            "MATCHER: Processing template element: '{}'. Type: {:?}. Search start cursor: {}. Contextual prev match: {}",
-            template_element_ref.name,
-            template_element_ref.element_type, 
-            current_search_cursor,
-            prev_match_for_current_iter.map_or("None", |m|m.template_element.name.as_str())
-        );
-        let maybe_match = match template_element_ref.element_type {
-            ElementType::Section => match_section(
-                template_element_ref, // This is now &'a Element
+    // TWO-PASS ALGORITHM:
+
+    // PASS 1: Find all Section boundaries to partition content space
+    let mut section_matches = Vec::new();
+    let mut content_partitions = Vec::new(); // (start_idx, end_idx)
+
+    for template_element in template_elements {
+        if template_element.element_type == ElementType::Section {
+            if let Some(section_match) = match_section(
+                template_element,
                 index,
                 &elements_by_page_view,
                 actual_inherited_metadata,
-                prev_match_for_current_iter,
-                current_search_cursor,
-            ),
-            ElementType::TextChunk => match_text_chunk(
-                template_element_ref, // This is now &'a Element
-                index,
-                actual_inherited_metadata,
-                prev_match_for_current_iter,
-                current_search_cursor,
-            ),
-            ElementType::ImageSummary | ElementType::ImageBytes | ElementType::ImageCaption | ElementType::ImageEmbedding => None,
-            _ => None,
-        };
+                section_matches.last(),
+                start_search_index,
+            ) {
+                println!(
+                    "  PASS 1: Found Section '{}' boundaries",
+                    template_element.name
+                );
 
-        if let Some(matched_val) = maybe_match {
-            println!("  SUCCESS: Matched '{}'", template_element_ref.name);
-            current_search_cursor = get_next_match_index(Some(&matched_val), index);
-            results.push(matched_val);
-            prev_match_for_current_iter = results.last(); 
-        } else {
-            println!("  FAILURE: No match for '{}'", template_element_ref.name);
+                // Extract partition boundaries
+                if let Some(boundaries) = &section_match.section_boundaries {
+                    let start_idx = index
+                        .element_id_to_index
+                        .get(&boundaries.start_marker.id())
+                        .copied()
+                        .unwrap_or(0);
+                    let end_idx = boundaries
+                        .end_marker
+                        .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
+                        .unwrap_or(max_content_boundary); // Use max_content_boundary instead of full document
+                                                          // The section partition includes content UP TO but NOT INCLUDING the end marker
+                                                          // TextChunks after sections should start AFTER the end marker
+                    content_partitions.push((start_idx, end_idx));
+                }
+
+                section_matches.push(section_match);
+            }
         }
     }
 
-    if results.is_empty() {
+    // PASS 2: Assign TextChunks to appropriate content partitions
+    let mut textchunk_matches = Vec::new();
+    let mut partition_cursor = 0; // Which partition we're currently processing
+
+    for (template_idx, template_element) in template_elements.iter().enumerate() {
+        if template_element.element_type == ElementType::TextChunk {
+            println!(
+                "  PASS 2: Processing TextChunk '{}' (template order: {})",
+                template_element.name, template_idx
+            );
+
+            // Determine which content partition this TextChunk should process
+            let (content_start, content_end) = if content_partitions.is_empty() {
+                // No sections found, process all content within constraints
+                (start_search_index, max_content_boundary)
+            } else {
+                // Check if this TextChunk comes before the first section
+                let first_section_template_idx = template_elements
+                    .iter()
+                    .position(|e| e.element_type == ElementType::Section);
+
+                if let Some(first_section_idx) = first_section_template_idx {
+                    if template_idx < first_section_idx {
+                        // TextChunk comes before first section - process content before first section
+                        let first_partition_start = content_partitions[0].0;
+                        println!(
+                            "    TextChunk '{}' processes content BEFORE first section: {} to {}",
+                            template_element.name, start_search_index, first_partition_start
+                        );
+                        (start_search_index, first_partition_start)
+                    } else {
+                        // TextChunk comes after sections - process content after last section
+                        let last_partition_end = content_partitions
+                            .last()
+                            .map(|(_, end)| *end)
+                            .unwrap_or(max_content_boundary);
+                        // Start after the section end marker (partition end is the end marker index)
+                        let content_start_after_section =
+                            if last_partition_end < max_content_boundary {
+                                last_partition_end + 1 // Start after the end marker
+                            } else {
+                                last_partition_end
+                            };
+                        println!(
+                            "    TextChunk '{}' processes content AFTER sections: {} to {}",
+                            template_element.name,
+                            content_start_after_section,
+                            max_content_boundary
+                        );
+                        (content_start_after_section, max_content_boundary)
+                    }
+                } else {
+                    // No sections in template (shouldn't happen if we have partitions, but fallback)
+                    (start_search_index, max_content_boundary)
+                }
+            };
+
+            // Match TextChunk with determined content boundaries
+            if let Some(textchunk_match) = match_text_chunk_with_boundaries(
+                template_element,
+                index,
+                actual_inherited_metadata,
+                content_start,
+                content_end,
+            ) {
+                println!("    SUCCESS: Matched TextChunk '{}'", template_element.name);
+                textchunk_matches.push(textchunk_match);
+            } else {
+                println!(
+                    "    FAILURE: No match for TextChunk '{}'",
+                    template_element.name
+                );
+            }
+        }
+    }
+
+    // Combine results maintaining original template order
+    let mut all_results = Vec::new();
+    for template_element in template_elements {
+        if template_element.element_type == ElementType::Section {
+            if let Some(section_match) = section_matches
+                .iter()
+                .find(|m| std::ptr::eq(m.template_element, template_element))
+            {
+                all_results.push(section_match.clone());
+            }
+        } else if template_element.element_type == ElementType::TextChunk {
+            if let Some(textchunk_match) = textchunk_matches
+                .iter()
+                .find(|m| std::ptr::eq(m.template_element, template_element))
+            {
+                all_results.push(textchunk_match.clone());
+            }
+        }
+    }
+
+    if all_results.is_empty() {
         None
     } else {
-        Some(results)
+        Some(all_results)
     }
 }
 
 /// Represents a potential section boundary with scoring information
 #[derive(Debug, Clone)]
-struct BoundaryCandidate {
-    content: PageContent,
+struct BoundaryCandidate<'a> {
+    content: &'a PageContent,
     score: f32,
     reasons: Vec<String>,
 }
@@ -230,8 +325,12 @@ fn match_section<'a, 'map_lt>(
     let match_config = template.attributes.get("match")?.as_match_config()?;
 
     let effective_search_start_index = current_search_start_index;
-    println!("[match_section] For '{}', using effective_search_start_index: {}. Prev_match_context: {}", 
-        template.name, effective_search_start_index, prev_match_for_context.map_or("None", |m| m.template_element.name.as_str()));
+    println!(
+        "[match_section] For '{}', using effective_search_start_index: {}. Prev_match_context: {}",
+        template.name,
+        effective_search_start_index,
+        prev_match_for_context.map_or("None", |m| m.template_element.name.as_str())
+    );
 
     // 1. Find start boundary candidates
     let start_candidates = find_start_boundary_candidates(
@@ -243,13 +342,7 @@ fn match_section<'a, 'map_lt>(
     )?;
 
     let selected_start_candidate = start_candidates.first()?;
-    let start_marker: &'a PageContent = index
-        .get_element_by_id(&selected_start_candidate.content.id())
-        .ok_or_else(|| {
-            warn!("Start boundary content ID not found in index");
-            "Start boundary content ID not found in index"
-        })
-        .ok()?;
+    let start_marker: &'a PageContent = selected_start_candidate.content;
 
     // 2. Find end boundary candidates
     let end_candidates = find_end_boundary_candidates(
@@ -257,20 +350,12 @@ fn match_section<'a, 'map_lt>(
         template,
         index,
         &template.children,
+        &match_config, // Pass the match_config for consistent threshold handling
         prev_match_for_context,
     )?;
 
     let selected_end_candidate = end_candidates.first()?;
-    let end_marker_option: Option<&'a PageContent> =
-        index.get_element_by_id(&selected_end_candidate.content.id());
-
-    // 4. Select best end boundary
-    // let end_boundary = select_best_boundary(
-    //     end_candidates,
-    //     Some(start_boundary),
-    //     &template.children,
-    //     index,
-    // );
+    let end_marker_option: Option<&'a PageContent> = Some(selected_end_candidate.content);
 
     let section_content_elements = extract_section_content(
         page_map_view,
@@ -301,6 +386,19 @@ fn match_section<'a, 'map_lt>(
 
     result.metadata = inherited_metadata.clone();
 
+    // Add section-specific metadata
+    if let Some(as_value) = template.attributes.get("as") {
+        result
+            .metadata
+            .insert("section".to_string(), as_value.clone());
+    }
+
+    // Add the section name as well for reference
+    result.metadata.insert(
+        "section_name".to_string(),
+        Value::String(template.name.clone()),
+    );
+
     // Handle child elements
     if !template.children.is_empty() {
         println!(
@@ -311,7 +409,7 @@ fn match_section<'a, 'map_lt>(
         if let Some(child_matches) = align_template_with_content(
             &template.children,
             index,
-            Some(&result.metadata),
+            Some(&result.metadata), // Pass the updated metadata including section info
             Some(&result),
         ) {
             println!("[match_section] Parent '{}' got Some(child_matches) with len: {}. Assigning to result.children.", template.name, child_matches.len());
@@ -341,7 +439,7 @@ fn find_start_boundary_candidates<'a>(
     start_index: usize,
     match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
-) -> Option<Vec<BoundaryCandidate>> {
+) -> Option<Vec<BoundaryCandidate<'a>>> {
     let mut candidates = Vec::new();
 
     println!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
@@ -358,11 +456,7 @@ fn find_start_boundary_candidates<'a>(
 
     for (element, score) in text_candidates {
         candidates.push(score_candidate(
-            element.clone(),
-            index,
-            template,
-            score,
-            prev_match,
+            &element, index, template, score, prev_match,
         ));
     }
 
@@ -415,8 +509,9 @@ fn find_end_boundary_candidates<'a>(
     template: &Element,
     index: &'a PdfIndex,
     children: &[Element],
+    match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
-) -> Option<Vec<BoundaryCandidate>> {
+) -> Option<Vec<BoundaryCandidate<'a>>> {
     println!(
         "[find_end_boundary_candidates] Looking for end for section starting with: {:?}",
         start_content.text()
@@ -427,15 +522,29 @@ fn find_end_boundary_candidates<'a>(
     );
     let mut candidates = Vec::new();
 
+    // Get the start marker's index so we can search after it
+    let start_marker_index = index.element_id_to_index.get(&start_content.id()).copied();
+    println!(
+        "[find_end_boundary_candidates] Start marker index: {:?}",
+        start_marker_index
+    );
+
     // 1. Template-based end markers
     if let Some(end_match_attr) = template.attributes.get("end_match") {
         if let Some(end_str) = end_match_attr.as_string() {
             println!(
-                "[find_end_boundary_candidates] Using end_match attribute: '{}'",
-                end_str
+                "[find_end_boundary_candidates] Using end_match attribute: '{}', threshold: {}",
+                end_str, match_config.threshold
             );
+
+            // Start search after the start marker, not from the beginning of the document
+            let search_start_index = start_marker_index.map(|idx| idx + 1);
+            println!("[find_end_boundary_candidates] Searching for end markers starting from index: {:?}", search_start_index);
+
             let end_text_candidates = index.find_text_matches(
-                &end_str, 0.8, None, // Search from start of document
+                &end_str,
+                match_config.threshold,
+                search_start_index, // Use match_config.threshold instead of hardcoded value
             );
             println!(
                 "[find_end_boundary_candidates] Found {} text candidates for end_match.",
@@ -443,11 +552,7 @@ fn find_end_boundary_candidates<'a>(
             );
             for (element, score) in end_text_candidates {
                 candidates.push(score_candidate(
-                    element.clone(),
-                    index,
-                    template,
-                    score,
-                    prev_match,
+                    &element, index, template, score, prev_match,
                 ));
             }
         } else {
@@ -486,12 +591,12 @@ fn find_end_boundary_candidates<'a>(
 
 /// Scores a potential boundary candidate
 fn score_candidate<'a>(
-    content: PageContent,
+    content: &'a PageContent,
     index: &PdfIndex,
     template: &Element,
     base_score: f64,
     prev_match: Option<&TemplateContentMatch<'a>>,
-) -> BoundaryCandidate {
+) -> BoundaryCandidate<'a> {
     let mut score = base_score as f32;
     let mut reasons = Vec::new();
 
@@ -499,7 +604,7 @@ fn score_candidate<'a>(
     if let Some(prev) = prev_match {
         if let Some(sb) = prev.section_boundaries.as_ref() {
             if let Some(end) = sb.end_marker {
-                match &content {
+                match content {
                     PageContent::Text(text) => {
                         // Check if this candidate comes after the previous section
                         if let Some(idx) = index.element_id_to_index.get(&text.id) {
@@ -517,7 +622,7 @@ fn score_candidate<'a>(
         }
     }
 
-    match &content {
+    match content {
         PageContent::Text(text) => {
             // Font size scoring using statistical analysis
             let stats = index.font_size_stats();
@@ -658,7 +763,7 @@ fn score_candidate<'a>(
 /// Validates if a candidate respects child element positions
 fn validate_child_position<'a>(
     child: &Element,
-    candidate: &BoundaryCandidate,
+    candidate: &BoundaryCandidate<'a>,
     flow: &ContentFlow<'a>,
 ) -> bool {
     // Implement child position validation logic
@@ -667,8 +772,8 @@ fn validate_child_position<'a>(
 }
 
 /// Selects the best boundary from candidates
-fn select_best_boundary(
-    candidates: Vec<BoundaryCandidate>,
+fn select_best_boundary<'a>(
+    candidates: Vec<BoundaryCandidate<'a>>,
     previous_content: Option<&PageContent>,
     children: &[Element],
     index: &PdfIndex,
@@ -680,7 +785,7 @@ fn select_best_boundary(
 
             // Consider content type compatibility
             if let Some(prev) = &previous_content {
-                if content_types_compatible(prev, &candidate.content) {
+                if content_types_compatible(prev, candidate.content) {
                     score += 0.2;
                 }
             }
@@ -692,7 +797,7 @@ fn select_best_boundary(
 
             // Consider document flow
             if let Some(prev) = &previous_content {
-                if maintains_document_flow(prev, &candidate.content, index) {
+                if maintains_document_flow(prev, candidate.content, index) {
                     score += 0.2;
                 }
             }
@@ -700,7 +805,7 @@ fn select_best_boundary(
             (candidate, score)
         })
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
-        .map(|(candidate, _)| candidate.content)
+        .map(|(candidate, _)| candidate.content.clone())
 }
 
 /// Checks if two content types are compatible
@@ -714,7 +819,7 @@ fn content_types_compatible(a: &PageContent, b: &PageContent) -> bool {
 
 /// Checks if a candidate satisfies child element requirements
 fn satisfies_child_requirements<'a>(
-    candidate: &BoundaryCandidate,
+    candidate: &BoundaryCandidate<'a>,
     children: &[Element],
     index: &PdfIndex,
 ) -> bool {
@@ -744,19 +849,33 @@ fn maintains_document_flow<'a>(
     }
 }
 
-/// Matches a TextChunk element in the template with content
-fn match_text_chunk<'a>(
+/// Matches a TextChunk element with explicit content boundaries
+fn match_text_chunk_with_boundaries<'a>(
     template: &'a Element,
     index: &'a PdfIndex,
     inherited_metadata: &HashMap<String, Value>,
-    prev_match: Option<&TemplateContentMatch<'a>>,
-    start_element_index: usize,
+    content_start_idx: usize,
+    content_end_idx: usize,
 ) -> Option<TemplateContentMatch<'a>> {
-    let content_slice = if start_element_index < index.all_ordered_content.len() {
-        &index.all_ordered_content[start_element_index..]
+    println!(
+        "[match_text_chunk_with_boundaries] Template: '{}', boundaries: {} to {}",
+        template.name, content_start_idx, content_end_idx
+    );
+
+    // Extract content slice based on explicit boundaries
+    let content_slice = if content_start_idx < content_end_idx
+        && content_start_idx < index.all_ordered_content.len()
+    {
+        let end_idx = content_end_idx.min(index.all_ordered_content.len());
+        &index.all_ordered_content[content_start_idx..end_idx]
     } else {
         &[]
     };
+
+    println!(
+        "[match_text_chunk_with_boundaries] Processing {} elements",
+        content_slice.len()
+    );
 
     let mut matched_content_for_chunk: Vec<MatchedContent<'a>> = Vec::new();
     let mut has_text_content = false;
@@ -768,16 +887,13 @@ fn match_text_chunk<'a>(
                 has_text_content = true;
             }
             PageContent::Image(_) => {
-                // TextChunk specifically ignores images, so we can add MatchedContent::None
-                // or simply not add anything if the output should only contain text matches.
-                // For now, let's be explicit and add None if we want to represent that an element was seen but skipped.
-                // If TextChunk should *only* ever contain Text, then we don't add anything here.
-                // Let's assume TextChunk only contains Text for now.
+                // TextChunk specifically ignores images
             }
         }
     }
 
     if !has_text_content {
+        println!("[match_text_chunk_with_boundaries] No text content found");
         return None;
     }
 
