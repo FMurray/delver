@@ -1309,6 +1309,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "dashmap",
  "eframe",
  "egui",
  "egui_extras",

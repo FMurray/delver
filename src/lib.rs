@@ -1,6 +1,7 @@
 pub mod chunker;
 pub mod debug_viewer;
 pub mod dom;
+pub mod features;
 pub mod fonts;
 pub mod geo;
 pub mod layout;
@@ -13,9 +14,9 @@ use crate::dom::{parse_template, process_matched_content, ChunkOutput, Processed
 use crate::layout::{group_text_into_lines_and_blocks, TextBlock};
 use crate::matcher::align_template_with_content;
 use crate::parse::{get_page_content, get_refs, PageContent, TextElement};
+use anyhow::Result;
 use lopdf::Document;
 use search_index::PdfIndex;
-use anyhow::Result;
 use std::collections::BTreeMap;
 
 #[cfg(feature = "extension-module")]
@@ -41,15 +42,14 @@ pub fn process_pdf(
     let mut text_pages_map: BTreeMap<u32, Vec<TextElement>> = BTreeMap::new();
     for (page_num, contents) in &pages_map {
         // Extract text elements and collect them
-        let text_elements: Vec<TextElement> = contents.iter()
-            .filter_map(|content| {
-                match content {
-                    PageContent::Text(text_elem) => Some(text_elem.clone()),
-                    _ => None
-                }
+        let text_elements: Vec<TextElement> = contents
+            .iter()
+            .filter_map(|content| match content {
+                PageContent::Text(text_elem) => Some(text_elem.clone()),
+                _ => None,
             })
             .collect();
-            
+
         if !text_elements.is_empty() {
             text_pages_map.insert(*page_num, text_elements);
         }
@@ -57,8 +57,11 @@ pub fn process_pdf(
 
     let line_join_threshold = 5.0;
     let block_join_threshold = 12.0;
-    let blocks =
-        group_text_into_lines_and_blocks(&text_pages_map, line_join_threshold, block_join_threshold);
+    let blocks = group_text_into_lines_and_blocks(
+        &text_pages_map,
+        line_join_threshold,
+        block_join_threshold,
+    );
 
     let match_context = get_refs(&doc)?;
 

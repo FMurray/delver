@@ -1,3 +1,6 @@
+// TODO(step‑2): remove AoS `all_ordered_content` and migrate callers to SoA accessors.
+
+use crate::features::{compute_similarity, TextFeatures};
 use crate::{
     layout::{MatchContext, TextLine},
     parse::{ImageElement, PageContent, TextElement},
@@ -5,6 +8,7 @@ use crate::{
 use lopdf::Object;
 use ordered_float::NotNan;
 use rstar::{RTree, RTreeObject, AABB};
+use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
@@ -28,6 +32,58 @@ impl SpatialPageContent {
         Self { element }
     }
 }
+
+/// Lightweight handle that keeps document order without dragging full payload
+#[derive(Copy, Clone, Debug)]
+pub enum ContentHandle {
+    Text(usize),
+    Image(usize),
+}
+
+/// Column‑oriented storage for text payload.
+#[derive(Debug, Default)]
+pub struct TextStore {
+    pub bbox: Vec<(f32, f32, f32, f32)>,
+    pub font_size: Vec<f32>,
+    pub font_key: Vec<(String, NotNan<f32>)>,
+    pub id: Vec<Uuid>,
+    /// Raw UTF‑8 text (kept for now; may be moved to an arena later)
+    pub text: Vec<String>,
+}
+impl TextStore {
+    #[inline]
+    pub fn push(&mut self, elem: &TextElement) -> usize {
+        let idx = self.id.len();
+        self.bbox.push(elem.bbox);
+        self.font_size.push(elem.font_size);
+        self.font_key.push((
+            crate::fonts::canonicalize::canonicalize_font_name(
+                elem.font_name.as_deref().unwrap_or_default(),
+            ),
+            NotNan::new(elem.font_size).unwrap(),
+        ));
+        self.id.push(elem.id);
+        self.text.push(elem.text.clone());
+        idx
+    }
+}
+
+/// Column‑oriented storage for image payload.
+#[derive(Debug, Default)]
+pub struct ImageStore {
+    pub bbox: Vec<crate::geo::Rect>,
+    pub id: Vec<Uuid>,
+}
+impl ImageStore {
+    #[inline]
+    pub fn push(&mut self, elem: &ImageElement) -> usize {
+        let idx = self.id.len();
+        self.bbox.push(elem.bbox);
+        self.id.push(elem.id);
+        idx
+    }
+}
+// -----------------------------------------------------------------------------
 
 /// Font usage analysis structure
 #[derive(Debug, Clone)]
@@ -64,18 +120,32 @@ pub struct PdfIndex {
     pub reference_count_index: Vec<(u32, usize)>,
     pub spatial_rtree: RTree<SpatialPageContent>,
     pub element_id_to_index: HashMap<Uuid, usize>,
+    pub order: Vec<ContentHandle>, // document sequence (SoA handle)
+    pub text_store: TextStore,     // SoA payload ‑ text
+    pub image_store: ImageStore,   // SoA payload ‑ images
+    // TODO: deprecated – migrate callers to SoA stores
     pub fonts: HashMap<(String, NotNan<f32>), FontUsage>,
     pub font_name_frequency_index: Vec<(u32, String)>,
+    pub font_size_stats: FontSizeStats,
+    pub feature_cache: dashmap::DashMap<Uuid, TextFeatures>,
 }
 
 impl PdfIndex {
     pub fn new(page_map: &BTreeMap<u32, Vec<PageContent>>, _match_context: &MatchContext) -> Self {
+        // SoA stores and ordering vector
+        let mut order: Vec<ContentHandle> =
+            Vec::with_capacity(page_map.values().map(|v| v.len()).sum::<usize>());
+        let mut text_store = TextStore::default();
+        let mut image_store = ImageStore::default();
+
         let mut all_ordered_content = Vec::new();
         let mut by_page = BTreeMap::new();
         let mut font_size_index_construction = Vec::new(); // Temp for construction before sorting
         let mut spatial_elements = Vec::new();
         let mut element_id_to_index = HashMap::new();
         let mut fonts_map: HashMap<(String, NotNan<f32>), FontUsage> = HashMap::new(); // Correctly typed
+        let font_size_stats = FontSizeStats::compute(&all_ordered_content);
+        let feature_cache = dashmap::DashMap::new();
 
         let mut current_content_index = 0;
 
@@ -83,6 +153,19 @@ impl PdfIndex {
             let mut page_element_indices = Vec::new();
 
             for content_item in page_contents_on_page {
+                // Push into columnar stores first (SoA)
+                match content_item {
+                    PageContent::Text(t) => {
+                        let idx_txt = text_store.push(t);
+                        order.push(ContentHandle::Text(idx_txt));
+                    }
+                    PageContent::Image(img) => {
+                        let idx_img = image_store.push(img);
+                        order.push(ContentHandle::Image(idx_img));
+                    }
+                }
+
+                // Temporary: keep AoS push for legacy code – will be removed later.
                 all_ordered_content.push(content_item.clone());
                 page_element_indices.push(current_content_index);
                 element_id_to_index.insert(content_item.id(), current_content_index);
@@ -142,17 +225,14 @@ impl PdfIndex {
             reference_count_index,
             spatial_rtree,
             element_id_to_index,
+            order,
+            text_store,
+            image_store,
             fonts: fonts_map, // Use the correctly populated map
             font_name_frequency_index,
+            font_size_stats,
+            feature_cache,
         }
-    }
-
-    /// Sort the font frequency index
-    fn sort_font_frequency_index(&mut self) {
-        self.font_name_frequency_index.sort_by(|a, b| {
-            // Sort by frequency (descending)
-            b.0.cmp(&a.0)
-        });
     }
 
     /// Update reference counts based on destinations in MatchContext
@@ -479,6 +559,115 @@ impl PdfIndex {
         }
     }
 
+    /// Return the top‑k most similar text elements to `seed` between [start_idx, end_idx).
+    /// Similarity is computed via `features::compute_similarity`.
+    pub fn top_k_similar_text<'a>(
+        &'a self,
+        seed: &'a TextElement,
+        start_idx: usize,
+        end_idx: usize,
+        k: usize,
+    ) -> Vec<(&'a PageContent, f32)> {
+        {
+            if start_idx >= end_idx || start_idx >= self.doc_len() {
+                return Vec::new();
+            }
+            let end_idx = end_idx.min(self.doc_len());
+
+            // --- Seed feature -----------------------------------------------------
+            let seed_feat = match TextFeatures::from_text_element(seed, self) {
+                Some(f) => f,
+                None => return Vec::new(),
+            };
+            let canonical_name = crate::fonts::canonicalize::canonicalize_font_name(
+                seed.font_name.as_deref().unwrap_or_default(),
+            );
+            let seed_size = seed.font_size;
+            const SIZE_TOLERANCE: f32 = 0.6;
+
+            // --- Gather candidate indices by font bucket --------------------------
+            let mut candidate_indices: Vec<usize> = Vec::new();
+            for ((name, nn_size), usage) in &self.fonts {
+                if name != &canonical_name {
+                    continue;
+                }
+                if (nn_size.into_inner() - seed_size).abs() <= SIZE_TOLERANCE {
+                    candidate_indices.extend(&usage.elements);
+                }
+            }
+
+            // Optional: if we found too few, fall back to neighbour pages
+            if candidate_indices.is_empty() {
+                // Fallback to full slice (rare)
+                candidate_indices.extend(
+                    (start_idx..end_idx)
+                        .filter(|idx| matches!(self.content_at(*idx), Some(PageContent::Text(_)))),
+                );
+            }
+
+            // --- Similarity heap --------------------------------------------------
+            let mut heap: BinaryHeap<(std::cmp::Reverse<NotNan<f32>>, usize)> =
+                BinaryHeap::with_capacity(k);
+
+            for &abs_idx in &candidate_indices {
+                // Respect section bounds
+                if abs_idx < start_idx || abs_idx >= end_idx {
+                    continue;
+                }
+                if let Some(PageContent::Text(txt)) = self.content_at(abs_idx) {
+                    if txt.id == seed.id {
+                        continue; // skip self
+                    }
+                    let feat = match TextFeatures::from_text_element(txt, self) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    let sim = compute_similarity(&seed_feat, &feat);
+                    let sim_notnan = match NotNan::new(sim) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if heap.len() < k {
+                        heap.push((std::cmp::Reverse(sim_notnan), abs_idx));
+                    } else if let Some(&(std::cmp::Reverse(lowest), _)) = heap.peek() {
+                        if sim_notnan.into_inner() > lowest.into_inner() {
+                            heap.pop();
+                            heap.push((std::cmp::Reverse(sim_notnan), abs_idx));
+                        }
+                    }
+                }
+            }
+
+            // Collect and sort descending
+            let mut results: Vec<(&PageContent, f32)> = heap
+                .into_iter()
+                .map(|(std::cmp::Reverse(sim), abs_idx)| {
+                    (self.content_at(abs_idx).unwrap(), sim.into_inner())
+                })
+                .collect();
+            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            results
+        }
+    }
+
+    /// Total number of sequential content items in document order
+    #[inline]
+    pub fn doc_len(&self) -> usize {
+        self.all_ordered_content.len()
+    }
+
+    /// Get a single content item by its sequential document index
+    #[inline]
+    pub fn content_at(&self, idx: usize) -> Option<&PageContent> {
+        self.all_ordered_content.get(idx)
+    }
+
+    /// Borrow a slice of content by sequential indices
+    #[inline]
+    pub fn content_slice(&self, start: usize, end: usize) -> &[PageContent] {
+        &self.all_ordered_content[start..end]
+    }
+
     /// Find elements with a specific font and size range
     ///
     /// # Arguments
@@ -509,8 +698,18 @@ impl PdfIndex {
             }
         };
 
-        let min_s = min_size_overall.unwrap_or(avg_font_size_for_default * 0.9);
-        let max_s = max_size_overall.unwrap_or(avg_font_size_for_default * 1.1);
+        // Only apply overall size filters if no specific target size is provided
+        let use_overall_size_filters = target_font_size.is_none();
+        let min_s = if use_overall_size_filters {
+            min_size_overall.unwrap_or(avg_font_size_for_default * 0.9)
+        } else {
+            0.0 // Don't filter if we have a specific target
+        };
+        let max_s = if use_overall_size_filters {
+            max_size_overall.unwrap_or(avg_font_size_for_default * 1.1)
+        } else {
+            f32::MAX // Don't filter if we have a specific target
+        };
 
         for ((name, nn_size), usage_data) in &self.fonts {
             let style_size = nn_size.into_inner();
@@ -529,100 +728,149 @@ impl PdfIndex {
             .collect()
     }
 
-    /// Find potential heading levels based on font analysis
-    pub fn identify_heading_levels(&self, max_levels: usize) -> Vec<((String, f32), u32)> {
-        // Calculate a more robust average font size, less skewed by unique large titles.
-        let mut sizes_for_avg_calc: Vec<f32> = Vec::new();
-        for ((_font_name, nn_font_size), usage_data) in &self.fonts {
-            // Include font sizes that appear more than once, or if they are not excessively large
-            // This is a heuristic to try and get a more representative "body/common" text average.
-            let style_size = nn_font_size.into_inner();
-            if usage_data.total_usage > 1 {
-                // If used more than once, include it
-                for _ in 0..usage_data.total_usage {
-                    // Weight by usage for average
-                    sizes_for_avg_calc.push(style_size);
-                }
-            } else {
-                // If used once, only include if it's not extremely large (e.g., > 30pt, assuming titles are often >30pt)
-                // This threshold (30.0) is arbitrary and might need tuning.
-                if style_size <= 30.0 {
-                    sizes_for_avg_calc.push(style_size);
+    /// Get font usage distribution, optionally scoped to a range of content indices
+    pub fn get_font_usage_distribution(
+        &self,
+        start_index: Option<usize>,
+        end_index: Option<usize>,
+    ) -> HashMap<(String, NotNan<f32>), FontUsage> {
+        let start = start_index.unwrap_or(0);
+        let end = end_index.unwrap_or(self.all_ordered_content.len());
+
+        let mut scoped_fonts: HashMap<(String, NotNan<f32>), FontUsage> = HashMap::new();
+
+        // If no scoping, return the full index
+        if start == 0 && end == self.all_ordered_content.len() {
+            return self.fonts.clone();
+        }
+
+        // Otherwise, build scoped font usage
+        for (idx, content) in self.all_ordered_content.iter().enumerate() {
+            if idx >= start && idx < end {
+                if let PageContent::Text(text_elem) = content {
+                    let canonical_font_name = crate::fonts::canonicalize::canonicalize_font_name(
+                        text_elem.font_name.as_deref().unwrap_or_default(),
+                    );
+
+                    let font_style_key = (
+                        canonical_font_name.clone(),
+                        NotNan::new(text_elem.font_size).unwrap(),
+                    );
+
+                    let font_entry = scoped_fonts.entry(font_style_key).or_insert_with(|| {
+                        FontUsage::new(
+                            canonical_font_name,
+                            text_elem.font_name.clone(),
+                            text_elem.font_size,
+                        )
+                    });
+                    font_entry.add_usage(idx);
                 }
             }
         }
 
-        let avg_font_size: f32 = if sizes_for_avg_calc.is_empty() {
-            12.0 // Default if no suitable sizes found for averaging
-        } else {
-            sizes_for_avg_calc.iter().sum::<f32>() / sizes_for_avg_calc.len() as f32
-        };
-        println!(
-            "[identify_heading_levels] Calculated avg_font_size (robust): {}",
-            avg_font_size
-        );
-
-        let mut candidates = Vec::new();
-        for ((font_name, nn_font_size), usage_data) in &self.fonts {
-            let current_style_font_size = nn_font_size.into_inner();
-
-            let text_elements_count = self
-                .all_ordered_content
-                .iter()
-                .filter(|e| e.is_text())
-                .count() as u32;
-            let min_abs_usage = 2; // Must appear at least twice
-                                   // Max 20% of text elements for a heading style, but ensure threshold is at least 1 if count > 0
-            let max_rel_usage_threshold = if text_elements_count > 0 {
-                std::cmp::max(1, text_elements_count / 5)
-            } else {
-                0
-            };
-
-            println!("[identify_heading_levels] Checking style: ({}, {}), usage: {}, avg_fs: {}, text_count: {}, max_rel_thresh: {}", 
-                font_name, current_style_font_size, usage_data.total_usage, avg_font_size, text_elements_count, max_rel_usage_threshold);
-
-            if usage_data.total_usage >= min_abs_usage
-                && (max_rel_usage_threshold == 0
-                    || usage_data.total_usage <= max_rel_usage_threshold)
-                && current_style_font_size > avg_font_size * 1.1
-            // Adjusted factor to 1.1
-            {
-                println!("    -> Candidate ACCEPTED");
-                candidates.push((
-                    (font_name.clone(), current_style_font_size),
-                    usage_data.total_usage,
-                ));
-            } else {
-                println!(
-                    "    -> Candidate REJECTED (usage: {}, size_check: {}, rel_usage_check: {})",
-                    usage_data.total_usage >= min_abs_usage,
-                    current_style_font_size > avg_font_size * 1.1,
-                    (max_rel_usage_threshold == 0
-                        || usage_data.total_usage <= max_rel_usage_threshold)
-                );
-            }
-        }
-        candidates.sort_by(|a, b| {
-            b.0 .1
-                .partial_cmp(&a.0 .1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.1.cmp(&a.1))
-        });
-        candidates.into_iter().take(max_levels).collect()
+        scoped_fonts
     }
 
-    /// Find elements that might be at a specific heading level
-    pub fn find_elements_at_heading_level(&self, level: usize) -> Vec<&PageContent> {
-        let heading_levels = self.identify_heading_levels(level + 1);
+    /// Get font size statistics (mean, std dev) for a given scope
+    pub fn get_font_size_stats(
+        &self,
+        start_index: Option<usize>,
+        end_index: Option<usize>,
+    ) -> (f32, f32) {
+        let start = start_index.unwrap_or(0);
+        let end = end_index.unwrap_or(self.all_ordered_content.len());
 
-        if level >= heading_levels.len() {
-            return Vec::new();
+        let font_sizes: Vec<f32> = self.all_ordered_content[start..end]
+            .iter()
+            .filter_map(|e| e.as_text().map(|t| t.font_size))
+            .collect();
+
+        if font_sizes.is_empty() {
+            return (12.0, 0.0); // Default mean, no deviation
         }
 
-        let ((font_name, font_size), _usage_count) = &heading_levels[level];
+        let mean = font_sizes.iter().sum::<f32>() / font_sizes.len() as f32;
+        let variance = font_sizes
+            .iter()
+            .map(|&size| (size - mean).powi(2))
+            .sum::<f32>()
+            / font_sizes.len() as f32;
+        let std_dev = variance.sqrt();
 
-        self.elements_by_font(Some(font_name), Some(*font_size), None, None)
+        (mean, std_dev)
+    }
+
+    /// Find fonts by z-score threshold (how many standard deviations above/below mean)
+    pub fn find_fonts_by_z_score(
+        &self,
+        min_z_score: f32,
+        start_index: Option<usize>,
+        end_index: Option<usize>,
+    ) -> Vec<((String, f32), u32, f32)> {
+        let (mean, std_dev) = self.get_font_size_stats(start_index, end_index);
+        let fonts_map = self.get_font_usage_distribution(start_index, end_index);
+
+        fonts_map
+            .into_iter()
+            .filter_map(|((font_name, nn_font_size), usage_data)| {
+                let font_size = nn_font_size.into_inner();
+                let z_score = if std_dev > 0.0 {
+                    (font_size - mean) / std_dev
+                } else {
+                    0.0
+                };
+
+                if z_score >= min_z_score {
+                    Some(((font_name, font_size), usage_data.total_usage, z_score))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Find fonts by usage frequency range
+    pub fn find_fonts_by_usage_range(
+        &self,
+        min_usage: u32,
+        max_usage: Option<u32>,
+        start_index: Option<usize>,
+        end_index: Option<usize>,
+    ) -> Vec<((String, f32), u32)> {
+        let fonts_map = self.get_font_usage_distribution(start_index, end_index);
+
+        fonts_map
+            .into_iter()
+            .filter_map(|((font_name, nn_font_size), usage_data)| {
+                let font_size = nn_font_size.into_inner();
+                let usage = usage_data.total_usage;
+
+                let meets_min = usage >= min_usage;
+                let meets_max = max_usage.map_or(true, |max| usage <= max);
+
+                if meets_min && meets_max {
+                    Some(((font_name, font_size), usage))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get total text element count in scope
+    pub fn get_text_element_count(
+        &self,
+        start_index: Option<usize>,
+        end_index: Option<usize>,
+    ) -> u32 {
+        let start = start_index.unwrap_or(0);
+        let end = end_index.unwrap_or(self.all_ordered_content.len());
+
+        self.all_ordered_content[start..end]
+            .iter()
+            .filter(|e| e.is_text())
+            .count() as u32
     }
 
     /// Get elements between two marker elements using sequential ordering
@@ -809,6 +1057,17 @@ impl PdfIndex {
             .filter(|e| e.as_text().map_or(false, |t| t.font_size >= threshold))
             .collect()
     }
+
+    #[inline]
+    pub fn features_for<'a>(&'a self, txt: &'a TextElement) -> TextFeatures {
+        if let Some(f) = self.feature_cache.get(&txt.id) {
+            return f.clone();
+        }
+        let feat = TextFeatures::from_text_element(txt, self)
+            .expect("feature extraction should never fail");
+        self.feature_cache.insert(txt.id, feat.clone());
+        feat
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -816,4 +1075,30 @@ pub struct FontSizeStats {
     pub mean: f32,
     pub std_dev: f32,
     pub percentiles: [f32; 5], // [25th, 50th, 75th, 90th, 95th]
+}
+
+impl FontSizeStats {
+    pub fn compute(content: &[PageContent]) -> Self {
+        let mut sizes: Vec<f32> = content
+            .iter()
+            .filter_map(|e| e.as_text().map(|t| t.font_size))
+            .collect();
+        if sizes.is_empty() {
+            return FontSizeStats {
+                mean: 12.0,
+                std_dev: 0.0,
+                percentiles: [12.0; 5],
+            };
+        }
+        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = sizes.iter().sum::<f32>() / sizes.len() as f32;
+        let var = sizes.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / sizes.len() as f32;
+        let sd = var.sqrt();
+        let idx = |p: f32| sizes[((sizes.len() as f32) * p) as usize];
+        FontSizeStats {
+            mean,
+            std_dev: sd,
+            percentiles: [idx(0.25), idx(0.50), idx(0.75), idx(0.90), idx(0.95)],
+        }
+    }
 }

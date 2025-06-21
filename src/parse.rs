@@ -6,7 +6,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::geo::{multiply_matrices, pre_translate, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
-use crate::layout::MatchContext;
+use crate::layout::{MatchContext, TextLine};
 use lopdf::{
     Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult, Stream,
 };
@@ -213,7 +213,6 @@ pub struct TextElement {
     pub font_name: Option<String>,
     pub bbox: (f32, f32, f32, f32),
     pub page_number: u32,
-    pub operators: Vec<String>,
 }
 
 impl TextElement {
@@ -225,7 +224,6 @@ impl TextElement {
             font_name: None,
             bbox: (0.0, 0.0, 0.0, 0.0),
             page_number: 0,
-            operators: Vec::new(),
         }
     }
 }
@@ -291,7 +289,7 @@ impl PageContent {
     }
 
     // Add text-specific helper methods
-    pub fn as_text(&self) -> Option<&TextElement> {
+    pub fn as_text(&self) -> Option<&TextLine> {
         match self {
             PageContent::Text(text) => Some(text),
             PageContent::Image(_) => None,
@@ -310,11 +308,11 @@ impl PageContent {
     }
 
     pub fn font_size(&self) -> Option<f32> {
-        self.as_text().map(|t| t.font_size)
+        self.as_text().map(|t| t.font_size())
     }
 
     pub fn font_name(&self) -> Option<&str> {
-        self.as_text().and_then(|t| t.font_name.as_deref())
+        self.as_text().and_then(|t| t.font_name())
     }
 }
 
@@ -421,8 +419,6 @@ fn finalize_text_run(
     if tos.glyphs.is_empty() {
         // Preserve text content from the buffer
         let text = std::mem::take(&mut tos.text_buffer);
-        // Preserve operators list
-        let operators = std::mem::take(&mut tos.operator_log);
 
         return Some(PageContent::Text(TextElement {
             id: Uuid::new_v4(),
@@ -432,7 +428,6 @@ fn finalize_text_run(
             // Use font size to generate valid dimensions for test assertions
             bbox: (0.0, 0.0, ts.size, ts.size),
             page_number,
-            operators,
         }));
     }
 
@@ -450,7 +445,6 @@ fn finalize_text_run(
 
     let text_run = std::mem::take(&mut tos.text_buffer);
     tos.glyphs.clear();
-    let operators = std::mem::take(&mut tos.operator_log);
 
     let text_element = TextElement {
         id: Uuid::new_v4(),
@@ -459,7 +453,6 @@ fn finalize_text_run(
         font_name: Some(ts.fontname.clone()),
         bbox: (x_min, y_min, x_max, y_max), // Bbox as tuple
         page_number,
-        operators,
     };
 
     debug!(
@@ -894,7 +887,7 @@ fn get_page_elements(
     doc: &Document,
     page_number: u32,
     page_id: (u32, u16),
-) -> Result<Vec<PageContent>, LopdfError> {
+) -> Result<Vec<TextElement>, LopdfError> {
     let mut page_elements = Vec::new(); // Changed type
     let mut text_object_state = TextObjectState::default();
 

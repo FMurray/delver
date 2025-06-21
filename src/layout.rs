@@ -1,9 +1,10 @@
+use crate::parse::{PageContent, TextElement};
 use indexmap::IndexMap;
 use lopdf::Object;
+
 use std::collections::BTreeMap;
-use uuid::Uuid;
 use std::fmt::Debug;
-use crate::parse::TextElement;
+use uuid::Uuid;
 
 // Add this struct at the module level
 #[derive(Debug, Default)]
@@ -68,6 +69,37 @@ impl TextLine {
     /// Get the first element in this line
     pub fn first_element(&self) -> Option<&TextElement> {
         self.elements.first()
+    }
+
+    /// Get the font name for this line (from the first element)
+    /// Since lines are now split by font changes, all elements should have the same font
+    pub fn font_name(&self) -> Option<&str> {
+        self.elements
+            .first()
+            .and_then(|elem| elem.font_name.as_deref())
+    }
+
+    /// Get the font size for this line (from the first element)
+    /// Since lines are now split by font changes, all elements should have the same font size
+    pub fn font_size(&self) -> f32 {
+        self.elements
+            .first()
+            .map(|elem| elem.font_size)
+            .unwrap_or(0.0)
+    }
+
+    /// Check if all elements in this line have the same font metadata
+    pub fn has_consistent_font(&self) -> bool {
+        if self.elements.len() <= 1 {
+            return true;
+        }
+
+        let first_font_name = &self.elements[0].font_name;
+        let first_font_size = self.elements[0].font_size;
+
+        self.elements.iter().skip(1).all(|elem| {
+            elem.font_name == *first_font_name && (elem.font_size - first_font_size).abs() < 0.1
+        })
     }
 }
 
@@ -151,18 +183,34 @@ pub fn group_text_into_lines_and_blocks(
         let mut current_line = Vec::new();
 
         let mut last_y = f32::MAX;
+        let mut last_font_name: Option<String> = None;
+        let mut last_font_size: Option<f32> = None;
 
         for elem in elements {
+            let current_font_name = elem.font_name.clone();
+            let current_font_size = Some(elem.font_size);
+
             if current_line.is_empty() {
                 current_line.push(elem.clone());
                 last_y = elem.bbox.1;
+                last_font_name = current_font_name;
+                last_font_size = current_font_size;
             } else {
-                if (last_y - elem.bbox.1).abs() < line_join_threshold {
+                let y_close = (last_y - elem.bbox.1).abs() < line_join_threshold;
+                let font_matches = last_font_name == current_font_name
+                    && last_font_size.map_or(false, |last_size| {
+                        current_font_size
+                            .map_or(false, |curr_size| (last_size - curr_size).abs() < 0.1)
+                    });
+
+                if y_close && font_matches {
                     current_line.push(elem.clone());
                 } else {
                     lines.push(TextLine::from_elements(*page_number, current_line));
                     current_line = vec![elem.clone()];
                     last_y = elem.bbox.1;
+                    last_font_name = current_font_name;
+                    last_font_size = current_font_size;
                 }
             }
         }
@@ -228,8 +276,6 @@ pub fn group_text_into_lines(
     text_elements: &Vec<TextElement>,
     line_join_threshold: f32,
 ) -> Vec<TextLine> {
-    let all_lines = Vec::new();
-
     let mut elements = text_elements.clone();
     elements.sort_by(|a, b| {
         b.bbox
@@ -247,13 +293,26 @@ pub fn group_text_into_lines(
     let mut lines = Vec::new();
     let mut current_line = Vec::new();
     let mut last_y = f32::MAX;
+    let mut last_font_name: Option<String> = None;
+    let mut last_font_size: Option<f32> = None;
 
     for elem in elements {
+        let current_font_name = elem.font_name.clone();
+        let current_font_size = Some(elem.font_size);
+
         if current_line.is_empty() {
             current_line.push(elem.clone());
             last_y = elem.bbox.1;
+            last_font_name = current_font_name;
+            last_font_size = current_font_size;
         } else {
-            if (last_y - elem.bbox.1).abs() < line_join_threshold {
+            let y_close = (last_y - elem.bbox.1).abs() < line_join_threshold;
+            let font_matches = last_font_name == current_font_name
+                && last_font_size.map_or(false, |last_size| {
+                    current_font_size.map_or(false, |curr_size| (last_size - curr_size).abs() < 0.1)
+                });
+
+            if y_close && font_matches {
                 current_line.push(elem.clone());
             } else {
                 if let Some(first_elem) = current_line.first() {
@@ -262,6 +321,8 @@ pub fn group_text_into_lines(
                 }
                 current_line = vec![elem.clone()];
                 last_y = elem.bbox.1;
+                last_font_name = current_font_name;
+                last_font_size = current_font_size;
             }
         }
     }
@@ -283,5 +344,151 @@ pub fn group_text_into_lines(
         });
     }
 
-    all_lines
+    lines
+}
+
+// FontUsage struct is now in search_index.rs
+
+/// Analyze the font usage patterns in a document to identify potential heading levels
+/// Uses the PdfIndex for efficient font usage analysis
+pub fn identify_heading_levels(
+    index: &crate::search_index::PdfIndex,
+    max_levels: usize,
+    start_index: Option<usize>,
+    end_index: Option<usize>,
+) -> Vec<((String, f32), u32)> {
+    // Get font statistics for the scope
+    let (mean, std_dev) = index.get_font_size_stats(start_index, end_index);
+    let text_element_count = index.get_text_element_count(start_index, end_index);
+
+    println!(
+        "[identify_heading_levels] Calculated avg_font_size: {}, std_dev: {}",
+        mean, std_dev
+    );
+
+    // Find fonts with moderate z-scores (not extreme outliers like titles)
+    // but above average (potential headings)
+    let font_candidates = index.find_fonts_by_z_score(0.1, start_index, end_index); // 0.1 std devs above mean
+
+    let mut candidates = Vec::new();
+
+    for ((font_name, font_size), usage_count, z_score) in font_candidates {
+        // Criteria for heading detection:
+        // 1. Must appear multiple times (not unique like titles)
+        let min_abs_usage = 2;
+        // 2. Must not be too frequent (not more than 50% of text elements)
+        let max_rel_usage_threshold = if text_element_count > 0 {
+            std::cmp::max(2, text_element_count / 2)
+        } else {
+            0
+        };
+
+        println!("[identify_heading_levels] Checking style: ({}, {}), usage: {}, z_score: {:.2}, text_count: {}, max_rel_thresh: {}", 
+            font_name, font_size, usage_count, z_score, text_element_count, max_rel_usage_threshold);
+
+        // Check if this font/size combination could be a heading:
+        if usage_count >= min_abs_usage
+            && (max_rel_usage_threshold == 0 || usage_count <= max_rel_usage_threshold)
+            && z_score > 0.0
+        // Must be above average
+        {
+            println!("    -> Candidate ACCEPTED");
+            candidates.push(((font_name, font_size), usage_count));
+        } else {
+            println!(
+                "    -> Candidate REJECTED (usage: {}, z_score_check: {}, rel_usage_check: {})",
+                usage_count >= min_abs_usage,
+                z_score > 0.0,
+                (max_rel_usage_threshold == 0 || usage_count <= max_rel_usage_threshold)
+            );
+        }
+    }
+
+    // Sort by font size (descending) then by usage count (descending)
+    candidates.sort_by(|a, b| {
+        b.0 .1
+            .partial_cmp(&a.0 .1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.1.cmp(&a.1))
+    });
+
+    candidates.into_iter().take(max_levels).collect()
+}
+
+/// Find elements in the document that match a specific font and size
+pub fn find_elements_by_font(
+    pages_map: &BTreeMap<u32, Vec<PageContent>>,
+    font_name_filter: Option<&str>,
+    target_font_size: Option<f32>,
+) -> Vec<PageContent> {
+    pages_map
+        .values()
+        .flat_map(|page_contents| page_contents.iter())
+        .filter_map(|content| match content {
+            PageContent::Text(text_elem) => {
+                let canonical_font_name = crate::fonts::canonicalize::canonicalize_font_name(
+                    text_elem.font_name.as_deref().unwrap_or_default(),
+                );
+
+                let name_matches =
+                    font_name_filter.map_or(true, |fname| canonical_font_name == fname);
+                let size_matches = target_font_size
+                    .map_or(true, |tsize| (text_elem.font_size - tsize).abs() < 0.1);
+
+                if name_matches && size_matches {
+                    Some(content.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Find elements that are likely to be at a specific heading level using PdfIndex
+pub fn find_elements_at_heading_level(
+    index: &crate::search_index::PdfIndex,
+    level: usize,
+    start_index: Option<usize>,
+    end_index: Option<usize>,
+) -> Vec<&PageContent> {
+    let heading_levels = identify_heading_levels(index, level + 1, start_index, end_index);
+
+    if level >= heading_levels.len() {
+        return Vec::new();
+    }
+
+    let ((font_name, font_size), _usage_count) = &heading_levels[level];
+
+    // Get elements by font and filter by scope if needed
+    let elements = index.elements_by_font(Some(font_name), Some(*font_size), None, None);
+
+    if let (Some(start), Some(end)) = (start_index, end_index) {
+        elements
+            .into_iter()
+            .filter(|elem| {
+                if let Some(&idx) = index.element_id_to_index.get(&elem.id()) {
+                    idx >= start && idx < end
+                } else {
+                    false
+                }
+            })
+            .collect()
+    } else {
+        elements
+    }
+}
+
+/// Convenience function that creates a temporary index for backward compatibility
+pub fn find_elements_at_heading_level_from_pages(
+    pages_map: &BTreeMap<u32, Vec<PageContent>>,
+    level: usize,
+) -> Vec<PageContent> {
+    let match_context = MatchContext::default();
+    let index = crate::search_index::PdfIndex::new(pages_map, &match_context);
+    find_elements_at_heading_level(&index, level, None, None)
+        .into_iter()
+        .cloned()
+        .collect()
 }

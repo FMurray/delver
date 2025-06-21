@@ -1,4 +1,5 @@
 use crate::dom::{Element, ElementType, MatchConfig, MatchType, Value};
+use crate::features::{compute_similarity, TextFeatures};
 use crate::layout::{group_text_into_lines, TextBlock, TextLine};
 use crate::logging::TEMPLATE_MATCH;
 use crate::parse::{ImageElement, PageContent, TextElement};
@@ -105,7 +106,7 @@ pub fn align_template_with_content<'a>(
     for (page_num, element_indices) in index.by_page.iter() {
         let mut page_elements: Vec<&'a PageContent> = Vec::new();
         for &idx in element_indices {
-            if let Some(element) = index.all_ordered_content.get(idx) {
+            if let Some(element) = index.content_at(idx) {
                 page_elements.push(element);
             }
         }
@@ -129,7 +130,7 @@ pub fn align_template_with_content<'a>(
                 let end_idx = section_boundaries
                     .end_marker
                     .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
-                    .unwrap_or(index.all_ordered_content.len());
+                    .unwrap_or(index.doc_len());
 
                 println!(
                     "MATCHER: Processing children within section boundaries {} to {}",
@@ -139,10 +140,10 @@ pub fn align_template_with_content<'a>(
             } else {
                 // Sibling elements start after previous match
                 let sibling_start = get_next_match_index(Some(context_match), index);
-                (sibling_start, index.all_ordered_content.len())
+                (sibling_start, index.doc_len())
             }
         } else {
-            (0, index.all_ordered_content.len())
+            (0, index.doc_len())
         };
 
     // TWO-PASS ALGORITHM:
@@ -505,7 +506,7 @@ fn find_start_boundary_candidates<'a>(
 /// Finds potential end boundary candidates
 /// Returns a list of candidates sorted by score
 fn find_end_boundary_candidates<'a>(
-    start_content: &PageContent,
+    start_content: &'a PageContent,
     template: &Element,
     index: &'a PdfIndex,
     children: &[Element],
@@ -575,6 +576,54 @@ fn find_end_boundary_candidates<'a>(
     // 3. Filter based on child elements (Currently Commented Out)
     // println!("[find_end_boundary_candidates] Validating boundary candidates based on children...");
     // candidates = validate_boundary_candidates(&candidates, children, index);
+
+    // --- Structural similarity driven candidates ---------------------------
+    // Pull top‑k (e.g., 5) similar text elements after the start marker up to the max boundary.
+    const K_SIMILAR: usize = 5;
+    if let PageContent::Text(start_text) = start_content {
+        if let Some(start_idx) = index.element_id_to_index.get(&start_text.id).copied() {
+            // Determine search boundary based on previous match section boundaries
+            let max_content_boundary = if let Some(prev) = prev_match {
+                if let Some(boundaries) = &prev.section_boundaries {
+                    boundaries
+                        .end_marker
+                        .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
+                        .unwrap_or(index.doc_len())
+                } else {
+                    index.doc_len()
+                }
+            } else {
+                index.doc_len()
+            };
+
+            println!(
+                "[find_end_boundary_candidates] Max content boundary: {}",
+                max_content_boundary
+            );
+
+            let similar = index.top_k_similar_text(
+                start_text,
+                start_idx + 1,        // search after the start marker
+                max_content_boundary, // bounded by previous section boundaries
+                K_SIMILAR,
+            );
+            for (pc, sim) in similar {
+                // Avoid duplicates – if already present, just update its score
+                if let Some(existing) = candidates.iter_mut().find(|c| c.content.id() == pc.id()) {
+                    existing.score += 0.5 * sim; // stronger weight for direct similarity
+                    existing
+                        .reasons
+                        .push(format!("Top‑k similarity {:.2}", sim));
+                } else {
+                    candidates.push(BoundaryCandidate {
+                        content: pc,
+                        score: 0.5 * sim, // base score from similarity
+                        reasons: vec![format!("Top‑k similarity {:.2}", sim)],
+                    });
+                }
+            }
+        }
+    }
 
     if candidates.is_empty() {
         println!("[find_end_boundary_candidates] No end candidates found. Returning None.");
@@ -863,14 +912,13 @@ fn match_text_chunk_with_boundaries<'a>(
     );
 
     // Extract content slice based on explicit boundaries
-    let content_slice = if content_start_idx < content_end_idx
-        && content_start_idx < index.all_ordered_content.len()
-    {
-        let end_idx = content_end_idx.min(index.all_ordered_content.len());
-        &index.all_ordered_content[content_start_idx..end_idx]
-    } else {
-        &[]
-    };
+    let content_slice =
+        if content_start_idx < content_end_idx && content_start_idx < index.doc_len() {
+            let end_idx = content_end_idx.min(index.doc_len());
+            index.content_slice(content_start_idx, end_idx)
+        } else {
+            &[]
+        };
 
     println!(
         "[match_text_chunk_with_boundaries] Processing {} elements",
@@ -1166,29 +1214,4 @@ fn get_next_match_index<'a>(
             })
             .map_or(0, |idx| idx + 1)
     }
-}
-
-/// Gets the next image index to start matching from
-fn get_next_image_index<'a>(
-    prev_match: Option<&TemplateContentMatch<'a>>,
-    index: &'a PdfIndex,
-) -> usize {
-    let Some(prev) = prev_match else { return 0 };
-
-    prev.matched_content
-        .iter()
-        .filter_map(|content| {
-            if let MatchedContent::Image(img_elem_ref) = content {
-                // Now use element_id_to_index as image_id_to_index was removed from PdfIndex
-                // and all_ordered_content is indexed by element_id_to_index.
-                // We need the ID of the PageContent::Image that contains this ImageElement
-                // This requires a bit of a search or a change in how MatchedContent::Image stores info.
-                // For now, assuming MatchedContent::Image still gives direct ImageElement & its ID is the PageContent ID.
-                index.element_id_to_index.get(&img_elem_ref.id).copied()
-            } else {
-                None
-            }
-        })
-        .last() // Get the last image found in the previous match
-        .map_or(0, |idx| idx + 1) // Start after it, or from 0 if no image was found
 }
