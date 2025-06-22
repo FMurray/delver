@@ -310,4 +310,121 @@ mod collation_flow_tests {
             &doc
         );
     }
+
+    #[test]
+    fn test_multi_page_chunking_preserves_page_numbers() {
+        use delver_pdf::dom::process_matched_content;
+        
+        // Build multi-page document content
+        let mut doc = DocumentBuilder::new();
+        
+        // Page 1 content
+        let page1_text1_id = doc.add_text(1, "Page one first paragraph with some content.", 12.0, 50.0, 700.0);
+        let page1_text2_id = doc.add_text(1, "Page one second paragraph continues here.", 12.0, 50.0, 680.0);
+        
+        // Page 2 content  
+        let page2_text1_id = doc.add_text(2, "Page two first paragraph with different content.", 12.0, 50.0, 700.0);
+        let page2_text2_id = doc.add_text(2, "Page two second paragraph also continues here.", 12.0, 50.0, 680.0);
+        
+        // Page 3 content
+        let page3_text1_id = doc.add_text(3, "Page three first paragraph with more content.", 12.0, 50.0, 700.0);
+        let page3_text2_id = doc.add_text(3, "Page three second paragraph concludes the document.", 12.0, 50.0, 680.0);
+        
+        let index = doc.build();
+
+        // Build template with a single large textchunk that should span multiple pages
+        let template = TemplateBuilder::new()
+            .add_textchunk("MultiPageChunk", 100, 20) // Small chunk size to force multiple chunks
+            .build();
+
+        // Execute matching
+        let results = align_template_with_content(&template, &index, None, None)
+            .expect("Should find textchunk match");
+
+        // Verify we found the textchunk
+        assert_eq!(results.len(), 1, "Should find one textchunk match");
+        let textchunk_match = &results[0];
+        assert_eq!(textchunk_match.template_element.name, "MultiPageChunk");
+
+        // Process the matched content to generate actual chunks with metadata
+        let processed_outputs = process_matched_content(&results);
+        
+        // Verify we have multiple chunks (due to small chunk size)
+        assert!(processed_outputs.len() > 1, "Should create multiple chunks due to small chunk size");
+        
+        // Extract all page numbers that appear in chunk metadata
+        let mut all_chunk_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut chunk_details = Vec::new();
+        
+        for output in &processed_outputs {
+            if let delver_pdf::dom::ProcessedOutput::Text(chunk) = output {
+                // Extract page numbers from metadata
+                if let Some(page_numbers_value) = chunk.metadata.get("page_numbers") {
+                    if let Some(page_array) = page_numbers_value.as_array() {
+                        for page_val in page_array {
+                            if let Some(page_num) = page_val.as_u64() {
+                                all_chunk_pages.insert(page_num as u32);
+                            }
+                        }
+                    }
+                }
+                
+                // Extract primary page
+                if let Some(primary_page_value) = chunk.metadata.get("primary_page") {
+                    if let Some(primary_page) = primary_page_value.as_u64() {
+                        chunk_details.push((chunk.chunk_index, primary_page as u32, chunk.text.len()));
+                    }
+                }
+                
+                println!("Chunk {}: primary_page={:?}, page_numbers={:?}, chars={}, text_preview={:.50}...", 
+                    chunk.chunk_index,
+                    chunk.metadata.get("primary_page"),
+                    chunk.metadata.get("page_numbers"),
+                    chunk.text.len(),
+                    chunk.text
+                );
+            }
+        }
+        
+        // Debug: Print all unique pages found in chunks
+        let mut sorted_pages: Vec<u32> = all_chunk_pages.iter().copied().collect();
+        sorted_pages.sort();
+        println!("All pages found in chunk metadata: {:?}", sorted_pages);
+        
+        // Critical assertion: We should see content from multiple pages
+        assert!(
+            all_chunk_pages.len() > 1,
+            "Chunks should contain content from multiple pages. Found pages: {:?}. This suggests a bug in page number assignment during parsing/indexing.",
+            sorted_pages
+        );
+        
+        // Verify we see all expected pages (1, 2, 3)
+        assert!(
+            all_chunk_pages.contains(&1),
+            "Should find content from page 1"
+        );
+        assert!(
+            all_chunk_pages.contains(&2), 
+            "Should find content from page 2"
+        );
+        assert!(
+            all_chunk_pages.contains(&3),
+            "Should find content from page 3"
+        );
+        
+        // Verify that chunk metadata is properly structured (no type tags)
+        for output in &processed_outputs {
+            if let delver_pdf::dom::ProcessedOutput::Text(chunk) = output {
+                // Page numbers should be a plain JSON array, not tagged with "Array"
+                if let Some(page_numbers_value) = chunk.metadata.get("page_numbers") {
+                    assert!(page_numbers_value.is_array(), "page_numbers should be a JSON array");
+                }
+                
+                // Primary page should be a plain JSON number, not tagged with "Number"
+                if let Some(primary_page_value) = chunk.metadata.get("primary_page") {
+                    assert!(primary_page_value.is_number(), "primary_page should be a JSON number");
+                }
+            }
+        }
+    }
 }

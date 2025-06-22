@@ -163,8 +163,11 @@ impl PdfIndex {
             }
 
             // Aggregate SoA data from PageContents
-            order.extend(page_contents.order.clone());
-            // Copy text and image stores (could be optimized to share references in future)
+            // We need to update ContentHandle indices when copying to global stores
+            let text_store_offset = text_store.id.len();
+            let image_store_offset = image_store.id.len();
+
+            // Copy text and image stores first
             for i in 0..page_contents.text_store.id.len() {
                 if let Some(elem) = page_contents.text_store.get(i) {
                     text_store.push(elem);
@@ -174,6 +177,19 @@ impl PdfIndex {
                 if let Some(elem) = page_contents.image_store.get(i) {
                     image_store.push(elem);
                 }
+            }
+
+            // Update ContentHandle indices and add to global order
+            for handle in &page_contents.order {
+                let updated_handle = match handle {
+                    ContentHandle::Text(local_idx) => {
+                        ContentHandle::Text(text_store_offset + local_idx)
+                    }
+                    ContentHandle::Image(local_idx) => {
+                        ContentHandle::Image(image_store_offset + local_idx)
+                    }
+                };
+                order.push(updated_handle);
             }
         }
 

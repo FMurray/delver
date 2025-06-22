@@ -6,7 +6,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::geo::{multiply_matrices, pre_translate, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
-use crate::layout::{MatchContext, TextLine};
+use crate::layout::MatchContext;
 use lopdf::{
     Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult, Stream,
 };
@@ -565,7 +565,9 @@ fn finalize_text_run(
     page_number: u32,
 ) -> Option<TextElement> {
     // If both glyphs and text buffer are empty, there's nothing to return
-    if tos.glyphs.is_empty() && tos.text_buffer.trim().is_empty() {
+    if tos.glyphs.is_empty()
+    // && tos.text_buffer.trim().is_empty()
+    {
         return None;
     }
 
@@ -1036,6 +1038,127 @@ fn pdf_page_transform(page_dict: &Dictionary) -> (Rect, Matrix) {
     (mediabox, ctm)
 }
 
+/// Group small text elements into larger ones based on spatial proximity and font consistency
+/// Similar to layout.rs group_text_into_lines but creates consolidated TextElements instead of TextLines
+fn group_text_elements(
+    text_elements: Vec<TextElement>,
+    line_join_threshold: f32,
+) -> Vec<TextElement> {
+    if text_elements.is_empty() {
+        return text_elements;
+    }
+
+    let mut elements = text_elements;
+    // Sort by y-coordinate (top to bottom) then x-coordinate (left to right)
+    elements.sort_by(|a, b| {
+        b.bbox
+            .1
+            .partial_cmp(&a.bbox.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.bbox
+                    .0
+                    .partial_cmp(&b.bbox.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut grouped_elements = Vec::new();
+    let mut current_group = Vec::new();
+    let mut last_y = f32::MAX;
+    let mut last_font_name: Option<String> = None;
+    let mut last_font_size: Option<f32> = None;
+
+    for elem in elements {
+        let current_font_name = elem.font_name.clone();
+        let current_font_size = Some(elem.font_size);
+
+        if current_group.is_empty() {
+            current_group.push(elem);
+            last_y = current_group[0].bbox.1;
+            last_font_name = current_font_name;
+            last_font_size = current_font_size;
+        } else {
+            let y_close = (last_y - elem.bbox.1).abs() < line_join_threshold;
+            let font_matches = last_font_name == current_font_name
+                && last_font_size.map_or(false, |last_size| {
+                    current_font_size.map_or(false, |curr_size| (last_size - curr_size).abs() < 0.1)
+                });
+
+            if y_close && font_matches {
+                current_group.push(elem);
+            } else {
+                // Finalize current group and start new one
+                if !current_group.is_empty() {
+                    grouped_elements.push(create_consolidated_text_element(current_group));
+                }
+                current_group = vec![elem];
+                last_y = current_group[0].bbox.1;
+                last_font_name = current_font_name;
+                last_font_size = current_font_size;
+            }
+        }
+    }
+
+    // Don't forget the last group
+    if !current_group.is_empty() {
+        grouped_elements.push(create_consolidated_text_element(current_group));
+    }
+
+    grouped_elements
+}
+
+/// Create a single consolidated TextElement from a group of TextElements
+fn create_consolidated_text_element(mut elements: Vec<TextElement>) -> TextElement {
+    if elements.is_empty() {
+        return TextElement::new(String::new());
+    }
+
+    if elements.len() == 1 {
+        return elements.into_iter().next().unwrap();
+    }
+
+    // Sort elements by x-coordinate for proper text ordering
+    elements.sort_by(|a, b| {
+        a.bbox
+            .0
+            .partial_cmp(&b.bbox.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Calculate consolidated bounding box
+    let mut x_min = f32::MAX;
+    let mut y_min = f32::MAX;
+    let mut x_max = f32::MIN;
+    let mut y_max = f32::MIN;
+
+    for elem in &elements {
+        x_min = x_min.min(elem.bbox.0);
+        y_min = y_min.min(elem.bbox.1);
+        x_max = x_max.max(elem.bbox.2);
+        y_max = y_max.max(elem.bbox.3);
+    }
+
+    // Combine text content
+    let combined_text = elements
+        .iter()
+        .map(|e| e.text.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Use properties from the first element (since they should be homogeneous due to grouping logic)
+    let first_elem = &elements[0];
+
+    TextElement {
+        id: Uuid::new_v4(),
+        text: combined_text,
+        font_size: first_elem.font_size,
+        font_name: first_elem.font_name.clone(),
+        bbox: (x_min, y_min, x_max, y_max),
+        page_number: first_elem.page_number,
+    }
+}
+
 fn get_page_elements(
     doc: &Document,
     page_number: u32,
@@ -1135,6 +1258,21 @@ fn get_page_elements(
         page_number,
     ) {
         page_contents.add_text(text_elem);
+    }
+
+    // Group small text elements into larger ones before coordinate transformation
+    let text_elements: Vec<TextElement> = page_contents.text_elements();
+    let line_join_threshold = 5.0; // Adjust this threshold as needed
+    let grouped_elements = group_text_elements(text_elements, line_join_threshold);
+
+    // Replace the existing text elements with grouped ones
+    page_contents.text_store = TextStore::default();
+    page_contents
+        .order
+        .retain(|handle| matches!(handle, ContentHandle::Image(_)));
+
+    for grouped_elem in grouped_elements {
+        page_contents.add_text(grouped_elem);
     }
 
     // After processing content, convert coordinates to top-left based system

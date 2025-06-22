@@ -95,7 +95,8 @@ fn test_detect_headings() {
     );
 
     // 3. Find Elements at the Identified Heading Level
-    let found_heading_elements = find_elements_at_heading_level(&index, 0, None, None);
+    let found_heading_elements =
+        find_elements_at_heading_level(&index, &level_font_name, *level_font_size, None, None);
     assert_eq!(
         found_heading_elements.len(),
         config.sections.len(),

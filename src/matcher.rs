@@ -187,7 +187,6 @@ pub fn align_template_with_content<'a>(
 
     // PASS 2: Assign TextChunks to appropriate content partitions
     let mut textchunk_matches = Vec::new();
-    let mut partition_cursor = 0; // Which partition we're currently processing
 
     for (template_idx, template_element) in template_elements.iter().enumerate() {
         if template_element.element_type == ElementType::TextChunk {
@@ -622,37 +621,37 @@ fn find_end_boundary_candidates<'a>(
                 max_content_boundary
             );
 
-            let similar = index.top_k_similar_text(
-                start_text,
-                start_idx + 1,        // search after the start marker
-                max_content_boundary, // bounded by previous section boundaries
-                K_SIMILAR,
-            );
-            for (text_handle, sim) in similar {
-                let txt_ref = index.text(text_handle);
-                let pc = PageContent::Text(TextElement {
-                    id: txt_ref.id,
-                    text: txt_ref.text.to_string(),
-                    font_size: txt_ref.font_size,
-                    font_name: txt_ref.font_name.map(|s| s.to_string()),
-                    bbox: txt_ref.bbox,
-                    page_number: txt_ref.page_number,
-                });
+            // let similar = index.top_k_similar_text(
+            //     start_text,
+            //     start_idx + 1,        // search after the start marker
+            //     max_content_boundary, // bounded by previous section boundaries
+            //     K_SIMILAR,
+            // );
+            // for (text_handle, sim) in similar {
+            //     let txt_ref = index.text(text_handle);
+            //     let pc = PageContent::Text(TextElement {
+            //         id: txt_ref.id,
+            //         text: txt_ref.text.to_string(),
+            //         font_size: txt_ref.font_size,
+            //         font_name: txt_ref.font_name.map(|s| s.to_string()),
+            //         bbox: txt_ref.bbox,
+            //         page_number: txt_ref.page_number,
+            //     });
 
-                // Avoid duplicates – if already present, just update its score
-                if let Some(existing) = candidates.iter_mut().find(|c| c.content.id() == pc.id()) {
-                    existing.score += 0.5 * sim; // stronger weight for direct similarity
-                    existing
-                        .reasons
-                        .push(format!("Top‑k similarity {:.2}", sim));
-                } else {
-                    candidates.push(BoundaryCandidate {
-                        content: pc,
-                        score: 0.5 * sim, // base score from similarity
-                        reasons: vec![format!("Top‑k similarity {:.2}", sim)],
-                    });
-                }
-            }
+            //     // Avoid duplicates – if already present, just update its score
+            //     if let Some(existing) = candidates.iter_mut().find(|c| c.content.id() == pc.id()) {
+            //         existing.score += 0.5 * sim; // stronger weight for direct similarity
+            //         existing
+            //             .reasons
+            //             .push(format!("Top‑k similarity {:.2}", sim));
+            //     } else {
+            //         candidates.push(BoundaryCandidate {
+            //             content: pc,
+            //             score: 0.5 * sim, // base score from similarity
+            //             reasons: vec![format!("Top‑k similarity {:.2}", sim)],
+            //         });
+            //     }
+            // }
         }
     }
 

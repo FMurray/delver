@@ -43,33 +43,27 @@ fn test_get_pdf_text() {
         "This is the second section text.",
     ];
 
-    let extracted_texts: Vec<&str> = pages_map
+    let extracted_texts: Vec<String> = pages_map
         .values()
-        .flatten()
-        .filter_map(|content| {
-            if let PageContent::Text(text_elem) = content {
-                Some(text_elem.text.as_str())
-            } else {
-                None
-            }
-        })
+        .flat_map(|contents| contents.text_elements())
+        .map(|text_elem| text_elem.text)
         .collect();
 
     for expected in expected_texts {
         assert!(
-            extracted_texts.contains(&expected),
+            extracted_texts.iter().any(|t| t == expected),
             "Missing expected text: {}",
             expected
         );
     }
 
     // Test font properties
-    for content in pages_map.values().flatten() {
-        if let PageContent::Text(element) = content {
-            match element.text.as_str() {
-                "Hello World!" => assert_eq!(element.font_size, 48.0),
-                text if text.starts_with("Subheading") => assert_eq!(element.font_size, 24.0),
-                _ => assert_eq!(element.font_size, 12.0),
+    for content in pages_map.values() {
+        for text_elem in content.text_elements() {
+            match text_elem.text.as_str() {
+                "Hello World!" => assert_eq!(text_elem.font_size, 48.0),
+                text if text.starts_with("Subheading") => assert_eq!(text_elem.font_size, 24.0),
+                _ => assert_eq!(text_elem.font_size, 12.0),
             }
         }
     }
@@ -154,10 +148,10 @@ fn test_coordinate_transformations() {
     // Get all text elements
     let text_elements: Vec<TextElement> = pages_map
         .values()
-        .flatten()
+        .flat_map(|page_contents| page_contents.iter_ordered())
         .filter_map(|content| {
             if let PageContent::Text(text_elem) = content {
-                Some(text_elem.clone())
+                Some(text_elem)
             } else {
                 None
             }

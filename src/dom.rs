@@ -10,6 +10,7 @@ use pest::iterators::Pair;
 use pest::Parser as PestParser;
 use pest_derive::Parser as PestParserDerive;
 use serde::Serialize;
+use serde_json;
 use std::io::ErrorKind;
 use std::sync::{Arc, Weak};
 use std::{collections::HashMap, io::Error}; // Add image crate import
@@ -126,7 +127,7 @@ pub struct MatchedElement {
 #[derive(Debug, serde::Serialize, Clone)]
 pub struct ChunkOutput {
     pub text: String,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, serde_json::Value>,
     pub chunk_index: usize,
 }
 
@@ -139,7 +140,7 @@ pub struct ImageOutput {
     pub bytes_base64: Option<String>,
     pub summary: Option<String>,
     pub embedding: Option<Vec<f32>>, // Assuming embedding is Vec<f32>
-    pub metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -537,6 +538,30 @@ fn process_image_element(
     template_element: &Element,
     metadata: &HashMap<String, Value>,
 ) -> ProcessedOutput {
+    // Convert existing metadata from Value to serde_json::Value
+    let mut json_metadata: HashMap<String, serde_json::Value> = HashMap::new();
+    for (key, value) in metadata {
+        let json_value = match value {
+            Value::String(s) => serde_json::Value::String(s.clone()),
+            Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+            Value::Boolean(b) => serde_json::Value::Bool(*b),
+            Value::Array(arr) => {
+                let json_arr: Vec<serde_json::Value> = arr
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => serde_json::Value::String(s.clone()),
+                        Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+                        Value::Boolean(b) => serde_json::Value::Bool(*b),
+                        _ => serde_json::Value::String(format!("{:?}", v)),
+                    })
+                    .collect();
+                serde_json::Value::Array(json_arr)
+            }
+            Value::Identifier(s) => serde_json::Value::String(s.clone()),
+        };
+        json_metadata.insert(key.clone(), json_value);
+    }
+
     let mut image_output = ImageOutput {
         id: image_element.id.to_string(),
         page_number: image_element.page_number,
@@ -550,7 +575,7 @@ fn process_image_element(
         bytes_base64: None,
         summary: None,
         embedding: None,
-        metadata: metadata.clone(),
+        metadata: json_metadata,
     };
 
     // Attempt to decode image bytes once if needed by any child
@@ -714,11 +739,81 @@ fn process_text_chunk_elements(
                 .iter()
                 .map(|e| e.text.as_str())
                 .collect::<Vec<_>>()
-                .join("");
+                .join(" ");
+
+            // Calculate page number metadata
+            let mut page_char_counts: std::collections::HashMap<u32, usize> =
+                std::collections::HashMap::new();
+            let mut all_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+            for element in chunk {
+                all_pages.insert(element.page_number);
+                *page_char_counts.entry(element.page_number).or_insert(0) += element.text.len();
+            }
+
+            // Find the primary page (page with most content by character count)
+            let primary_page = page_char_counts
+                .iter()
+                .max_by_key(|(_, &count)| count)
+                .map(|(&page, _)| page)
+                .unwrap_or(1); // Default to page 1 if no elements
+
+            // Convert page numbers to sorted Vec for consistent ordering
+            let mut page_numbers: Vec<u32> = all_pages.into_iter().collect();
+            page_numbers.sort();
+
+            // Convert existing metadata from Value to serde_json::Value
+            let mut enhanced_metadata: HashMap<String, serde_json::Value> = HashMap::new();
+            for (key, value) in metadata {
+                let json_value = match value {
+                    Value::String(s) => serde_json::Value::String(s.clone()),
+                    Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+                    Value::Boolean(b) => serde_json::Value::Bool(*b),
+                    Value::Array(arr) => {
+                        let json_arr: Vec<serde_json::Value> = arr
+                            .iter()
+                            .map(|v| match v {
+                                Value::String(s) => serde_json::Value::String(s.clone()),
+                                Value::Number(n) => {
+                                    serde_json::Value::Number(serde_json::Number::from(*n))
+                                }
+                                Value::Boolean(b) => serde_json::Value::Bool(*b),
+                                _ => serde_json::Value::String(format!("{:?}", v)),
+                            })
+                            .collect();
+                        serde_json::Value::Array(json_arr)
+                    }
+                    Value::Identifier(s) => serde_json::Value::String(s.clone()),
+                };
+                enhanced_metadata.insert(key.clone(), json_value);
+            }
+
+            // Add page metadata as plain JSON values
+            enhanced_metadata.insert(
+                "primary_page".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(primary_page)),
+            );
+            enhanced_metadata.insert(
+                "page_numbers".to_string(),
+                serde_json::Value::Array(
+                    page_numbers
+                        .iter()
+                        .map(|&p| serde_json::Value::Number(serde_json::Number::from(p)))
+                        .collect(),
+                ),
+            );
+            enhanced_metadata.insert(
+                "chunk_element_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(chunk.len())),
+            );
+            enhanced_metadata.insert(
+                "chunk_char_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(chunk_text.len())),
+            );
 
             ChunkOutput {
                 text: chunk_text,
-                metadata: metadata.clone(),
+                metadata: enhanced_metadata,
                 chunk_index: i,
             }
         })

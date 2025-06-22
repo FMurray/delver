@@ -6,7 +6,7 @@ use uuid::Uuid;
 use delver_pdf::dom::{Element, ElementType, Value};
 use delver_pdf::layout::MatchContext;
 use delver_pdf::matcher::TemplateContentMatch;
-use delver_pdf::parse::{ImageElement, PageContent, TextElement};
+use delver_pdf::parse::{ImageElement, PageContent, PageContents, TextElement};
 use delver_pdf::search_index::PdfIndex;
 use lopdf::Object;
 
@@ -45,7 +45,7 @@ pub fn load_test_template() -> String {
 // Test builders and helpers for more readable tests
 #[derive(Default)]
 pub struct DocumentBuilder {
-    pages: BTreeMap<u32, Vec<PageContent>>,
+    pages: BTreeMap<u32, PageContents>,
     elements: Vec<(Uuid, String, f32, f32, f32)>, // (id, text, x, y, font_size)
 }
 
@@ -70,8 +70,8 @@ impl DocumentBuilder {
 
         self.pages
             .entry(page)
-            .or_insert_with(Vec::new)
-            .push(element);
+            .or_insert_with(PageContents::new)
+            .add_text(element);
         self.elements.push((id, text.to_string(), x, y, font_size));
         id
     }
@@ -81,8 +81,8 @@ impl DocumentBuilder {
         let element = create_mock_image_element(id, page, x, y, width, height);
         self.pages
             .entry(page)
-            .or_insert_with(Vec::new)
-            .push(element);
+            .or_insert_with(PageContents::new)
+            .add_image(element);
         id
     }
 
@@ -318,7 +318,7 @@ impl TestAssertions {
                 .unwrap_or("Unknown")
         );
 
-        match (boundaries.end_marker, expected_end_id) {
+        match (boundaries.end_marker.as_ref(), expected_end_id) {
             (Some(end_marker), Some(expected_id)) => {
                 assert_eq!(
                     end_marker.id(),
@@ -434,16 +434,15 @@ pub fn create_mock_text_element(
     y: f32,
     width: f32,
     height: f32,
-) -> PageContent {
-    PageContent::Text(TextElement {
+) -> TextElement {
+    TextElement {
         id,
         text: text.to_string(),
         font_name: Some(font_name.to_string()),
         font_size,
         bbox: (x, y, x + width, y + height),
         page_number: page,
-        operators: Vec::new(),
-    })
+    }
 }
 
 // Helper function to create mock ImageElement
@@ -454,8 +453,8 @@ pub fn create_mock_image_element(
     y: f32,
     width: f32,
     height: f32,
-) -> PageContent {
-    PageContent::Image(ImageElement {
+) -> ImageElement {
+    ImageElement {
         id,
         page_number: page,
         bbox: delver_pdf::geo::Rect {
@@ -465,5 +464,5 @@ pub fn create_mock_image_element(
             y1: y + height,
         },
         image_object: Object::Null,
-    })
+    }
 }
