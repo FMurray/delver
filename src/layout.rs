@@ -449,46 +449,22 @@ pub fn find_elements_by_font(
 /// Find elements that are likely to be at a specific heading level using PdfIndex
 pub fn find_elements_at_heading_level(
     index: &crate::search_index::PdfIndex,
-    level: usize,
+    font_name: &str,
+    font_size: f32,
     start_index: Option<usize>,
     end_index: Option<usize>,
-) -> Vec<&PageContent> {
-    let heading_levels = identify_heading_levels(index, level + 1, start_index, end_index);
-
-    if level >= heading_levels.len() {
-        return Vec::new();
-    }
-
-    let ((font_name, font_size), _usage_count) = &heading_levels[level];
-
-    // Get elements by font and filter by scope if needed
-    let elements = index.elements_by_font(Some(font_name), Some(*font_size), None, None);
-
-    if let (Some(start), Some(end)) = (start_index, end_index) {
-        elements
-            .into_iter()
-            .filter(|elem| {
-                if let Some(&idx) = index.element_id_to_index.get(&elem.id()) {
-                    idx >= start && idx < end
-                } else {
-                    false
-                }
-            })
-            .collect()
-    } else {
-        elements
-    }
-}
-
-/// Convenience function that creates a temporary index for backward compatibility
-pub fn find_elements_at_heading_level_from_pages(
-    pages_map: &BTreeMap<u32, Vec<PageContent>>,
-    level: usize,
 ) -> Vec<PageContent> {
-    let match_context = MatchContext::default();
-    let index = crate::search_index::PdfIndex::new(pages_map, &match_context);
-    find_elements_at_heading_level(&index, level, None, None)
-        .into_iter()
-        .cloned()
-        .collect()
+    println!(
+        "Looking for heading elements with font '{}' and size {}",
+        font_name, font_size
+    );
+
+    // Find elements matching the font criteria
+    let elements = index.elements_by_font(Some(font_name), Some(font_size), None, None);
+
+    // Filter by index range if provided
+    let start = start_index.unwrap_or(0);
+    let end = end_index.unwrap_or(elements.len());
+
+    elements.into_iter().skip(start).take(end - start).collect()
 }

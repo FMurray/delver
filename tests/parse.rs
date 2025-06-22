@@ -113,7 +113,6 @@ fn create_sample_text_element() -> TextElement {
         font_name: Some(String::from("Courier")),
         bbox: (100.0, 200.0, 150.0, 210.0),
         id: uuid::Uuid::new_v4(),
-        operators: Vec::new(),
     }
 }
 

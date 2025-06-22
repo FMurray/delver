@@ -13,7 +13,7 @@ pub mod search_index;
 use crate::dom::{parse_template, process_matched_content, ChunkOutput, ProcessedOutput};
 use crate::layout::{group_text_into_lines_and_blocks, TextBlock};
 use crate::matcher::align_template_with_content;
-use crate::parse::{get_page_content, get_refs, PageContent, TextElement};
+use crate::parse::{get_page_content, get_refs, PageContent, PageContents, TextElement};
 use anyhow::Result;
 use lopdf::Document;
 use search_index::PdfIndex;
@@ -40,16 +40,8 @@ pub fn process_pdf(
     let pages_map = get_page_content(&doc)?;
 
     let mut text_pages_map: BTreeMap<u32, Vec<TextElement>> = BTreeMap::new();
-    for (page_num, contents) in &pages_map {
-        // Extract text elements and collect them
-        let text_elements: Vec<TextElement> = contents
-            .iter()
-            .filter_map(|content| match content {
-                PageContent::Text(text_elem) => Some(text_elem.clone()),
-                _ => None,
-            })
-            .collect();
-
+    for (page_num, page_contents) in &pages_map {
+        let text_elements = page_contents.text_elements();
         if !text_elements.is_empty() {
             text_pages_map.insert(*page_num, text_elements);
         }

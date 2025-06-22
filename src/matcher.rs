@@ -14,26 +14,26 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct TemplateContentMatch<'a> {
     pub template_element: &'a Element,
-    pub matched_content: Vec<MatchedContent<'a>>,
+    pub matched_content: Vec<MatchedContent>,
     pub children: Vec<TemplateContentMatch<'a>>,
     pub metadata: HashMap<String, Value>,
-    pub section_boundaries: Option<SectionBoundaries<'a>>,
+    pub section_boundaries: Option<SectionBoundaries>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SectionBoundaries<'a> {
-    pub start_marker: &'a PageContent,
-    pub end_marker: Option<&'a PageContent>,
+pub struct SectionBoundaries {
+    pub start_marker: PageContent,
+    pub end_marker: Option<PageContent>,
 }
 
 #[derive(Debug, Clone)]
-pub enum MatchedContent<'a> {
-    Text(&'a TextElement),
-    Image(&'a ImageElement),
+pub enum MatchedContent {
+    Text(TextElement),
+    Image(ImageElement),
     None,
 }
 
-impl<'a> MatchedContent<'a> {
+impl MatchedContent {
     pub fn id(&self) -> Uuid {
         match self {
             MatchedContent::Text(text_elem) => text_elem.id,
@@ -54,7 +54,7 @@ impl<'a> TemplateContentMatch<'a> {
         }
     }
 
-    pub fn with_content(template_element: &'a Element, content: Vec<MatchedContent<'a>>) -> Self {
+    pub fn with_content(template_element: &'a Element, content: Vec<MatchedContent>) -> Self {
         TemplateContentMatch {
             template_element,
             matched_content: content,
@@ -66,8 +66,8 @@ impl<'a> TemplateContentMatch<'a> {
 
     pub fn with_section_boundaries(
         template_element: &'a Element,
-        start_marker: &'a PageContent,
-        end_marker: Option<&'a PageContent>,
+        start_marker: PageContent,
+        end_marker: Option<PageContent>,
     ) -> Self {
         TemplateContentMatch {
             template_element,
@@ -102,16 +102,11 @@ pub fn align_template_with_content<'a>(
     let default_metadata = HashMap::new();
     let actual_inherited_metadata = inherited_metadata.unwrap_or(&default_metadata);
 
-    let mut elements_by_page_view: BTreeMap<u32, Vec<&'a PageContent>> = BTreeMap::new();
-    for (page_num, element_indices) in index.by_page.iter() {
-        let mut page_elements: Vec<&'a PageContent> = Vec::new();
-        for &idx in element_indices {
-            if let Some(element) = index.content_at(idx) {
-                page_elements.push(element);
-            }
-        }
-        if !page_elements.is_empty() {
-            elements_by_page_view.insert(*page_num, page_elements);
+    let mut elements_by_page_view: BTreeMap<u32, Vec<PageContent>> = BTreeMap::new();
+    for (page_num, page_elements) in index.by_page.iter() {
+        let page_content = index.elements_on_page(*page_num);
+        if !page_content.is_empty() {
+            elements_by_page_view.insert(*page_num, page_content);
         }
     }
 
@@ -129,6 +124,7 @@ pub fn align_template_with_content<'a>(
                     .unwrap_or(0);
                 let end_idx = section_boundaries
                     .end_marker
+                    .as_ref()
                     .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
                     .unwrap_or(index.doc_len());
 
@@ -176,6 +172,7 @@ pub fn align_template_with_content<'a>(
                         .unwrap_or(0);
                     let end_idx = boundaries
                         .end_marker
+                        .as_ref()
                         .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
                         .unwrap_or(max_content_boundary); // Use max_content_boundary instead of full document
                                                           // The section partition includes content UP TO but NOT INCLUDING the end marker
@@ -293,8 +290,8 @@ pub fn align_template_with_content<'a>(
 
 /// Represents a potential section boundary with scoring information
 #[derive(Debug, Clone)]
-struct BoundaryCandidate<'a> {
-    content: &'a PageContent,
+struct BoundaryCandidate {
+    content: PageContent,
     score: f32,
     reasons: Vec<String>,
 }
@@ -318,7 +315,7 @@ enum RelationshipType {
 fn match_section<'a, 'map_lt>(
     template: &'a Element,
     index: &'a PdfIndex,
-    page_map_view: &'map_lt BTreeMap<u32, Vec<&'a PageContent>>,
+    page_map_view: &'map_lt BTreeMap<u32, Vec<PageContent>>,
     inherited_metadata: &HashMap<String, Value>,
     prev_match_for_context: Option<&TemplateContentMatch<'a>>,
     current_search_start_index: usize,
@@ -342,12 +339,12 @@ fn match_section<'a, 'map_lt>(
         prev_match_for_context,
     )?;
 
-    let selected_start_candidate = start_candidates.first()?;
-    let start_marker: &'a PageContent = selected_start_candidate.content;
+    let selected_start_candidate = start_candidates.first()?.clone();
+    let start_marker: &PageContent = &selected_start_candidate.content;
 
     // 2. Find end boundary candidates
     let end_candidates = find_end_boundary_candidates(
-        start_marker, // Use the &'a PageContent from index
+        start_marker, // Use the PageContent from candidates
         template,
         index,
         &template.children,
@@ -355,8 +352,8 @@ fn match_section<'a, 'map_lt>(
         prev_match_for_context,
     )?;
 
-    let selected_end_candidate = end_candidates.first()?;
-    let end_marker_option: Option<&'a PageContent> = Some(selected_end_candidate.content);
+    let selected_end_candidate = end_candidates.first()?.clone();
+    let end_marker_option: Option<&PageContent> = Some(&selected_end_candidate.content);
 
     let section_content_elements = extract_section_content(
         page_map_view,
@@ -369,18 +366,17 @@ fn match_section<'a, 'map_lt>(
     // Create section match
     let mut result = TemplateContentMatch::with_section_boundaries(
         template,
-        start_marker,      // This is &'a PageContent from index
-        end_marker_option, // This is Option<&'a PageContent> from index
+        start_marker.clone(),       // Clone for storage
+        end_marker_option.cloned(), // Clone for storage
     );
 
     // Add the extracted content as matched content
     if !section_content_elements.is_empty() {
         result.matched_content = section_content_elements
             .iter()
-            .map(|&content| match content {
-                // content is &'a PageContent
-                PageContent::Text(text) => MatchedContent::Text(text),
-                PageContent::Image(image) => MatchedContent::Image(image),
+            .map(|content| match content {
+                PageContent::Text(text) => MatchedContent::Text(text.clone()),
+                PageContent::Image(image) => MatchedContent::Image(image.clone()),
             })
             .collect();
     }
@@ -440,22 +436,31 @@ fn find_start_boundary_candidates<'a>(
     start_index: usize,
     match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
-) -> Option<Vec<BoundaryCandidate<'a>>> {
+) -> Option<Vec<BoundaryCandidate>> {
     let mut candidates = Vec::new();
 
     println!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
     // 1. Text-based candidates
-    let text_candidates = index.find_text_matches(
+    let text_matches = index.find_text_matches(
         &match_config.pattern,
         match_config.threshold,
         Some(start_index),
     );
     println!(
         "[find_start_boundary_candidates] Text-based candidates found: {}",
-        text_candidates.len()
+        text_matches.len()
     );
 
-    for (element, score) in text_candidates {
+    for (text_handle, score) in text_matches {
+        let txt_ref = index.text(text_handle);
+        let element = PageContent::Text(TextElement {
+            id: txt_ref.id,
+            text: txt_ref.text.to_string(),
+            font_size: txt_ref.font_size,
+            font_name: txt_ref.font_name.map(|s| s.to_string()),
+            bbox: txt_ref.bbox,
+            page_number: txt_ref.page_number,
+        });
         candidates.push(score_candidate(
             &element, index, template, score, prev_match,
         ));
@@ -512,7 +517,7 @@ fn find_end_boundary_candidates<'a>(
     children: &[Element],
     match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
-) -> Option<Vec<BoundaryCandidate<'a>>> {
+) -> Option<Vec<BoundaryCandidate>> {
     println!(
         "[find_end_boundary_candidates] Looking for end for section starting with: {:?}",
         start_content.text()
@@ -542,16 +547,25 @@ fn find_end_boundary_candidates<'a>(
             let search_start_index = start_marker_index.map(|idx| idx + 1);
             println!("[find_end_boundary_candidates] Searching for end markers starting from index: {:?}", search_start_index);
 
-            let end_text_candidates = index.find_text_matches(
+            let end_text_matches = index.find_text_matches(
                 &end_str,
                 match_config.threshold,
                 search_start_index, // Use match_config.threshold instead of hardcoded value
             );
             println!(
                 "[find_end_boundary_candidates] Found {} text candidates for end_match.",
-                end_text_candidates.len()
+                end_text_matches.len()
             );
-            for (element, score) in end_text_candidates {
+            for (text_handle, score) in end_text_matches {
+                let txt_ref = index.text(text_handle);
+                let element = PageContent::Text(TextElement {
+                    id: txt_ref.id,
+                    text: txt_ref.text.to_string(),
+                    font_size: txt_ref.font_size,
+                    font_name: txt_ref.font_name.map(|s| s.to_string()),
+                    bbox: txt_ref.bbox,
+                    page_number: txt_ref.page_number,
+                });
                 candidates.push(score_candidate(
                     &element, index, template, score, prev_match,
                 ));
@@ -587,8 +601,15 @@ fn find_end_boundary_candidates<'a>(
                 if let Some(boundaries) = &prev.section_boundaries {
                     boundaries
                         .end_marker
+                        .as_ref()
                         .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
-                        .unwrap_or(index.doc_len())
+                        .or_else(|| {
+                            index
+                                .element_id_to_index
+                                .get(&boundaries.start_marker.id())
+                                .copied()
+                        })
+                        .unwrap_or(0)
                 } else {
                     index.doc_len()
                 }
@@ -607,7 +628,17 @@ fn find_end_boundary_candidates<'a>(
                 max_content_boundary, // bounded by previous section boundaries
                 K_SIMILAR,
             );
-            for (pc, sim) in similar {
+            for (text_handle, sim) in similar {
+                let txt_ref = index.text(text_handle);
+                let pc = PageContent::Text(TextElement {
+                    id: txt_ref.id,
+                    text: txt_ref.text.to_string(),
+                    font_size: txt_ref.font_size,
+                    font_name: txt_ref.font_name.map(|s| s.to_string()),
+                    bbox: txt_ref.bbox,
+                    page_number: txt_ref.page_number,
+                });
+
                 // Avoid duplicates – if already present, just update its score
                 if let Some(existing) = candidates.iter_mut().find(|c| c.content.id() == pc.id()) {
                     existing.score += 0.5 * sim; // stronger weight for direct similarity
@@ -645,27 +676,17 @@ fn score_candidate<'a>(
     template: &Element,
     base_score: f64,
     prev_match: Option<&TemplateContentMatch<'a>>,
-) -> BoundaryCandidate<'a> {
+) -> BoundaryCandidate {
     let mut score = base_score as f32;
     let mut reasons = Vec::new();
 
     // Consider previous match if available
     if let Some(prev) = prev_match {
         if let Some(sb) = prev.section_boundaries.as_ref() {
-            if let Some(end) = sb.end_marker {
-                match content {
-                    PageContent::Text(text) => {
-                        // Check if this candidate comes after the previous section
-                        if let Some(idx) = index.element_id_to_index.get(&text.id) {
-                            if let Some(prev_idx) = index.element_id_to_index.get(&end.id()) {
-                                if idx > prev_idx {
-                                    score += 0.3;
-                                    reasons.push("Follows previous section".to_string());
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+            if let Some(ref end) = sb.end_marker {
+                if end.page_number() != content.page_number() {
+                    score += 0.2;
+                    reasons.push("End marker on different page".to_string());
                 }
             }
         }
@@ -711,7 +732,7 @@ fn score_candidate<'a>(
     }
 
     BoundaryCandidate {
-        content,
+        content: content.clone(),
         score,
         reasons,
     }
@@ -812,7 +833,7 @@ fn score_candidate<'a>(
 /// Validates if a candidate respects child element positions
 fn validate_child_position<'a>(
     child: &Element,
-    candidate: &BoundaryCandidate<'a>,
+    candidate: &BoundaryCandidate,
     flow: &ContentFlow<'a>,
 ) -> bool {
     // Implement child position validation logic
@@ -822,7 +843,7 @@ fn validate_child_position<'a>(
 
 /// Selects the best boundary from candidates
 fn select_best_boundary<'a>(
-    candidates: Vec<BoundaryCandidate<'a>>,
+    candidates: Vec<BoundaryCandidate>,
     previous_content: Option<&PageContent>,
     children: &[Element],
     index: &PdfIndex,
@@ -834,7 +855,7 @@ fn select_best_boundary<'a>(
 
             // Consider content type compatibility
             if let Some(prev) = &previous_content {
-                if content_types_compatible(prev, candidate.content) {
+                if content_types_compatible(prev, &candidate.content) {
                     score += 0.2;
                 }
             }
@@ -846,7 +867,7 @@ fn select_best_boundary<'a>(
 
             // Consider document flow
             if let Some(prev) = &previous_content {
-                if maintains_document_flow(prev, candidate.content, index) {
+                if maintains_document_flow(prev, &candidate.content, index) {
                     score += 0.2;
                 }
             }
@@ -868,7 +889,7 @@ fn content_types_compatible(a: &PageContent, b: &PageContent) -> bool {
 
 /// Checks if a candidate satisfies child element requirements
 fn satisfies_child_requirements<'a>(
-    candidate: &BoundaryCandidate<'a>,
+    candidate: &BoundaryCandidate,
     children: &[Element],
     index: &PdfIndex,
 ) -> bool {
@@ -917,7 +938,7 @@ fn match_text_chunk_with_boundaries<'a>(
             let end_idx = content_end_idx.min(index.doc_len());
             index.content_slice(content_start_idx, end_idx)
         } else {
-            &[]
+            Vec::new()
         };
 
     println!(
@@ -925,7 +946,7 @@ fn match_text_chunk_with_boundaries<'a>(
         content_slice.len()
     );
 
-    let mut matched_content_for_chunk: Vec<MatchedContent<'a>> = Vec::new();
+    let mut matched_content_for_chunk: Vec<MatchedContent> = Vec::new();
     let mut has_text_content = false;
 
     for pc_ref in content_slice {
@@ -1036,12 +1057,12 @@ pub fn perform_matching(
 
 /// Extracts the content between a start element and an optional end element
 pub fn extract_section_content<'a>(
-    _page_map_view: &BTreeMap<u32, Vec<&'a PageContent>>,
+    _page_map_view: &BTreeMap<u32, Vec<PageContent>>,
     _start_marker_page_num: u32,
     start_marker: &'a PageContent,
     end_marker_option: Option<&'a PageContent>,
     index: &'a PdfIndex,
-) -> Vec<&'a PageContent> {
+) -> Vec<PageContent> {
     // Debugging output
     let start_debug_info = match start_marker {
         PageContent::Text(t) => format!("Text('{}', ID: {})", t.text, t.id),
@@ -1189,12 +1210,13 @@ fn get_next_match_index<'a>(
                     .as_ref()
                     .and_then(|sb| {
                         sb.end_marker
-                            .or(Some(sb.start_marker))
-                            .and_then(|elem| match elem {
-                                PageContent::Text(text) => {
-                                    index.element_id_to_index.get(&text.id).copied()
-                                }
-                                PageContent::Image(_) => None,
+                            .as_ref()
+                            .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
+                            .or_else(|| {
+                                index
+                                    .element_id_to_index
+                                    .get(&sb.start_marker.id())
+                                    .copied()
                             })
                     })
                     .map_or(0, |idx| idx + 1)
@@ -1206,10 +1228,13 @@ fn get_next_match_index<'a>(
             .as_ref()
             .and_then(|sb| {
                 sb.end_marker
-                    .or(Some(sb.start_marker))
-                    .and_then(|elem| match elem {
-                        PageContent::Text(text) => index.element_id_to_index.get(&text.id).copied(),
-                        PageContent::Image(_) => None,
+                    .as_ref()
+                    .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
+                    .or_else(|| {
+                        index
+                            .element_id_to_index
+                            .get(&sb.start_marker.id())
+                            .copied()
                     })
             })
             .map_or(0, |idx| idx + 1)

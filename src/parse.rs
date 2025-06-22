@@ -251,7 +251,161 @@ pub struct ImageElement {
                     // format, bytes etc. would be derived later from image_object
 }
 
-// Define enum to hold either TextElement or ImageElement
+/// Lightweight handle that preserves document order
+#[derive(Copy, Clone, Debug)]
+pub enum ContentHandle {
+    Text(usize),
+    Image(usize),
+}
+
+/// Column-oriented storage for text elements
+#[derive(Debug, Default, Clone)]
+pub struct TextStore {
+    pub bbox: Vec<(f32, f32, f32, f32)>,
+    pub font_size: Vec<f32>,
+    pub font_name: Vec<Option<String>>,
+    pub id: Vec<Uuid>,
+    pub text: Vec<String>,
+    pub page_number: Vec<u32>,
+}
+
+impl TextStore {
+    pub fn push(&mut self, elem: TextElement) -> usize {
+        let idx = self.id.len();
+        self.bbox.push(elem.bbox);
+        self.font_size.push(elem.font_size);
+        self.font_name.push(elem.font_name);
+        self.id.push(elem.id);
+        self.text.push(elem.text);
+        self.page_number.push(elem.page_number);
+        idx
+    }
+
+    pub fn get(&self, idx: usize) -> Option<TextElement> {
+        if idx < self.id.len() {
+            Some(TextElement {
+                id: self.id[idx],
+                text: self.text[idx].clone(),
+                font_size: self.font_size[idx],
+                font_name: self.font_name[idx].clone(),
+                bbox: self.bbox[idx],
+                page_number: self.page_number[idx],
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = TextElement> + '_ {
+        (0..self.id.len()).map(move |i| TextElement {
+            id: self.id[i],
+            text: self.text[i].clone(),
+            font_size: self.font_size[i],
+            font_name: self.font_name[i].clone(),
+            bbox: self.bbox[i],
+            page_number: self.page_number[i],
+        })
+    }
+}
+
+/// Column-oriented storage for image elements
+#[derive(Debug, Default, Clone)]
+pub struct ImageStore {
+    pub bbox: Vec<crate::geo::Rect>,
+    pub id: Vec<Uuid>,
+    pub page_number: Vec<u32>,
+    pub image_object: Vec<Object>,
+}
+
+impl ImageStore {
+    pub fn push(&mut self, elem: ImageElement) -> usize {
+        let idx = self.id.len();
+        self.bbox.push(elem.bbox);
+        self.id.push(elem.id);
+        self.page_number.push(elem.page_number);
+        self.image_object.push(elem.image_object);
+        idx
+    }
+
+    pub fn get(&self, idx: usize) -> Option<ImageElement> {
+        if idx < self.id.len() {
+            Some(ImageElement {
+                id: self.id[idx],
+                page_number: self.page_number[idx],
+                bbox: self.bbox[idx],
+                image_object: self.image_object[idx].clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = ImageElement> + '_ {
+        (0..self.id.len()).map(move |i| ImageElement {
+            id: self.id[i],
+            page_number: self.page_number[i],
+            bbox: self.bbox[i],
+            image_object: self.image_object[i].clone(),
+        })
+    }
+}
+
+/// Struct-of-Arrays for efficient content storage with preserved ordering
+#[derive(Debug, Clone)]
+pub struct PageContents {
+    pub order: Vec<ContentHandle>,
+    pub text_store: TextStore,
+    pub image_store: ImageStore,
+}
+
+impl PageContents {
+    pub fn new() -> Self {
+        Self {
+            order: Vec::new(),
+            text_store: TextStore::default(),
+            image_store: ImageStore::default(),
+        }
+    }
+
+    pub fn add_text(&mut self, text_elem: TextElement) {
+        let idx = self.text_store.push(text_elem);
+        self.order.push(ContentHandle::Text(idx));
+    }
+
+    pub fn add_image(&mut self, image_elem: ImageElement) {
+        let idx = self.image_store.push(image_elem);
+        self.order.push(ContentHandle::Image(idx));
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// Iterate through content in document order
+    pub fn iter_ordered(&self) -> impl Iterator<Item = PageContent> + '_ {
+        self.order.iter().filter_map(move |handle| match handle {
+            ContentHandle::Text(idx) => self.text_store.get(*idx).map(PageContent::Text),
+            ContentHandle::Image(idx) => self.image_store.get(*idx).map(PageContent::Image),
+        })
+    }
+
+    /// Get content by index in document order
+    pub fn get_content(&self, idx: usize) -> Option<PageContent> {
+        self.order.get(idx).and_then(|handle| match handle {
+            ContentHandle::Text(text_idx) => self.text_store.get(*text_idx).map(PageContent::Text),
+            ContentHandle::Image(img_idx) => self.image_store.get(*img_idx).map(PageContent::Image),
+        })
+    }
+
+    /// Get all text elements as a Vec (for compatibility)
+    pub fn text_elements(&self) -> Vec<TextElement> {
+        (0..self.text_store.id.len())
+            .filter_map(|idx| self.text_store.get(idx))
+            .collect()
+    }
+}
+
+// Define enum to hold either TextElement or ImageElement (for backwards compatibility where needed)
 #[derive(Debug, Clone)]
 pub enum PageContent {
     Text(TextElement),
@@ -289,7 +443,7 @@ impl PageContent {
     }
 
     // Add text-specific helper methods
-    pub fn as_text(&self) -> Option<&TextLine> {
+    pub fn as_text(&self) -> Option<&TextElement> {
         match self {
             PageContent::Text(text) => Some(text),
             PageContent::Image(_) => None,
@@ -308,11 +462,11 @@ impl PageContent {
     }
 
     pub fn font_size(&self) -> Option<f32> {
-        self.as_text().map(|t| t.font_size())
+        self.as_text().map(|t| t.font_size)
     }
 
     pub fn font_name(&self) -> Option<&str> {
-        self.as_text().and_then(|t| t.font_name())
+        self.as_text().and_then(|t| t.font_name.as_deref())
     }
 }
 
@@ -409,7 +563,7 @@ fn finalize_text_run(
     tos: &mut TextObjectState,
     ts: &TextState,
     page_number: u32,
-) -> Option<PageContent> {
+) -> Option<TextElement> {
     // If both glyphs and text buffer are empty, there's nothing to return
     if tos.glyphs.is_empty() && tos.text_buffer.trim().is_empty() {
         return None;
@@ -420,15 +574,14 @@ fn finalize_text_run(
         // Preserve text content from the buffer
         let text = std::mem::take(&mut tos.text_buffer);
 
-        return Some(PageContent::Text(TextElement {
+        return Some(TextElement {
             id: Uuid::new_v4(),
             text,
             font_size: ts.size,
             font_name: Some(ts.fontname.clone()),
-            // Use font size to generate valid dimensions for test assertions
             bbox: (0.0, 0.0, ts.size, ts.size),
             page_number,
-        }));
+        });
     }
 
     let mut x_min = f32::MAX;
@@ -463,28 +616,28 @@ fn finalize_text_run(
         "Created text element"
     );
 
-    Some(PageContent::Text(text_element))
+    Some(text_element)
 }
 
-pub fn get_page_content(doc: &Document) -> Result<BTreeMap<u32, Vec<PageContent>>, Error> {
-    let mut pages_map: BTreeMap<u32, Vec<PageContent>> = BTreeMap::new();
+pub fn get_page_content(doc: &Document) -> Result<BTreeMap<u32, PageContents>, Error> {
+    let mut pages_map: BTreeMap<u32, PageContents> = BTreeMap::new();
 
-    let results: Result<Vec<(u32, Vec<PageContent>)>, Error> = doc
+    let results: Result<Vec<(u32, PageContents)>, Error> = doc
         .get_pages()
         .into_par_iter()
         .map(|(page_num, page_id)| {
-            let page_elements = get_page_elements(doc, page_num, page_id).map_err(|e| {
+            let page_contents = get_page_elements(doc, page_num, page_id).map_err(|e| {
                 Error::new(
                     ErrorKind::Other,
                     format!("Failed to extract content from page {page_num} id={page_id:?}: {e:?}"),
                 )
             })?;
-            Ok((page_num, page_elements))
+            Ok((page_num, page_contents))
         })
         .collect();
 
-    for (page_num, elements) in results? {
-        pages_map.insert(page_num, elements);
+    for (page_num, contents) in results? {
+        pages_map.insert(page_num, contents);
     }
 
     Ok(pages_map)
@@ -594,7 +747,7 @@ fn handle_operator<'a>(
     gs_stack: &mut Vec<GraphicsState<'a>>,
     op: &lopdf::content::Operation,
     text_object_state: &mut TextObjectState,
-    page_elements: &mut Vec<PageContent>, // Changed type
+    page_contents: &mut PageContents,
     page_number: u32,
     page_objects: &PageObjects, // Replace doc with preloaded objects
     encodings: &'a BTreeMap<Vec<u8>, Encoding<'a>>,
@@ -613,7 +766,7 @@ fn handle_operator<'a>(
             if let Some(text_elem) =
                 finalize_text_run(text_object_state, &current_gs.text_state, page_number)
             {
-                page_elements.push(text_elem);
+                page_contents.add_text(text_elem);
             }
             let matrix = matrix_from_operands(op);
             current_gs.ctm = multiply_matrices(&matrix, &current_gs.ctm);
@@ -630,7 +783,7 @@ fn handle_operator<'a>(
             if let Some(text_elem) =
                 finalize_text_run(text_object_state, &current_gs.text_state, page_number)
             {
-                page_elements.push(text_elem);
+                page_contents.add_text(text_elem);
             }
             // Clear text state specifics
             text_object_state.glyphs.clear();
@@ -643,7 +796,7 @@ fn handle_operator<'a>(
             if let Some(text_elem) =
                 finalize_text_run(text_object_state, &current_gs.text_state, page_number)
             {
-                page_elements.push(text_elem);
+                page_contents.add_text(text_elem);
             }
             if let (Some(Object::Name(font_name_bytes)), Some(font_size_obj)) =
                 (op.operands.get(0), op.operands.get(1))
@@ -711,7 +864,7 @@ fn handle_operator<'a>(
             if let Some(text_elem) =
                 finalize_text_run(text_object_state, &current_gs.text_state, page_number)
             {
-                page_elements.push(text_elem);
+                page_contents.add_text(text_elem);
             }
             let matrix = matrix_from_operands(op);
             text_object_state.text_matrix = matrix;
@@ -766,7 +919,7 @@ fn handle_operator<'a>(
             if let Some(text_elem) =
                 finalize_text_run(text_object_state, &current_gs.text_state, page_number)
             {
-                page_elements.push(text_elem);
+                page_contents.add_text(text_elem);
             }
 
             if let Some(Object::Name(name)) = op.operands.first() {
@@ -805,7 +958,7 @@ fn handle_operator<'a>(
                                 bbox,
                                 image_object: xobject.clone(), // Clone the object (Stream)
                             };
-                            page_elements.push(PageContent::Image(image_element));
+                            page_contents.add_image(image_element);
                         }
                     } else {
                         warn!(xobject_name=?String::from_utf8_lossy(name), "XObject is not a stream");
@@ -887,8 +1040,8 @@ fn get_page_elements(
     doc: &Document,
     page_number: u32,
     page_id: (u32, u16),
-) -> Result<Vec<TextElement>, LopdfError> {
-    let mut page_elements = Vec::new(); // Changed type
+) -> Result<PageContents, LopdfError> {
+    let mut page_contents = PageContents::new();
     let mut text_object_state = TextObjectState::default();
 
     let content_data = match doc.get_and_decode_page_content(page_id) {
@@ -963,7 +1116,7 @@ fn get_page_elements(
                 &mut gs_stack,
                 &op,
                 &mut text_object_state,
-                &mut page_elements,
+                &mut page_contents,
                 page_number,
                 &page_objects,
                 &encodings,
@@ -981,41 +1134,35 @@ fn get_page_elements(
         &gs_stack.last().unwrap().text_state,
         page_number,
     ) {
-        page_elements.push(text_elem);
+        page_contents.add_text(text_elem);
     }
 
     // After processing content, convert coordinates to top-left based system
-    let mut top_left_elements = Vec::new();
-    for element in page_elements {
-        match element {
-            PageContent::Text(mut text_elem) => {
-                let (x0, y0, x1, y1) = text_elem.bbox;
-                let top_left_bbox = (
-                    x0,
-                    mediabox.y1 - y1, // Top = page_height - bottom
-                    x1,
-                    mediabox.y1 - y0, // Bottom = page_height - top
-                );
-                text_elem.bbox = top_left_bbox;
-                top_left_elements.push(PageContent::Text(text_elem));
-            }
-            PageContent::Image(mut img_elem) => {
-                // Transform image bbox as well
-                let transformed_bbox = transform_rect(&img_elem.bbox, &IDENTITY_MATRIX); // Using Identity, assumes bbox is already in page space?
-                                                                                         // TODO: Verify CTM usage for image bbox
-                let top_left_bbox = Rect {
-                    x0: transformed_bbox.x0,
-                    y0: mediabox.y1 - transformed_bbox.y1,
-                    x1: transformed_bbox.x1,
-                    y1: mediabox.y1 - transformed_bbox.y0,
-                };
-                img_elem.bbox = top_left_bbox;
-                top_left_elements.push(PageContent::Image(img_elem));
-            }
-        }
+    for bbox in &mut page_contents.text_store.bbox {
+        let (x0, y0, x1, y1) = *bbox;
+        let top_left_bbox = (
+            x0,
+            mediabox.y1 - y1, // Top = page_height - bottom
+            x1,
+            mediabox.y1 - y0, // Bottom = page_height - top
+        );
+        *bbox = top_left_bbox;
     }
 
-    Ok(top_left_elements)
+    for bbox in &mut page_contents.image_store.bbox {
+        // Transform image bbox as well
+        let transformed_bbox = transform_rect(bbox, &IDENTITY_MATRIX); // Using Identity, assumes bbox is already in page space?
+                                                                       // TODO: Verify CTM usage for image bbox
+        let top_left_bbox = Rect {
+            x0: transformed_bbox.x0,
+            y0: mediabox.y1 - transformed_bbox.y1,
+            x1: transformed_bbox.x1,
+            y1: mediabox.y1 - transformed_bbox.y0,
+        };
+        *bbox = top_left_bbox;
+    }
+
+    Ok(page_contents)
 }
 
 pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {

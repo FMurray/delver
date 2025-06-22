@@ -3,7 +3,9 @@
 use crate::features::{compute_similarity, TextFeatures};
 use crate::{
     layout::{MatchContext, TextLine},
-    parse::{ImageElement, PageContent, TextElement},
+    parse::{
+        ContentHandle, ImageElement, ImageStore, PageContent, PageContents, TextElement, TextStore,
+    },
 };
 use lopdf::Object;
 use ordered_float::NotNan;
@@ -11,6 +13,34 @@ use rstar::{RTree, RTreeObject, AABB};
 use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
+
+/// Typed handle for text elements - prevents mixing with image handles
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextHandle(pub u32);
+
+/// Typed handle for image elements
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImageHandle(pub u32);
+
+/// Narrow borrow: contains refs into *one* row; can't out-live `PdfIndex`.
+#[derive(Debug)]
+pub struct TextElemRef<'a> {
+    pub id: Uuid,
+    pub text: &'a str,
+    pub font_size: f32,
+    pub font_name: Option<&'a str>,
+    pub bbox: (f32, f32, f32, f32),
+    pub page_number: u32,
+}
+
+/// Narrow borrow for image elements
+#[derive(Debug)]
+pub struct ImageElemRef<'a> {
+    pub id: Uuid,
+    pub bbox: crate::geo::Rect,
+    pub page_number: u32,
+    pub image_object: &'a Object,
+}
 
 // Wrapper for TextElement to implement RTreeObject
 #[derive(Clone, Debug)]
@@ -33,56 +63,6 @@ impl SpatialPageContent {
     }
 }
 
-/// Lightweight handle that keeps document order without dragging full payload
-#[derive(Copy, Clone, Debug)]
-pub enum ContentHandle {
-    Text(usize),
-    Image(usize),
-}
-
-/// Column‑oriented storage for text payload.
-#[derive(Debug, Default)]
-pub struct TextStore {
-    pub bbox: Vec<(f32, f32, f32, f32)>,
-    pub font_size: Vec<f32>,
-    pub font_key: Vec<(String, NotNan<f32>)>,
-    pub id: Vec<Uuid>,
-    /// Raw UTF‑8 text (kept for now; may be moved to an arena later)
-    pub text: Vec<String>,
-}
-impl TextStore {
-    #[inline]
-    pub fn push(&mut self, elem: &TextElement) -> usize {
-        let idx = self.id.len();
-        self.bbox.push(elem.bbox);
-        self.font_size.push(elem.font_size);
-        self.font_key.push((
-            crate::fonts::canonicalize::canonicalize_font_name(
-                elem.font_name.as_deref().unwrap_or_default(),
-            ),
-            NotNan::new(elem.font_size).unwrap(),
-        ));
-        self.id.push(elem.id);
-        self.text.push(elem.text.clone());
-        idx
-    }
-}
-
-/// Column‑oriented storage for image payload.
-#[derive(Debug, Default)]
-pub struct ImageStore {
-    pub bbox: Vec<crate::geo::Rect>,
-    pub id: Vec<Uuid>,
-}
-impl ImageStore {
-    #[inline]
-    pub fn push(&mut self, elem: &ImageElement) -> usize {
-        let idx = self.id.len();
-        self.bbox.push(elem.bbox);
-        self.id.push(elem.id);
-        idx
-    }
-}
 // -----------------------------------------------------------------------------
 
 /// Font usage analysis structure
@@ -114,7 +94,6 @@ impl FontUsage {
 
 #[derive(Debug)]
 pub struct PdfIndex {
-    pub all_ordered_content: Vec<PageContent>,
     pub by_page: BTreeMap<u32, Vec<usize>>,
     pub font_size_index: Vec<(f32, usize)>,
     pub reference_count_index: Vec<(u32, usize)>,
@@ -123,7 +102,6 @@ pub struct PdfIndex {
     pub order: Vec<ContentHandle>, // document sequence (SoA handle)
     pub text_store: TextStore,     // SoA payload ‑ text
     pub image_store: ImageStore,   // SoA payload ‑ images
-    // TODO: deprecated – migrate callers to SoA stores
     pub fonts: HashMap<(String, NotNan<f32>), FontUsage>,
     pub font_name_frequency_index: Vec<(u32, String)>,
     pub font_size_stats: FontSizeStats,
@@ -131,47 +109,31 @@ pub struct PdfIndex {
 }
 
 impl PdfIndex {
-    pub fn new(page_map: &BTreeMap<u32, Vec<PageContent>>, _match_context: &MatchContext) -> Self {
-        // SoA stores and ordering vector
-        let mut order: Vec<ContentHandle> =
-            Vec::with_capacity(page_map.values().map(|v| v.len()).sum::<usize>());
-        let mut text_store = TextStore::default();
-        let mut image_store = ImageStore::default();
-
-        let mut all_ordered_content = Vec::new();
+    pub fn new(page_map: &BTreeMap<u32, PageContents>, _match_context: &MatchContext) -> Self {
         let mut by_page = BTreeMap::new();
         let mut font_size_index_construction = Vec::new(); // Temp for construction before sorting
         let mut spatial_elements = Vec::new();
         let mut element_id_to_index = HashMap::new();
         let mut fonts_map: HashMap<(String, NotNan<f32>), FontUsage> = HashMap::new(); // Correctly typed
-        let font_size_stats = FontSizeStats::compute(&all_ordered_content);
         let feature_cache = dashmap::DashMap::new();
 
         let mut current_content_index = 0;
 
-        for (page_number, page_contents_on_page) in page_map {
+        // Aggregate all SoA data from PageContents
+        let mut order: Vec<ContentHandle> = Vec::new();
+        let mut text_store = TextStore::default();
+        let mut image_store = ImageStore::default();
+
+        for (page_number, page_contents) in page_map {
             let mut page_element_indices = Vec::new();
 
-            for content_item in page_contents_on_page {
-                // Push into columnar stores first (SoA)
-                match content_item {
-                    PageContent::Text(t) => {
-                        let idx_txt = text_store.push(t);
-                        order.push(ContentHandle::Text(idx_txt));
-                    }
-                    PageContent::Image(img) => {
-                        let idx_img = image_store.push(img);
-                        order.push(ContentHandle::Image(idx_img));
-                    }
-                }
-
-                // Temporary: keep AoS push for legacy code – will be removed later.
-                all_ordered_content.push(content_item.clone());
+            // Process content in document order using the SoA
+            for content_item in page_contents.iter_ordered() {
                 page_element_indices.push(current_content_index);
                 element_id_to_index.insert(content_item.id(), current_content_index);
                 spatial_elements.push(SpatialPageContent::new(content_item.clone()));
 
-                if let PageContent::Text(text_elem) = content_item {
+                if let PageContent::Text(ref text_elem) = content_item {
                     let current_font_size = text_elem.font_size;
                     let canonical_font_name = crate::fonts::canonicalize::canonicalize_font_name(
                         text_elem.font_name.as_deref().unwrap_or_default(),
@@ -195,8 +157,23 @@ impl PdfIndex {
                 }
                 current_content_index += 1;
             }
+
             if !page_element_indices.is_empty() {
                 by_page.insert(*page_number, page_element_indices);
+            }
+
+            // Aggregate SoA data from PageContents
+            order.extend(page_contents.order.clone());
+            // Copy text and image stores (could be optimized to share references in future)
+            for i in 0..page_contents.text_store.id.len() {
+                if let Some(elem) = page_contents.text_store.get(i) {
+                    text_store.push(elem);
+                }
+            }
+            for i in 0..page_contents.image_store.id.len() {
+                if let Some(elem) = page_contents.image_store.get(i) {
+                    image_store.push(elem);
+                }
             }
         }
 
@@ -206,6 +183,30 @@ impl PdfIndex {
 
         let spatial_rtree = RTree::bulk_load(spatial_elements);
         let reference_count_index = Vec::new();
+
+        // Compute font size stats from SoA text store
+        let font_size_stats = {
+            let mut sizes: Vec<f32> = text_store.font_size.clone();
+            if sizes.is_empty() {
+                FontSizeStats {
+                    mean: 12.0,
+                    std_dev: 0.0,
+                    percentiles: [12.0; 5],
+                }
+            } else {
+                sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mean = sizes.iter().sum::<f32>() / sizes.len() as f32;
+                let variance =
+                    sizes.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / sizes.len() as f32;
+                let std_dev = variance.sqrt();
+                let idx = |p: f32| sizes[((sizes.len() as f32) * p) as usize];
+                FontSizeStats {
+                    mean,
+                    std_dev,
+                    percentiles: [idx(0.25), idx(0.50), idx(0.75), idx(0.90), idx(0.95)],
+                }
+            }
+        };
 
         // Build font_name_frequency_index (total usage of a font name across all its sizes)
         let mut font_name_totals: HashMap<String, u32> = HashMap::new();
@@ -219,7 +220,6 @@ impl PdfIndex {
         font_name_frequency_index.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
         PdfIndex {
-            all_ordered_content,
             by_page,
             font_size_index,
             reference_count_index,
@@ -233,6 +233,24 @@ impl PdfIndex {
             font_size_stats,
             feature_cache,
         }
+    }
+
+    // Helper method to reconstruct PageContent from SoA based on ContentHandle
+    pub fn content_from_handle(&self, idx: usize) -> Option<PageContent> {
+        self.order.get(idx).and_then(|handle| match handle {
+            ContentHandle::Text(text_idx) => self.text_store.get(*text_idx).map(PageContent::Text),
+            ContentHandle::Image(image_idx) => {
+                self.image_store.get(*image_idx).map(PageContent::Image)
+            }
+        })
+    }
+
+    // Helper method to get multiple content items efficiently
+    fn content_from_indices(&self, indices: &[usize]) -> Vec<PageContent> {
+        indices
+            .iter()
+            .filter_map(|&idx| self.content_from_handle(idx))
+            .collect()
     }
 
     /// Update reference counts based on destinations in MatchContext
@@ -312,7 +330,7 @@ impl PdfIndex {
 
         // Build the reference count index
         self.reference_count_index.clear();
-        for idx in 0..self.all_ordered_content.len() {
+        for idx in 0..self.order.len() {
             let count = reference_counts.get(&idx).copied().unwrap_or(0);
             self.reference_count_index.push((count, idx));
         }
@@ -322,19 +340,16 @@ impl PdfIndex {
     }
 
     /// Find elements on a specific page
-    pub fn elements_on_page(&self, page_num: u32) -> Vec<&PageContent> {
+    pub fn elements_on_page(&self, page_num: u32) -> Vec<PageContent> {
         if let Some(indices) = self.by_page.get(&page_num) {
-            indices
-                .iter()
-                .map(|&idx| &self.all_ordered_content[idx])
-                .collect()
+            self.content_from_indices(indices)
         } else {
             Vec::new()
         }
     }
 
-    /// Find elements with font size in a specific range
-    pub fn elements_by_font_size(&self, min_size: f32, max_size: f32) -> Vec<&PageContent> {
+    /// Find elements with font size in a specific range - uses SoA for cache efficiency
+    pub fn elements_by_font_size(&self, min_size: f32, max_size: f32) -> Vec<PageContent> {
         // Binary search for the lower and upper bounds
         let lower_idx = self
             .font_size_index
@@ -352,33 +367,37 @@ impl PdfIndex {
             })
             .unwrap_or_else(|idx| idx);
 
-        self.font_size_index[lower_idx..upper_idx]
+        let indices: Vec<usize> = self.font_size_index[lower_idx..upper_idx]
             .iter()
-            .map(|&(_, idx)| &self.all_ordered_content[idx])
-            .collect()
+            .map(|&(_, idx)| idx)
+            .collect();
+
+        self.content_from_indices(&indices)
     }
 
     /// Find elements with at least the specified number of references
-    pub fn elements_by_reference_count(&self, min_count: u32) -> Vec<&PageContent> {
+    pub fn elements_by_reference_count(&self, min_count: u32) -> Vec<PageContent> {
         // Binary search for the lower bound
         let lower_idx = self
             .reference_count_index
             .binary_search_by_key(&min_count, |&(count, _)| count)
             .unwrap_or_else(|idx| idx);
 
-        self.reference_count_index[lower_idx..]
+        let indices: Vec<usize> = self.reference_count_index[lower_idx..]
             .iter()
-            .map(|&(_, idx)| &self.all_ordered_content[idx])
-            .collect()
+            .map(|&(_, idx)| idx)
+            .collect();
+
+        self.content_from_indices(&indices)
     }
 
     /// Find elements within a specified rectangular region
-    pub fn elements_in_region(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<&PageContent> {
+    pub fn elements_in_region(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<PageContent> {
         let query_rect = AABB::from_corners([x0, y0], [x1, y1]);
 
         self.spatial_rtree
             .locate_in_envelope(&query_rect)
-            .map(|spatial_elem| &spatial_elem.element)
+            .map(|spatial_elem| spatial_elem.element.clone())
             .collect()
     }
 
@@ -390,7 +409,7 @@ impl PdfIndex {
         max_font_size: Option<f32>,
         min_references: Option<u32>,
         region: Option<(f32, f32, f32, f32)>,
-    ) -> Vec<&PageContent> {
+    ) -> Vec<PageContent> {
         let mut result_indices: Option<HashSet<usize>> = None;
 
         // Filter by page
@@ -456,42 +475,26 @@ impl PdfIndex {
             };
         }
 
-        // Convert result indices to TextElements
+        // Convert result indices to PageContent
         match result_indices {
-            Some(indices) => indices
-                .into_iter()
-                .map(|idx| &self.all_ordered_content[idx])
-                .collect::<Vec<&PageContent>>(),
-            None => self.all_ordered_content.iter().collect(), // If no filters applied, return all elements
+            Some(indices) => {
+                let indices_vec: Vec<usize> = indices.into_iter().collect();
+                self.content_from_indices(&indices_vec)
+            }
+            None => {
+                // If no filters applied, return all elements
+                (0..self.order.len())
+                    .filter_map(|idx| self.content_from_handle(idx))
+                    .collect()
+            }
         }
     }
 
-    /// Find potential section headings based on font size and reference count
-    // pub fn find_potential_section_headings(&self) -> Vec<&PageContent> {
-    //     // Strategy: Find elements with larger than average font size and with references
-
-    //     // Calculate average font size
-    //     let avg_font_size: f32 = if self.elements.is_empty() {
-    //         12.0 // Default if no elements
-    //     } else {
-    //         self.elements.iter().map(|e| e.font_size).sum::<f32>() / self.elements.len() as f32
-    //     };
-
-    //     // Find elements with font size > avg and at least one reference
-    //     self.search(
-    //         None,
-    //         Some(avg_font_size * 1.2), // 20% larger than average
-    //         None,
-    //         Some(1), // At least one reference
-    //         None,
-    //     )
-    // }
-
-    /// Get TextElement by ID
-    pub fn get_element_by_id(&self, id: &Uuid) -> Option<&PageContent> {
+    /// Get PageContent by ID
+    pub fn get_element_by_id(&self, id: &Uuid) -> Option<PageContent> {
         self.element_id_to_index
             .get(id)
-            .map(|&idx| &self.all_ordered_content[idx])
+            .and_then(|&idx| self.content_from_handle(idx))
     }
 
     /// Update the index with a new MatchContext
@@ -499,32 +502,49 @@ impl PdfIndex {
         self.update_reference_counts(match_context);
     }
 
-    /// Find elements that might match a text string (simple search)
+    /// Find elements that might match a text string - cache-efficient SoA access
+    /// Returns typed handles and scores for zero-copy access
     pub fn find_text_matches(
         &self,
         text: &str,
         threshold: f64,
         start_content_index: Option<usize>,
-    ) -> Vec<(&PageContent, f64)> {
+    ) -> Vec<(TextHandle, f64)> {
         use strsim::normalized_levenshtein;
         let start = start_content_index.unwrap_or(0);
-        if start >= self.all_ordered_content.len() {
-            return Vec::new();
-        }
-        self.all_ordered_content[start..]
-            .iter()
-            .filter_map(|element| match element {
-                PageContent::Text(text_elem) => {
-                    let score = normalized_levenshtein(text, &text_elem.text);
-                    if score >= threshold {
-                        Some((element, score))
-                    } else {
-                        None
+
+        // Cache-efficient: iterate through text store directly
+        let mut results = Vec::new();
+
+        // Iterate through the text column only (cache-friendly)
+        for (text_idx, text_content) in self.text_store.text.iter().enumerate() {
+            let score = normalized_levenshtein(text, text_content);
+            if score >= threshold {
+                // Find the corresponding document index for this text element
+                if let Some(doc_idx) = self.find_doc_index_for_text(text_idx) {
+                    if doc_idx >= start {
+                        results.push((TextHandle(text_idx as u32), score));
                     }
                 }
-                _ => None, // Skip images for text matching
-            })
-            .collect()
+            }
+        }
+        results
+    }
+
+    /// Helper method to find document index for a text store index
+    fn find_doc_index_for_text(&self, text_idx: usize) -> Option<usize> {
+        // Get the ID of the text element
+        let text_id = self.text_store.id.get(text_idx)?;
+        // Look up the document index by ID
+        self.element_id_to_index.get(text_id).copied()
+    }
+
+    /// Get text element by document index - cache efficient
+    pub fn get_text_at(&self, doc_idx: usize) -> Option<TextElement> {
+        match self.order.get(doc_idx)? {
+            ContentHandle::Text(text_idx) => self.text_store.get(*text_idx),
+            ContentHandle::Image(_) => None,
+        }
     }
 
     /// Find lines that might match a text string
@@ -547,27 +567,25 @@ impl PdfIndex {
             .collect()
     }
 
+    /// Cache-efficient average font size calculation using SoA
     pub fn average_font_size(&self) -> f32 {
-        if self.all_ordered_content.is_empty() {
+        if self.text_store.font_size.is_empty() {
             12.0
         } else {
-            self.all_ordered_content
-                .iter()
-                .map(|e| e.as_text().unwrap().font_size)
-                .sum::<f32>()
-                / self.all_ordered_content.len() as f32
+            self.text_store.font_size.iter().sum::<f32>() / self.text_store.font_size.len() as f32
         }
     }
 
     /// Return the top‑k most similar text elements to `seed` between [start_idx, end_idx).
     /// Similarity is computed via `features::compute_similarity`.
+    /// Returns typed handles and similarity scores for zero-copy access.
     pub fn top_k_similar_text<'a>(
         &'a self,
         seed: &'a TextElement,
         start_idx: usize,
         end_idx: usize,
         k: usize,
-    ) -> Vec<(&'a PageContent, f32)> {
+    ) -> Vec<(TextHandle, f32)> {
         {
             if start_idx >= end_idx || start_idx >= self.doc_len() {
                 return Vec::new();
@@ -598,15 +616,16 @@ impl PdfIndex {
 
             // Optional: if we found too few, fall back to neighbour pages
             if candidate_indices.is_empty() {
-                // Fallback to full slice (rare)
-                candidate_indices.extend(
-                    (start_idx..end_idx)
-                        .filter(|idx| matches!(self.content_at(*idx), Some(PageContent::Text(_)))),
-                );
+                // Fallback to full slice (rare) - only text elements
+                for i in start_idx..end_idx {
+                    if let Some(ContentHandle::Text(_)) = self.order.get(i) {
+                        candidate_indices.push(i);
+                    }
+                }
             }
 
             // --- Similarity heap --------------------------------------------------
-            let mut heap: BinaryHeap<(std::cmp::Reverse<NotNan<f32>>, usize)> =
+            let mut heap: BinaryHeap<(std::cmp::Reverse<NotNan<f32>>, TextHandle)> =
                 BinaryHeap::with_capacity(k);
 
             for &abs_idx in &candidate_indices {
@@ -614,11 +633,22 @@ impl PdfIndex {
                 if abs_idx < start_idx || abs_idx >= end_idx {
                     continue;
                 }
-                if let Some(PageContent::Text(txt)) = self.content_at(abs_idx) {
-                    if txt.id == seed.id {
+                if let Some(ContentHandle::Text(text_idx)) = self.order.get(abs_idx) {
+                    let text_handle = TextHandle(*text_idx as u32);
+                    let txt_ref = self.text(text_handle);
+                    if txt_ref.id == seed.id {
                         continue; // skip self
                     }
-                    let feat = match TextFeatures::from_text_element(txt, self) {
+                    // Convert TextElemRef to TextElement for feature computation
+                    let txt = TextElement {
+                        id: txt_ref.id,
+                        text: txt_ref.text.to_string(),
+                        font_size: txt_ref.font_size,
+                        font_name: txt_ref.font_name.map(|s| s.to_string()),
+                        bbox: txt_ref.bbox,
+                        page_number: txt_ref.page_number,
+                    };
+                    let feat = match TextFeatures::from_text_element(&txt, self) {
                         Some(f) => f,
                         None => continue,
                     };
@@ -628,22 +658,20 @@ impl PdfIndex {
                         Err(_) => continue,
                     };
                     if heap.len() < k {
-                        heap.push((std::cmp::Reverse(sim_notnan), abs_idx));
+                        heap.push((std::cmp::Reverse(sim_notnan), text_handle));
                     } else if let Some(&(std::cmp::Reverse(lowest), _)) = heap.peek() {
                         if sim_notnan.into_inner() > lowest.into_inner() {
                             heap.pop();
-                            heap.push((std::cmp::Reverse(sim_notnan), abs_idx));
+                            heap.push((std::cmp::Reverse(sim_notnan), text_handle));
                         }
                     }
                 }
             }
 
-            // Collect and sort descending
-            let mut results: Vec<(&PageContent, f32)> = heap
+            // Collect and sort descending - return handles for efficiency
+            let mut results: Vec<(TextHandle, f32)> = heap
                 .into_iter()
-                .map(|(std::cmp::Reverse(sim), abs_idx)| {
-                    (self.content_at(abs_idx).unwrap(), sim.into_inner())
-                })
+                .map(|(std::cmp::Reverse(sim), handle)| (handle, sim.into_inner()))
                 .collect();
             results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             results
@@ -653,50 +681,35 @@ impl PdfIndex {
     /// Total number of sequential content items in document order
     #[inline]
     pub fn doc_len(&self) -> usize {
-        self.all_ordered_content.len()
+        self.order.len()
     }
 
     /// Get a single content item by its sequential document index
     #[inline]
-    pub fn content_at(&self, idx: usize) -> Option<&PageContent> {
-        self.all_ordered_content.get(idx)
+    pub fn content_at(&self, idx: usize) -> Option<PageContent> {
+        self.content_from_handle(idx)
     }
 
     /// Borrow a slice of content by sequential indices
     #[inline]
-    pub fn content_slice(&self, start: usize, end: usize) -> &[PageContent] {
-        &self.all_ordered_content[start..end]
+    pub fn content_slice(&self, start: usize, end: usize) -> Vec<PageContent> {
+        (start..end.min(self.order.len()))
+            .filter_map(|idx| self.content_from_handle(idx))
+            .collect()
     }
 
-    /// Find elements with a specific font and size range
-    ///
-    /// # Arguments
-    ///
-    /// * `font_id`: Option<&str> - The font ID to filter by
-    /// * `min_size`: Option<f32> - The minimum font size to filter by. Defaults to average font size * 0.9
-    /// * `max_size`: Option<f32> - The maximum font size to filter by. Defaults to average font size * 1.1
-    /// * `min_frequency`: Option<u32> - The minimum frequency to filter by
+    /// Find elements with a specific font and size range - cache-efficient using font index
     pub fn elements_by_font(
         &self,
         font_name_filter: Option<&str>,
         target_font_size: Option<f32>,
         min_size_overall: Option<f32>,
         max_size_overall: Option<f32>,
-    ) -> Vec<&PageContent> {
+    ) -> Vec<PageContent> {
         let mut result_indices = HashSet::new();
 
-        let avg_font_size_for_default: f32 = {
-            let text_font_sizes_vec: Vec<f32> = self
-                .all_ordered_content
-                .iter()
-                .filter_map(|e| e.font_size())
-                .collect();
-            if text_font_sizes_vec.is_empty() {
-                12.0
-            } else {
-                text_font_sizes_vec.iter().sum::<f32>() / text_font_sizes_vec.len() as f32
-            }
-        };
+        // Cache-efficient: use pre-computed average from SoA
+        let avg_font_size_for_default = self.average_font_size();
 
         // Only apply overall size filters if no specific target size is provided
         let use_overall_size_filters = target_font_size.is_none();
@@ -722,10 +735,8 @@ impl PdfIndex {
             }
         }
 
-        result_indices
-            .into_iter()
-            .map(|idx: usize| &self.all_ordered_content[idx])
-            .collect()
+        let indices_vec: Vec<usize> = result_indices.into_iter().collect();
+        self.content_from_indices(&indices_vec)
     }
 
     /// Get font usage distribution, optionally scoped to a range of content indices
@@ -735,60 +746,58 @@ impl PdfIndex {
         end_index: Option<usize>,
     ) -> HashMap<(String, NotNan<f32>), FontUsage> {
         let start = start_index.unwrap_or(0);
-        let end = end_index.unwrap_or(self.all_ordered_content.len());
+        let end = end_index.unwrap_or(self.order.len());
 
         let mut scoped_fonts: HashMap<(String, NotNan<f32>), FontUsage> = HashMap::new();
 
         // If no scoping, return the full index
-        if start == 0 && end == self.all_ordered_content.len() {
+        if start == 0 && end == self.order.len() {
             return self.fonts.clone();
         }
 
-        // Otherwise, build scoped font usage
-        for (idx, content) in self.all_ordered_content.iter().enumerate() {
-            if idx >= start && idx < end {
-                if let PageContent::Text(text_elem) = content {
-                    let canonical_font_name = crate::fonts::canonicalize::canonicalize_font_name(
-                        text_elem.font_name.as_deref().unwrap_or_default(),
-                    );
+        // Cache-efficient: iterate over SoA text store in the specified range
+        for (global_idx, text_elem) in self.text_store.iter().enumerate() {
+            if global_idx >= start && global_idx < end {
+                let canonical_font_name = crate::fonts::canonicalize::canonicalize_font_name(
+                    text_elem.font_name.as_deref().unwrap_or_default(),
+                );
 
-                    let font_style_key = (
-                        canonical_font_name.clone(),
-                        NotNan::new(text_elem.font_size).unwrap(),
-                    );
+                let font_style_key = (
+                    canonical_font_name.clone(),
+                    NotNan::new(text_elem.font_size).unwrap(),
+                );
 
-                    let font_entry = scoped_fonts.entry(font_style_key).or_insert_with(|| {
-                        FontUsage::new(
-                            canonical_font_name,
-                            text_elem.font_name.clone(),
-                            text_elem.font_size,
-                        )
-                    });
-                    font_entry.add_usage(idx);
-                }
+                let font_entry = scoped_fonts.entry(font_style_key).or_insert_with(|| {
+                    FontUsage::new(
+                        canonical_font_name,
+                        text_elem.font_name.clone(),
+                        text_elem.font_size,
+                    )
+                });
+                font_entry.add_usage(global_idx);
             }
         }
 
         scoped_fonts
     }
 
-    /// Get font size statistics (mean, std dev) for a given scope
+    /// Get font size statistics - cache-efficient using SoA
     pub fn get_font_size_stats(
         &self,
         start_index: Option<usize>,
         end_index: Option<usize>,
     ) -> (f32, f32) {
         let start = start_index.unwrap_or(0);
-        let end = end_index.unwrap_or(self.all_ordered_content.len());
+        let end = end_index
+            .unwrap_or(self.text_store.font_size.len())
+            .min(self.text_store.font_size.len());
 
-        let font_sizes: Vec<f32> = self.all_ordered_content[start..end]
-            .iter()
-            .filter_map(|e| e.as_text().map(|t| t.font_size))
-            .collect();
-
-        if font_sizes.is_empty() {
+        if start >= end || self.text_store.font_size.is_empty() {
             return (12.0, 0.0); // Default mean, no deviation
         }
+
+        // Cache-efficient: direct access to font_size column
+        let font_sizes = &self.text_store.font_size[start..end];
 
         let mean = font_sizes.iter().sum::<f32>() / font_sizes.len() as f32;
         let variance = font_sizes
@@ -858,18 +867,18 @@ impl PdfIndex {
             .collect()
     }
 
-    /// Get total text element count in scope
+    /// Get total text element count in scope - cache-efficient
     pub fn get_text_element_count(
         &self,
         start_index: Option<usize>,
         end_index: Option<usize>,
     ) -> u32 {
         let start = start_index.unwrap_or(0);
-        let end = end_index.unwrap_or(self.all_ordered_content.len());
+        let end = end_index.unwrap_or(self.order.len()).min(self.order.len());
 
-        self.all_ordered_content[start..end]
+        self.order[start..end]
             .iter()
-            .filter(|e| e.is_text())
+            .filter(|handle| matches!(handle, ContentHandle::Text(_)))
             .count() as u32
     }
 
@@ -878,7 +887,7 @@ impl PdfIndex {
         &self,
         start_element: &PageContent,
         end_element: Option<&PageContent>,
-    ) -> Vec<&PageContent> {
+    ) -> Vec<PageContent> {
         let start_id = start_element.id();
         let end_id = end_element.map(|e| e.id());
 
@@ -913,11 +922,6 @@ impl PdfIndex {
                     "[get_elements_between_markers] Start element ID {} not found in index",
                     start_id
                 );
-                // Let's also check what IDs are actually in the index
-                println!("[get_elements_between_markers] Available IDs in index:");
-                for (id, idx) in &self.element_id_to_index {
-                    println!("  {} -> {}", id, idx);
-                }
                 return Vec::new(); // Start element not found in index
             }
         };
@@ -935,43 +939,37 @@ impl PdfIndex {
                     }
                     None => {
                         println!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
-                        self.all_ordered_content.len() // End element not found, go to end of document
+                        self.order.len() // End element not found, go to end of document
                     }
                 }
             }
             None => {
                 println!("[get_elements_between_markers] No end element, using document end");
-                self.all_ordered_content.len() // No end element, go to end of document
+                self.order.len() // No end element, go to end of document
             }
         };
 
         println!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
-                 start_idx_inclusive, end_idx_exclusive, self.all_ordered_content.len());
+                 start_idx_inclusive, end_idx_exclusive, self.order.len());
 
         // Now, start_idx_inclusive will be used directly for the slice start.
         // Ensure start_idx_inclusive is not past end_idx_exclusive or bounds.
-        if start_idx_inclusive >= end_idx_exclusive
-            || start_idx_inclusive >= self.all_ordered_content.len()
-        {
+        if start_idx_inclusive >= end_idx_exclusive || start_idx_inclusive >= self.order.len() {
             println!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
-                     start_idx_inclusive, end_idx_exclusive, self.all_ordered_content.len());
+                     start_idx_inclusive, end_idx_exclusive, self.order.len());
             return Vec::new();
         }
 
         // Ensure the slice end is within bounds.
-        // end_idx_exclusive can be self.all_ordered_content.len(), which is fine for slicing.
-        let effective_end_idx = std::cmp::min(end_idx_exclusive, self.all_ordered_content.len());
+        let effective_end_idx = std::cmp::min(end_idx_exclusive, self.order.len());
 
         println!(
             "[get_elements_between_markers] Effective slice: [{}..{}]",
             start_idx_inclusive, effective_end_idx
         );
 
-        // Slice is [start_idx_inclusive..effective_end_idx]
-        let result: Vec<&PageContent> = self.all_ordered_content
-            [start_idx_inclusive..effective_end_idx]
-            .iter()
-            .collect();
+        // Use cache-efficient content_slice method
+        let result = self.content_slice(start_idx_inclusive, effective_end_idx);
 
         println!(
             "[get_elements_between_markers] Returning {} elements",
@@ -981,81 +979,63 @@ impl PdfIndex {
     }
 
     /// Get elements after a specific marker element
-    pub fn get_elements_after(&self, marker: &PageContent) -> Vec<&PageContent> {
+    pub fn get_elements_after(&self, marker: &PageContent) -> Vec<PageContent> {
         if let Some(&idx) = self.element_id_to_index.get(&marker.id()) {
-            self.all_ordered_content[idx..].iter().collect()
+            self.content_slice(idx, self.order.len())
         } else {
             Vec::new()
         }
     }
 
-    /// Get image by ID
-    pub fn get_image_by_id(&self, id: &Uuid) -> Option<&ImageElement> {
-        self.all_ordered_content.iter().find_map(|pc| match pc {
-            PageContent::Image(img_elem) if img_elem.id == *id => Some(img_elem),
-            _ => None,
-        })
+    /// Get image by ID - cache-efficient using SoA
+    pub fn get_image_by_id(&self, id: &Uuid) -> Option<ImageElement> {
+        // Search through image store directly
+        for img_elem in self.image_store.iter() {
+            if img_elem.id == *id {
+                return Some(img_elem);
+            }
+        }
+        None
     }
 
-    /// Calculate font size statistics including mean, standard deviation, and percentiles
+    /// Calculate font size statistics - cache-efficient using SoA
     pub fn font_size_stats(&self) -> FontSizeStats {
-        let mut sizes: Vec<f32> = self
-            .all_ordered_content
-            .iter()
-            .filter_map(|e| e.as_text().map(|t| t.font_size))
-            .collect();
-
-        if sizes.is_empty() {
-            return FontSizeStats {
-                mean: 12.0,
-                std_dev: 0.0,
-                percentiles: [12.0; 5],
-            };
-        }
-
-        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mean = sizes.iter().sum::<f32>() / sizes.len() as f32;
-        let variance = sizes.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / sizes.len() as f32;
-        let std_dev = variance.sqrt();
-
-        // Calculate percentiles (25th, 50th, 75th, 90th, 95th)
-        let percentiles = [
-            sizes[(sizes.len() as f32 * 0.25) as usize],
-            sizes[(sizes.len() as f32 * 0.50) as usize],
-            sizes[(sizes.len() as f32 * 0.75) as usize],
-            sizes[(sizes.len() as f32 * 0.90) as usize],
-            sizes[(sizes.len() as f32 * 0.95) as usize],
-        ];
-
-        FontSizeStats {
-            mean,
-            std_dev,
-            percentiles,
-        }
+        // Use pre-computed stats if available, otherwise compute from SoA
+        self.font_size_stats.clone()
     }
 
     /// Find elements with statistically significant font sizes
-    /// Returns elements whose font size is above the specified percentile
-    pub fn elements_by_font_size_percentile(&self, percentile: f32) -> Vec<&PageContent> {
+    pub fn elements_by_font_size_percentile(&self, percentile: f32) -> Vec<PageContent> {
         let stats = self.font_size_stats();
         let threshold = stats.percentiles[3]; // Using 90th percentile as default
 
-        self.all_ordered_content
-            .iter()
-            .filter(|e| e.as_text().map_or(false, |t| t.font_size >= threshold))
-            .collect()
+        // Cache-efficient: iterate through font_size column directly
+        let mut results = Vec::new();
+        for (idx, &font_size) in self.text_store.font_size.iter().enumerate() {
+            if font_size >= threshold {
+                if let Some(text_elem) = self.text_store.get(idx) {
+                    results.push(PageContent::Text(text_elem));
+                }
+            }
+        }
+        results
     }
 
-    /// Find elements that are likely section boundaries based on font size distribution
-    pub fn find_potential_section_boundaries(&self) -> Vec<&PageContent> {
+    /// Find elements that are likely section boundaries - cache-efficient
+    pub fn find_potential_section_boundaries(&self) -> Vec<PageContent> {
         let stats = self.font_size_stats();
         let threshold = stats.mean + (stats.std_dev * 1.5); // Elements > 1.5 standard deviations above mean
 
-        self.all_ordered_content
-            .iter()
-            .filter(|e| e.as_text().map_or(false, |t| t.font_size >= threshold))
-            .collect()
+        // Cache-efficient: iterate through font_size column directly
+        let mut results = Vec::new();
+        for (idx, &font_size) in self.text_store.font_size.iter().enumerate() {
+            if font_size >= threshold {
+                if let Some(text_elem) = self.text_store.get(idx) {
+                    results.push(PageContent::Text(text_elem));
+                }
+            }
+        }
+        results
     }
 
     #[inline]
@@ -1067,6 +1047,52 @@ impl PdfIndex {
             .expect("feature extraction should never fail");
         self.feature_cache.insert(txt.id, feat.clone());
         feat
+    }
+
+    /// Zero-copy access to text element via typed handle
+    #[inline]
+    pub fn text(&self, h: TextHandle) -> TextElemRef<'_> {
+        let i = h.0 as usize;
+        TextElemRef {
+            id: self.text_store.id[i],
+            text: &self.text_store.text[i],
+            font_size: self.text_store.font_size[i],
+            font_name: self.text_store.font_name[i].as_deref(),
+            bbox: self.text_store.bbox[i],
+            page_number: self.text_store.page_number[i],
+        }
+    }
+
+    /// Zero-copy access to image element via typed handle
+    #[inline]
+    pub fn image(&self, h: ImageHandle) -> ImageElemRef<'_> {
+        let i = h.0 as usize;
+        ImageElemRef {
+            id: self.image_store.id[i],
+            bbox: self.image_store.bbox[i],
+            page_number: self.image_store.page_number[i],
+            image_object: &self.image_store.image_object[i],
+        }
+    }
+
+    /// Get typed handle from document index
+    pub fn get_handle(&self, doc_idx: usize) -> Option<ContentHandle> {
+        self.order.get(doc_idx).copied()
+    }
+
+    /// Convert ContentHandle to typed handles
+    pub fn as_text_handle(&self, handle: ContentHandle) -> Option<TextHandle> {
+        match handle {
+            ContentHandle::Text(idx) => Some(TextHandle(idx as u32)),
+            ContentHandle::Image(_) => None,
+        }
+    }
+
+    pub fn as_image_handle(&self, handle: ContentHandle) -> Option<ImageHandle> {
+        match handle {
+            ContentHandle::Text(_) => None,
+            ContentHandle::Image(idx) => Some(ImageHandle(idx as u32)),
+        }
     }
 }
 
