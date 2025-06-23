@@ -1,0 +1,54 @@
+---
+layout: default
+---
+
+<div class="doc-layout">
+  <aside class="doc-sidebar">
+    <nav class="doc-nav">
+      <h3>Documentation</h3>
+      <ul>
+        <li><a href="{{ '/docs/template-syntax/' | relative_url }}">Template Syntax</a></li>
+        <li><a href="{{ '/docs/parser/' | relative_url }}">Parser Details</a></li>
+        <li><a href="{{ '/docs/collation/' | relative_url }}">Content Collation</a></li>
+        <li><a href="{{ '/docs/implementation-plan/' | relative_url }}">Implementation Plan</a></li>
+      </ul>
+    </nav>
+  </aside>
+
+  <main class="doc-content">
+    <article class="doc-article">
+      <header class="doc-header">
+        <h1 class="doc-title">{{ page.title | escape }}</h1>
+        {%- if page.description -%}
+        <p class="doc-description">{{ page.description }}</p>
+        {%- endif -%}
+      </header>
+
+      {%- if page.toc != false -%}
+      <nav class="doc-toc">
+        <h2>Contents</h2>
+        {{ content | toc_only }}
+      </nav>
+      {%- endif -%}
+
+      <div class="doc-body">
+        {{ content }}
+      </div>
+
+      <footer class="doc-footer">
+        <div class="doc-nav-links">
+          {%- if page.prev -%}
+          <a href="{{ page.prev.url | relative_url }}" class="doc-nav-prev">
+            ← {{ page.prev.title }}
+          </a>
+          {%- endif -%}
+          {%- if page.next -%}
+          <a href="{{ page.next.url | relative_url }}" class="doc-nav-next">
+            {{ page.next.title }} →
+          </a>
+          {%- endif -%}
+        </div>
+      </footer>
+    </article>
+  </main>
+</div>

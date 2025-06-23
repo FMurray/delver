@@ -1,0 +1,78 @@
+# Site settings
+title: Delver
+email: support@delver.dev
+description: >-
+  A high-performance, declarative tool for parsing and splitting unstructured documents, 
+  with an initial focus on scanned PDF files (without OCR).
+baseurl: "/delver" # the subpath of your site, e.g. /blog
+url: "https://yourusername.github.io" # the base hostname & protocol for your site
+twitter_username: delver_dev
+github_username: yourusername
+
+# Build settings
+markdown: kramdown
+highlighter: rouge
+theme: minima
+
+# GitHub Pages settings
+plugins:
+  - jekyll-feed
+  - jekyll-sitemap
+  - jekyll-seo-tag
+
+# Exclude from processing
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
+
+# Collections
+collections:
+  docs:
+    output: true
+    permalink: /:collection/:name/
+
+# Navigation
+navigation:
+  - title: Home
+    url: /
+  - title: Getting Started
+    url: /getting-started/
+  - title: Documentation
+    url: /documentation/
+    submenu:
+      - title: Template Syntax
+        url: /docs/template-syntax/
+      - title: Parser Details
+        url: /docs/parser/
+      - title: Content Collation
+        url: /docs/collation/
+      - title: Implementation Plan
+        url: /docs/implementation-plan/
+  - title: API Reference
+    url: /api/
+  - title: GitHub
+    url: https://github.com/yourusername/delver
+
+# Code highlighting
+kramdown:
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    css_class: 'highlight'
+    span:
+      line_numbers: false
+    block:
+      line_numbers: true
+
+# SEO settings
+lang: en
+author: Delver Team
+logo: /assets/images/logo.png
+social:
+  name: Delver
+  links:
+    - https://github.com/yourusername/delver

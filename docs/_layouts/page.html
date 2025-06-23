@@ -1,0 +1,34 @@
+---
+layout: default
+---
+
+<article class="post">
+
+  <header class="post-header">
+    <h1 class="post-title">{{ page.title | escape }}</h1>
+    {%- if page.description -%}
+    <p class="post-description">{{ page.description }}</p>
+    {%- endif -%}
+  </header>
+
+  {%- if page.toc -%}
+  <nav class="toc">
+    <h2>Table of Contents</h2>
+    {{ content | toc_only }}
+  </nav>
+  {%- endif -%}
+
+  <div class="post-content">
+    {{ content }}
+  </div>
+
+  {%- if page.tags.size > 0 -%}
+  <div class="post-tags">
+    <strong>Tags:</strong>
+    {%- for tag in page.tags -%}
+    <span class="tag">{{ tag }}</span>
+    {%- endfor -%}
+  </div>
+  {%- endif -%}
+
+</article>
