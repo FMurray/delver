@@ -16,9 +16,6 @@ markdown: kramdown
 highlighter: rouge
 theme: minima
 
-sass: 
-  sass_dir: assets/sass
-
 # GitHub Pages settings
 plugins:
   - jekyll-feed
