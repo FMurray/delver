@@ -5,7 +5,7 @@ description: >-
   A high-performance, declarative tool for parsing and splitting unstructured documents, 
   with an initial focus on scanned PDF files (without OCR).
 baseurl: "/delver" # the subpath of your site, e.g. /blog
-url: "https://yourusername.github.io" # the base hostname & protocol for your site
+url: "https://fmurray.github.io" # the base hostname & protocol for your site
 twitter_username: delver_dev
 github_username: yourusername
 
@@ -13,6 +13,9 @@ github_username: yourusername
 markdown: kramdown
 highlighter: rouge
 theme: minima
+
+sass: 
+  sass_dir: assets/sass
 
 # GitHub Pages settings
 plugins:
