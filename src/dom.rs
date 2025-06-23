@@ -14,6 +14,7 @@ use serde_json;
 use std::io::ErrorKind;
 use std::sync::{Arc, Weak};
 use std::{collections::HashMap, io::Error}; // Add image crate import
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum EmbeddingModel {
@@ -129,6 +130,8 @@ pub struct ChunkOutput {
     pub text: String,
     pub metadata: HashMap<String, serde_json::Value>,
     pub chunk_index: usize,
+    pub parent_name: Option<String>,    // Immediate containing section name
+    pub parent_index: Option<usize>,    // Immediate containing section index
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -141,6 +144,8 @@ pub struct ImageOutput {
     pub summary: Option<String>,
     pub embedding: Option<Vec<f32>>, // Assuming embedding is Vec<f32>
     pub metadata: HashMap<String, serde_json::Value>,
+    pub parent_name: Option<String>,    // Immediate containing section name
+    pub parent_index: Option<usize>,    // Immediate containing section index
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -421,8 +426,29 @@ pub fn process_matched_content(
     matched_items: &Vec<TemplateContentMatch>,
     index: &crate::search_index::PdfIndex,  // Add index parameter to resolve handles
 ) -> Vec<ProcessedOutput> {
-    let mut output_elements = Vec::new();
+    let mut global_chunk_counter = 0;
+    let mut all_outputs = Vec::new();
+    
+    // Process all content and then fix parent references
+    process_matched_content_recursive(
+        matched_items, 
+        index, 
+        &mut all_outputs,
+        &mut global_chunk_counter,
+        None, // parent_info: Option<(String, usize)>
+    );
+    
+    all_outputs
+}
 
+// Recursive function that builds the output list and tracks parent relationships
+fn process_matched_content_recursive(
+    matched_items: &Vec<TemplateContentMatch>,
+    index: &crate::search_index::PdfIndex,
+    all_outputs: &mut Vec<ProcessedOutput>,
+    global_chunk_counter: &mut usize,
+    parent_info: Option<(String, usize)>, // (parent_name, parent_output_index)
+) {
     for match_item in matched_items {
         match &match_item.template_element.element_type {
             ElementType::TextChunk | ElementType::Paragraph => {
@@ -446,47 +472,120 @@ pub fn process_matched_content(
                     .collect();
 
                 if !text_elements_to_chunk.is_empty() {
-                    let chunk_outputs = process_text_chunk_elements(
+                    let chunk_outputs = process_text_chunk_elements_simple(
                         &text_elements_to_chunk,
                         &match_item.template_element,
                         &match_item.metadata,
+                        parent_info.clone(),
+                        global_chunk_counter,
                     );
                     for chunk_output in chunk_outputs {
-                        output_elements.push(ProcessedOutput::Text(chunk_output));
+                        all_outputs.push(ProcessedOutput::Text(chunk_output));
                     }
                 }
             }
             ElementType::Section => {
-                if !match_item.children.is_empty() {
-                    output_elements.extend(process_matched_content(&match_item.children, index));
-                } else {
-                    let section_text_elements: Vec<TextElement> = match_item
-                        .matched_content
-                        .iter()
-                        .filter_map(|mc_ref| match mc_ref {
-                            MatchedContent::Index(doc_idx) => {
-                                // Resolve index to get actual content
-                                if let Some(content) = index.content_at(*doc_idx) {
-                                    match content {
-                                        PageContent::Text(text_elem) => Some(text_elem),
-                                        PageContent::Image(_) => None,
-                                    }
-                                } else {
-                                    None
+                let current_section_name = match_item.template_element.name.clone();
+                
+                // First, process the section's own content if it has any
+                let section_text_elements: Vec<TextElement> = match_item
+                    .matched_content
+                    .iter()
+                    .filter_map(|mc_ref| match mc_ref {
+                        MatchedContent::Index(doc_idx) => {
+                            // Resolve index to get actual content
+                            if let Some(content) = index.content_at(*doc_idx) {
+                                match content {
+                                    PageContent::Text(text_elem) => Some(text_elem),
+                                    PageContent::Image(_) => None,
                                 }
+                            } else {
+                                None
                             }
-                            MatchedContent::None => None,
-                        })
-                        .collect();
+                        }
+                        MatchedContent::None => None,
+                    })
+                    .collect();
 
-                    if !section_text_elements.is_empty() {
-                        let chunk_outputs = process_text_chunk_elements(
-                            &section_text_elements,
-                            &match_item.template_element,
-                            &match_item.metadata,
-                        );
-                        for chunk_output in chunk_outputs {
-                            output_elements.push(ProcessedOutput::Text(chunk_output));
+                // Track where this section's content will be in the output
+                let section_output_index = all_outputs.len();
+                let mut section_has_content = false;
+
+                if !section_text_elements.is_empty() {
+                    let chunk_outputs = process_text_chunk_elements_simple(
+                        &section_text_elements,
+                        &match_item.template_element,
+                        &match_item.metadata,
+                        parent_info.clone(), // FIXED: Section's own content gets the parent info passed to this section
+                        global_chunk_counter,
+                    );
+                    for chunk_output in chunk_outputs {
+                        all_outputs.push(ProcessedOutput::Text(chunk_output));
+                        section_has_content = true;
+                    }
+                }
+                
+                // Determine parent info for children - children should reference THIS section
+                let child_parent_info = if section_has_content {
+                    // If this section itself has a parent, then its children should reference this section
+                    // If this section has no parent (root-level), then its immediate TextChunk children should also have no parent
+                    // but nested Sections should reference this section
+                    if parent_info.is_some() {
+                        // This is a nested section, so children reference this section
+                        Some((current_section_name.clone(), section_output_index))
+                    } else {
+                        // This is a root-level section, so immediate TextChunk children get no parent
+                        // but nested Sections should reference this section
+                        // We'll handle this distinction in the child processing
+                        Some((current_section_name.clone(), section_output_index))
+                    }
+                } else {
+                    // Section has no content, children inherit the same parent
+                    parent_info.clone()
+                };
+                
+                // Process any children with updated parent info
+                if !match_item.children.is_empty() {
+                    // Special handling: if this is a root-level section (parent_info is None),
+                    // then TextChunk children should get None as parent, but Section children should get this section as parent
+                    for child_match in &match_item.children {
+                        match &child_match.template_element.element_type {
+                            ElementType::TextChunk | ElementType::Paragraph => {
+                                // TextChunk children of root-level sections get no parent
+                                let textchunk_parent_info = if parent_info.is_none() {
+                                    None // Root-level section's TextChunk children have no parent
+                                } else {
+                                    child_parent_info.clone() // Nested section's TextChunk children have parent
+                                };
+                                
+                                process_matched_content_recursive(
+                                    &vec![child_match.clone()], 
+                                    index, 
+                                    all_outputs,
+                                    global_chunk_counter,
+                                    textchunk_parent_info,
+                                );
+                            }
+                            ElementType::Section => {
+                                // Section children always get this section as parent (regardless of nesting level)
+                                process_matched_content_recursive(
+                                    &vec![child_match.clone()], 
+                                    index, 
+                                    all_outputs,
+                                    global_chunk_counter,
+                                    child_parent_info.clone(),
+                                );
+                            }
+                            _ => {
+                                // Other types use the default logic
+                                process_matched_content_recursive(
+                                    &vec![child_match.clone()], 
+                                    index, 
+                                    all_outputs,
+                                    global_chunk_counter,
+                                    child_parent_info.clone(),
+                                );
+                            }
                         }
                     }
                 }
@@ -498,10 +597,11 @@ pub fn process_matched_content(
                         // Resolve index to get actual content
                         if let Some(content) = index.content_at(*doc_idx) {
                             if let PageContent::Image(image_elem) = content {
-                                output_elements.push(process_image_element(
+                                all_outputs.push(process_image_element_simple(
                                     &image_elem,
                                     &match_item.template_element,
                                     &match_item.metadata,
+                                    parent_info.clone(),
                                 ));
                                 image_processed = true;
                                 break;
@@ -539,13 +639,15 @@ pub fn process_matched_content(
                     })
                     .collect();
                 if !table_text_elements.is_empty() {
-                    let chunk_outputs = process_text_chunk_elements(
+                    let chunk_outputs = process_text_chunk_elements_simple(
                         &table_text_elements,
                         &match_item.template_element,
                         &match_item.metadata,
+                        parent_info.clone(),
+                        global_chunk_counter,
                     );
                     for chunk_output in chunk_outputs {
-                        output_elements.push(ProcessedOutput::Text(chunk_output));
+                        all_outputs.push(ProcessedOutput::Text(chunk_output));
                     }
                 }
             }
@@ -566,15 +668,14 @@ pub fn process_matched_content(
             }
         }
     }
-
-    output_elements
 }
 
 // Helper function to process a matched Image element based on its children
-fn process_image_element(
+fn process_image_element_simple(
     image_element: &crate::parse::ImageElement,
     template_element: &Element,
     metadata: &HashMap<String, Value>,
+    parent_info: Option<(String, usize)>,
 ) -> ProcessedOutput {
     // Convert existing metadata from Value to serde_json::Value
     let mut json_metadata: HashMap<String, serde_json::Value> = HashMap::new();
@@ -600,6 +701,13 @@ fn process_image_element(
         json_metadata.insert(key.clone(), json_value);
     }
 
+    // Extract parent information
+    let (parent_name, parent_index) = if let Some((name, index)) = parent_info {
+        (Some(name), Some(index))
+    } else {
+        (None, None)
+    };
+
     let mut image_output = ImageOutput {
         id: image_element.id.to_string(),
         page_number: image_element.page_number,
@@ -614,6 +722,8 @@ fn process_image_element(
         summary: None,
         embedding: None,
         metadata: json_metadata,
+        parent_name,
+        parent_index,
     };
 
     // Attempt to decode image bytes once if needed by any child
@@ -736,126 +846,151 @@ fn process_image_element(
     ProcessedOutput::Image(image_output)
 }
 
-fn process_text_chunk_elements(
+fn process_text_chunk_elements_simple(
     elements: &[TextElement],
     template_element: &Element,
     metadata: &HashMap<String, Value>,
+    parent_info: Option<(String, usize)>,
+    global_chunk_counter: &mut usize,
 ) -> Vec<ChunkOutput> {
+    // -------- 1. resolve parameters once --------
     let chunk_size = template_element
         .attributes
         .get("chunkSize")
-        .map_or(500, |v| {
-            if let Value::Number(n) = v {
-                *n as usize
-            } else {
-                500
-            }
-        });
+        .and_then(|v| v.as_number())
+        .unwrap_or(500) as usize;
 
     let chunk_overlap = template_element
         .attributes
         .get("chunkOverlap")
-        .map_or(150, |v| {
-            if let Value::Number(n) = v {
-                *n as usize
-            } else {
-                150
-            }
-        });
+        .and_then(|v| v.as_number())
+        .unwrap_or(150) as usize;
 
-    // Use your existing chunking logic
-    let strategy = ChunkingStrategy::Characters {
-        max_chars: chunk_size,
+    // -------- 2. static conversion of template‑level metadata --------
+    // Transform once rather than for every chunk.
+    let base_metadata: std::sync::Arc<HashMap<String, serde_json::Value>> = {
+        let mut out = HashMap::new();
+        for (k, v) in metadata {
+            let json_value = match v {
+                Value::String(s) => serde_json::Value::String(s.clone()),
+                Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+                Value::Boolean(b) => serde_json::Value::Bool(*b),
+                Value::Array(arr) => {
+                    let json_arr: Vec<_> = arr
+                        .iter()
+                        .map(|vv| match vv {
+                            Value::String(s) => serde_json::Value::String(s.clone()),
+                            Value::Number(n) => {
+                                serde_json::Value::Number(serde_json::Number::from(*n))
+                            }
+                            Value::Boolean(b) => serde_json::Value::Bool(*b),
+                            _ => serde_json::Value::String(format!("{:?}", vv)),
+                        })
+                        .collect();
+                    serde_json::Value::Array(json_arr)
+                }
+                Value::Identifier(s) => serde_json::Value::String(s.clone()),
+            };
+            out.insert(k.clone(), json_value);
+        }
+        std::sync::Arc::new(out)
     };
+
+    let tokenizer = Tokenizer::from_pretrained("Qwen/Qwen2-7B-Instruct", None).unwrap_or_else(|e| {
+        panic!("Failed to load tokenizer: {}", e);
+    });
+    let strategy = ChunkingStrategy::Tokens {
+        max_tokens: chunk_size,
+        chunk_overlap,
+        tokenizer: tokenizer,
+    };
+
+    // -------- 3. chunk the elements --------
+    // let strategy = ChunkingStrategy::Characters {
+    //     max_chars: chunk_size,
+    // };
     let chunks = chunk_text_elements(elements, &strategy, chunk_overlap);
 
-    chunks
-        .iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let chunk_text = chunk
-                .iter()
-                .map(|e| e.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
+    // -------- 4. Extract parent information --------
+    let (parent_name, parent_index) = if let Some((name, index)) = parent_info {
+        (Some(name), Some(index))
+    } else {
+        (None, None)
+    };
 
-            // Calculate page number metadata
-            let mut page_char_counts: std::collections::HashMap<u32, usize> =
-                std::collections::HashMap::new();
-            let mut all_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // -------- 5. build outputs --------
+    let mut outputs = Vec::with_capacity(chunks.len());
 
-            for element in chunk {
-                all_pages.insert(element.page_number);
-                *page_char_counts.entry(element.page_number).or_insert(0) += element.text.len();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        // a) pre‑compute char capacity
+        let est_chars: usize = chunk.iter().map(|e| e.text.len()).sum();
+        let mut chunk_text = String::with_capacity(est_chars + chunk.len()); // +spaces
+
+        // b) page statistics (we almost never have more than a handful of pages per chunk)
+        let mut page_char_counts: Vec<(u32, usize)> = Vec::new();
+
+        for (i, elem) in chunk.iter().enumerate() {
+            chunk_text.push_str(elem.text.as_str());
+            if i + 1 != chunk.len() {
+                chunk_text.push(' ');
             }
 
-            // Find the primary page (page with most content by character count)
-            let primary_page = page_char_counts
-                .iter()
-                .max_by_key(|(_, &count)| count)
-                .map(|(&page, _)| page)
-                .unwrap_or(1); // Default to page 1 if no elements
-
-            // Convert page numbers to sorted Vec for consistent ordering
-            let mut page_numbers: Vec<u32> = all_pages.into_iter().collect();
-            page_numbers.sort();
-
-            // Convert existing metadata from Value to serde_json::Value
-            let mut enhanced_metadata: HashMap<String, serde_json::Value> = HashMap::new();
-            for (key, value) in metadata {
-                let json_value = match value {
-                    Value::String(s) => serde_json::Value::String(s.clone()),
-                    Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
-                    Value::Boolean(b) => serde_json::Value::Bool(*b),
-                    Value::Array(arr) => {
-                        let json_arr: Vec<serde_json::Value> = arr
-                            .iter()
-                            .map(|v| match v {
-                                Value::String(s) => serde_json::Value::String(s.clone()),
-                                Value::Number(n) => {
-                                    serde_json::Value::Number(serde_json::Number::from(*n))
-                                }
-                                Value::Boolean(b) => serde_json::Value::Bool(*b),
-                                _ => serde_json::Value::String(format!("{:?}", v)),
-                            })
-                            .collect();
-                        serde_json::Value::Array(json_arr)
-                    }
-                    Value::Identifier(s) => serde_json::Value::String(s.clone()),
-                };
-                enhanced_metadata.insert(key.clone(), json_value);
+            // accumulate char counts per page without HashMap
+            match page_char_counts.iter_mut().find(|(p, _)| *p == elem.page_number) {
+                Some((_, cnt)) => *cnt += elem.text.len(),
+                None => page_char_counts.push((elem.page_number, elem.text.len())),
             }
+        }
 
-            // Add page metadata as plain JSON values
-            enhanced_metadata.insert(
-                "primary_page".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(primary_page)),
-            );
-            enhanced_metadata.insert(
-                "page_numbers".to_string(),
-                serde_json::Value::Array(
-                    page_numbers
-                        .iter()
-                        .map(|&p| serde_json::Value::Number(serde_json::Number::from(p)))
-                        .collect(),
-                ),
-            );
-            enhanced_metadata.insert(
-                "chunk_element_count".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(chunk.len())),
-            );
-            enhanced_metadata.insert(
-                "chunk_char_count".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(chunk_text.len())),
-            );
+        // derive page metadata
+        let primary_page = page_char_counts
+            .iter()
+            .max_by_key(|(_, cnt)| *cnt)
+            .map(|(p, _)| *p)
+            .unwrap_or(1);
 
-            ChunkOutput {
-                text: chunk_text,
-                metadata: enhanced_metadata,
-                chunk_index: i,
-            }
-        })
-        .collect()
+        // stable order
+        page_char_counts.sort_by_key(|(p, _)| *p);
+        let page_numbers: Vec<u32> = page_char_counts.iter().map(|(p, _)| *p).collect();
+
+        // c) assemble metadata – start with shared reference, then extend
+        let mut meta = (*base_metadata).clone(); // shallow clone of small map
+        meta.insert(
+            "primary_page".into(),
+            serde_json::Value::Number(serde_json::Number::from(primary_page)),
+        );
+        meta.insert(
+            "page_numbers".into(),
+            serde_json::Value::Array(
+                page_numbers
+                    .iter()
+                    .map(|p| serde_json::Value::Number(serde_json::Number::from(*p)))
+                    .collect(),
+            ),
+        );
+        meta.insert(
+            "chunk_element_count".into(),
+            serde_json::Value::Number(serde_json::Number::from(chunk.len())),
+        );
+        meta.insert(
+            "chunk_char_count".into(),
+            serde_json::Value::Number(serde_json::Number::from(chunk_text.len())),
+        );
+
+        // Note: We've simplified the parent tracking - no longer storing full ancestry path
+
+        outputs.push(ChunkOutput {
+            text: chunk_text,
+            metadata: meta,
+            chunk_index: *global_chunk_counter,
+            parent_name: parent_name.clone(),
+            parent_index,
+        });
+        
+        *global_chunk_counter += 1;
+    }
+
+    outputs
 }
 
 fn decode_image_object(image_object: &Object) -> Result<Vec<u8>, String> {

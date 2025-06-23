@@ -335,7 +335,7 @@ mod collation_flow_tests {
 
         // Build template with a single large textchunk that should span multiple pages
         let template = TemplateBuilder::new()
-            .add_textchunk("MultiPageChunk", 100, 20) // Small chunk size to force multiple chunks
+            .add_textchunk("MultiPageChunk", 30, 10) // Small token count to force multiple chunks
             .build();
 
         // Execute matching

@@ -600,9 +600,20 @@ fn match_section<'a, 'map_lt>(
 
     // Add section-specific metadata
     if let Some(as_value) = template.attributes.get("as") {
+        // If 'as' attribute is defined, use its value
         result
             .metadata
             .insert("section".to_string(), as_value.clone());
+    } else {
+        // If 'as' attribute is not defined, fall back to the 'match' attribute value or null
+        if let Some(match_value) = template.attributes.get("match") {
+            result
+                .metadata
+                .insert("section".to_string(), match_value.clone());
+        } else {
+            // Remove any inherited "section" value and set to null
+            result.metadata.remove("section");
+        }
     }
 
     // Add the section name as well for reference
