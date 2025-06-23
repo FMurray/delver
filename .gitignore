@@ -3,3 +3,5 @@
 /deps
 /logs/*
 .DS_Store
+
+*/generated.rs
