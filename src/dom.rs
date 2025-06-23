@@ -417,7 +417,10 @@ fn process_value(pair: Pair<Rule>) -> Value {
 }
 
 // Process the matched content to generate chunks or image data
-pub fn process_matched_content(matched_items: &Vec<TemplateContentMatch>) -> Vec<ProcessedOutput> {
+pub fn process_matched_content(
+    matched_items: &Vec<TemplateContentMatch>,
+    index: &crate::search_index::PdfIndex,  // Add index parameter to resolve handles
+) -> Vec<ProcessedOutput> {
     let mut output_elements = Vec::new();
 
     for match_item in matched_items {
@@ -427,8 +430,18 @@ pub fn process_matched_content(matched_items: &Vec<TemplateContentMatch>) -> Vec
                     .matched_content
                     .iter()
                     .filter_map(|mc_ref| match mc_ref {
-                        MatchedContent::Text(text_elem_ref) => Some((*text_elem_ref).clone()),
-                        _ => None,
+                        MatchedContent::Index(doc_idx) => {
+                            // Resolve index to get actual content
+                            if let Some(content) = index.content_at(*doc_idx) {
+                                match content {
+                                    PageContent::Text(text_elem) => Some(text_elem),
+                                    PageContent::Image(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        MatchedContent::None => None,
                     })
                     .collect();
 
@@ -445,14 +458,24 @@ pub fn process_matched_content(matched_items: &Vec<TemplateContentMatch>) -> Vec
             }
             ElementType::Section => {
                 if !match_item.children.is_empty() {
-                    output_elements.extend(process_matched_content(&match_item.children));
+                    output_elements.extend(process_matched_content(&match_item.children, index));
                 } else {
                     let section_text_elements: Vec<TextElement> = match_item
                         .matched_content
                         .iter()
                         .filter_map(|mc_ref| match mc_ref {
-                            MatchedContent::Text(text_elem_ref) => Some((*text_elem_ref).clone()),
-                            _ => None,
+                            MatchedContent::Index(doc_idx) => {
+                                // Resolve index to get actual content
+                                if let Some(content) = index.content_at(*doc_idx) {
+                                    match content {
+                                        PageContent::Text(text_elem) => Some(text_elem),
+                                        PageContent::Image(_) => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            MatchedContent::None => None,
                         })
                         .collect();
 
@@ -471,19 +494,24 @@ pub fn process_matched_content(matched_items: &Vec<TemplateContentMatch>) -> Vec
             ElementType::Image => {
                 let mut image_processed = false;
                 for mc_ref in &match_item.matched_content {
-                    if let MatchedContent::Image(image_elem_ref) = mc_ref {
-                        output_elements.push(process_image_element(
-                            image_elem_ref,
-                            &match_item.template_element,
-                            &match_item.metadata,
-                        ));
-                        image_processed = true;
-                        break;
+                    if let MatchedContent::Index(doc_idx) = mc_ref {
+                        // Resolve index to get actual content
+                        if let Some(content) = index.content_at(*doc_idx) {
+                            if let PageContent::Image(image_elem) = content {
+                                output_elements.push(process_image_element(
+                                    &image_elem,
+                                    &match_item.template_element,
+                                    &match_item.metadata,
+                                ));
+                                image_processed = true;
+                                break;
+                            }
+                        }
                     }
                 }
                 if !image_processed {
                     warn!(
-                        "Image template element '{}' did not find any MatchedContent::Image.",
+                        "Image template element '{}' did not find any MatchedContent::Index with Image content.",
                         match_item.template_element.name
                     );
                 }
@@ -496,8 +524,18 @@ pub fn process_matched_content(matched_items: &Vec<TemplateContentMatch>) -> Vec
                     .matched_content
                     .iter()
                     .filter_map(|mc_ref| match mc_ref {
-                        MatchedContent::Text(text_elem_ref) => Some((*text_elem_ref).clone()),
-                        _ => None,
+                        MatchedContent::Index(doc_idx) => {
+                            // Resolve index to get actual content
+                            if let Some(content) = index.content_at(*doc_idx) {
+                                match content {
+                                    PageContent::Text(text_elem) => Some(text_elem),
+                                    PageContent::Image(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        MatchedContent::None => None,
                     })
                     .collect();
                 if !table_text_elements.is_empty() {

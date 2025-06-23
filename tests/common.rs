@@ -356,10 +356,12 @@ impl TestAssertions {
         expected_ids: &[Uuid],
         doc_builder: &DocumentBuilder,
     ) {
+        // Get the index from the doc builder to resolve content IDs
+        let index = doc_builder.build();
         let actual_ids: Vec<Uuid> = match_result
             .matched_content
             .iter()
-            .map(|mc| mc.id())
+            .filter_map(|mc| mc.id(&index))
             .collect();
 
         assert_eq!(

@@ -1,7 +1,6 @@
 pub mod chunker;
 pub mod debug_viewer;
-pub mod dom;
-pub mod features;
+pub mod dom; 
 pub mod fonts;
 pub mod geo;
 pub mod layout;
@@ -62,7 +61,7 @@ pub fn process_pdf(
     let index = PdfIndex::new(&pages_map, &match_context);
 
     if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None) {
-        let outputs = process_matched_content(&matched_content);
+        let outputs = process_matched_content(&matched_content, &index);
         all_outputs.extend(outputs);
     }
 

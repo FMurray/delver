@@ -63,7 +63,7 @@ fn basic_page_map_and_context() -> (BTreeMap<u32, PageContents>, MatchContext) {
     // Create PageContents for page 1
     let mut page1_contents = PageContents::new();
 
-    // Add text elements directly to the stores
+    // Add text elements using the proper add_text method
     if let PageContent::Text(text_elem) = create_mock_text_element(
         el1_id,
         "Hello World",
@@ -75,21 +75,7 @@ fn basic_page_map_and_context() -> (BTreeMap<u32, PageContents>, MatchContext) {
         100.0,
         12.0,
     ) {
-        page1_contents.text_store.id.push(text_elem.id);
-        page1_contents.text_store.text.push(text_elem.text);
-        page1_contents
-            .text_store
-            .font_size
-            .push(text_elem.font_size);
-        page1_contents
-            .text_store
-            .font_name
-            .push(text_elem.font_name);
-        page1_contents.text_store.bbox.push(text_elem.bbox);
-        page1_contents
-            .text_store
-            .page_number
-            .push(text_elem.page_number);
+        page1_contents.add_text(text_elem);
     }
 
     if let PageContent::Text(text_elem) = create_mock_text_element(
@@ -103,36 +89,13 @@ fn basic_page_map_and_context() -> (BTreeMap<u32, PageContents>, MatchContext) {
         150.0,
         18.0,
     ) {
-        page1_contents.text_store.id.push(text_elem.id);
-        page1_contents.text_store.text.push(text_elem.text);
-        page1_contents
-            .text_store
-            .font_size
-            .push(text_elem.font_size);
-        page1_contents
-            .text_store
-            .font_name
-            .push(text_elem.font_name);
-        page1_contents.text_store.bbox.push(text_elem.bbox);
-        page1_contents
-            .text_store
-            .page_number
-            .push(text_elem.page_number);
+        page1_contents.add_text(text_elem);
     }
 
     if let PageContent::Image(image_elem) =
         create_mock_image_element(img1_id, 1, 50.0, 500.0, 200.0, 100.0)
     {
-        page1_contents.image_store.id.push(image_elem.id);
-        page1_contents.image_store.bbox.push(image_elem.bbox);
-        page1_contents
-            .image_store
-            .page_number
-            .push(image_elem.page_number);
-        page1_contents
-            .image_store
-            .image_object
-            .push(image_elem.image_object);
+        page1_contents.add_image(image_elem);
     }
 
     // Create PageContents for page 2
@@ -149,21 +112,7 @@ fn basic_page_map_and_context() -> (BTreeMap<u32, PageContents>, MatchContext) {
         120.0,
         12.0,
     ) {
-        page2_contents.text_store.id.push(text_elem.id);
-        page2_contents.text_store.text.push(text_elem.text);
-        page2_contents
-            .text_store
-            .font_size
-            .push(text_elem.font_size);
-        page2_contents
-            .text_store
-            .font_name
-            .push(text_elem.font_name);
-        page2_contents.text_store.bbox.push(text_elem.bbox);
-        page2_contents
-            .text_store
-            .page_number
-            .push(text_elem.page_number);
+        page2_contents.add_text(text_elem);
     }
 
     page_map.insert(1, page1_contents);
@@ -336,7 +285,7 @@ mod pdf_index_tests {
         let index = PdfIndex::new(&page_map, &mock_match_context);
 
         // Test exact match
-        let matches = index.find_text_matches("Hello World", 0.9, None);
+        let matches = index.find_text_matches("Hello World", 0.9, None, None);
         assert_eq!(
             matches.len(),
             1,
@@ -349,14 +298,14 @@ mod pdf_index_tests {
         assert!(score > 0.9, "Score should be high for exact match");
 
         // Test partial match
-        let partial_matches = index.find_text_matches("Hello", 0.6, None);
+        let partial_matches = index.find_text_matches("Hello", 0.4, None, None);
         assert!(
             partial_matches.len() >= 1,
             "Should find at least one partial match for 'Hello'"
         );
 
         // Test no match
-        let no_matches = index.find_text_matches("Nonexistent", 0.8, None);
+        let no_matches = index.find_text_matches("Nonexistent", 0.8, None, None);
         assert_eq!(
             no_matches.len(),
             0,
