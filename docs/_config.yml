@@ -9,8 +9,6 @@ url: "https://fmurray.github.io" # the base hostname & protocol for your site
 twitter_username: delver_dev
 github_username: yourusername
 
-remote_theme: "jekyll/minima@1e8a445"
-
 # Build settings
 markdown: kramdown
 highlighter: rouge
