@@ -1,15 +1,41 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
-use crate::layout::{extract_section_content, perform_matching, select_best_match};
-use crate::parse::{get_refs, TextElement};
-use log::{error, info};
-use lopdf::Document;
+use crate::matcher::{MatchedContent, TemplateContentMatch};
+use crate::parse::{ImageElement, PageContent, TextElement};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use image;
+use log::{error, info, warn};
+use lopdf::{Dictionary as LoPdfDictionary, Document, Object, Stream};
 use pest::iterators::Pair;
 use pest::Parser as PestParser;
 use pest_derive::Parser as PestParserDerive;
 use serde::Serialize;
+use serde_json;
 use std::io::ErrorKind;
 use std::sync::{Arc, Weak};
-use std::{collections::HashMap, io::Error};
+use std::{collections::HashMap, io::Error}; // Add image crate import
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum EmbeddingModel {
+    Clip,
+    Unknown(String),
+}
+
+impl From<&str> for EmbeddingModel {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "clip" => EmbeddingModel::Clip,
+            _ => EmbeddingModel::Unknown(s.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LLMConfig {
+    pub model: String,
+    pub prompt: String,
+    pub target_schema: Option<String>,
+}
 
 #[derive(PestParserDerive)]
 #[grammar = "template.pest"]
@@ -20,9 +46,10 @@ pub struct Root {
     pub elements: Vec<Element>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Element {
     pub name: String,
+    pub element_type: ElementType,
     pub attributes: HashMap<String, Value>,
     pub children: Vec<Element>,
     pub parent: Option<Weak<Element>>,
@@ -31,6 +58,18 @@ pub struct Element {
 }
 
 impl Element {
+    pub fn new(name: String, element_type: ElementType) -> Self {
+        Element {
+            name,
+            element_type,
+            attributes: HashMap::new(),
+            children: Vec::new(),
+            parent: None,
+            prev_sibling: None,
+            next_sibling: None,
+        }
+    }
+
     pub fn previous_sibling(&self) -> Option<Arc<Element>> {
         self.prev_sibling.as_ref().and_then(|w| w.upgrade())
     }
@@ -57,11 +96,23 @@ pub struct DocumentElement {
     pub metadata: HashMap<String, String>, // Additional info like font size, position
 }
 
-#[derive(Debug)]
+/// Types of elements that can be matched against the document
+/// Implements PartialEq and PartialOrd for sorting so that
+/// elements are matched in a deterministic order.
+/// Elements which can contain other elements should be enumerated first.
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum ElementType {
     Section,
     Paragraph,
     TextChunk,
+    Table,
+    Image,
+    // Image-specific processing children
+    ImageSummary,
+    ImageBytes,
+    ImageCaption,
+    ImageEmbedding,
+    Unknown,
     // Add other types as needed
 }
 
@@ -73,11 +124,141 @@ pub struct MatchedElement {
     pub metadata: HashMap<String, Value>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 pub struct ChunkOutput {
     pub text: String,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, serde_json::Value>,
     pub chunk_index: usize,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct ImageOutput {
+    pub id: String, // Use UUID as String for JSON compatibility
+    pub page_number: u32,
+    pub bbox: (f32, f32, f32, f32),
+    pub caption: Option<String>,
+    pub bytes_base64: Option<String>,
+    pub summary: Option<String>,
+    pub embedding: Option<Vec<f32>>, // Assuming embedding is Vec<f32>
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+#[serde(tag = "type")] // Add type field for distinguishing in JSON
+pub enum ProcessedOutput {
+    Text(ChunkOutput),
+    Image(ImageOutput),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchType {
+    Text,           // Simple text matching
+    Semantic,       // Vector embedding similarity
+    Regex,          // Regular expression matching
+    Custom(String), // For future extension
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchConfig {
+    pub match_type: MatchType,
+    pub pattern: String,                 // Text to match or regex pattern
+    pub threshold: f64,                  // Similarity threshold (0.0-1.0)
+    pub options: HashMap<String, Value>, // Additional match-specific options
+}
+
+impl Default for MatchConfig {
+    fn default() -> Self {
+        Self {
+            match_type: MatchType::Text,
+            pattern: String::new(),
+            threshold: 0.6,
+            options: HashMap::new(),
+        }
+    }
+}
+
+impl Value {
+    // Add a helper to extract match config from attributes
+    pub fn as_match_config(&self) -> Option<MatchConfig> {
+        if let Value::String(s) = self {
+            Some(MatchConfig {
+                match_type: MatchType::Text,
+                pattern: s.clone(),
+                threshold: 0.6,
+                options: HashMap::new(),
+            })
+        } else if let Value::Array(values) = self {
+            if values.len() >= 2 {
+                let pattern = values[0].as_string()?;
+                let threshold = values[1].as_number().map_or(600, |n| n) as f64 / 1000.0;
+
+                let match_type = if values.len() >= 3 {
+                    match values[2].as_string() {
+                        Some(t) if t == "semantic" => MatchType::Semantic,
+                        Some(t) if t == "regex" => MatchType::Regex,
+                        Some(t) => MatchType::Custom(t),
+                        None => MatchType::Text,
+                    }
+                } else {
+                    MatchType::Text
+                };
+
+                let mut options = HashMap::new();
+                if values.len() >= 4 {
+                    if let Value::Array(opts) = &values[3] {
+                        for i in (0..opts.len()).step_by(2) {
+                            if i + 1 < opts.len() {
+                                if let (Some(key), value) = (opts[i].as_string(), &opts[i + 1]) {
+                                    options.insert(key, (*value).clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Some(MatchConfig {
+                    match_type,
+                    pattern,
+                    threshold,
+                    options,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    // Existing methods...
+    pub fn as_string(&self) -> Option<String> {
+        match self {
+            Value::String(s) => Some(s.clone()),
+            Value::Identifier(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn as_number(&self) -> Option<i64> {
+        match self {
+            Value::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_boolean(&self) -> Option<bool> {
+        match self {
+            Value::Boolean(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<Vec<Value>> {
+        match self {
+            Value::Array(a) => Some(a.clone()),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_template(template_str: &str) -> Result<Root, Error> {
@@ -129,6 +310,20 @@ fn process_element(pair: Pair<Rule>) -> Element {
     let mut inner_rules = element_pair.into_inner();
     let identifier = inner_rules.next().unwrap().as_str().to_string();
 
+    // Determine element type based on identifier
+    let element_type = match identifier.as_str() {
+        "Section" => ElementType::Section,
+        "Paragraph" => ElementType::Paragraph,
+        "TextChunk" => ElementType::TextChunk,
+        "Table" => ElementType::Table,
+        "Image" => ElementType::Image,
+        "ImageSummary" => ElementType::ImageSummary,
+        "ImageBytes" => ElementType::ImageBytes,
+        "ImageCaption" => ElementType::ImageCaption,
+        "ImageEmbedding" => ElementType::ImageEmbedding,
+        _ => ElementType::Unknown,
+    };
+
     let mut attributes = HashMap::new();
     let mut children = Vec::new();
 
@@ -151,6 +346,7 @@ fn process_element(pair: Pair<Rule>) -> Element {
 
     Element {
         name: identifier,
+        element_type,
         attributes,
         children,
         parent: None,
@@ -220,170 +416,358 @@ fn process_value(pair: Pair<Rule>) -> Value {
     }
 }
 
-pub fn process_template_element(
-    template_element: &Element,
-    text_elements: &[TextElement],
-    doc: &Document,
-    inherited_metadata: &HashMap<String, Value>,
-) -> Vec<ChunkOutput> {
-    info!("\n=== Processing {} ===", template_element.name);
-    let context = get_refs(doc).unwrap();
-    let mut all_chunks = Vec::new();
+// Process the matched content to generate chunks or image data
+pub fn process_matched_content(
+    matched_items: &Vec<TemplateContentMatch>,
+    index: &crate::search_index::PdfIndex,  // Add index parameter to resolve handles
+) -> Vec<ProcessedOutput> {
+    let mut output_elements = Vec::new();
 
-    // Create MatchContext with fonts
-    let mut match_context = context;
-    // match_context.fonts = Some(text_elements.first().unwrap().font_name.clone());
+    for match_item in matched_items {
+        match &match_item.template_element.element_type {
+            ElementType::TextChunk | ElementType::Paragraph => {
+                let text_elements_to_chunk: Vec<TextElement> = match_item
+                    .matched_content
+                    .iter()
+                    .filter_map(|mc_ref| match mc_ref {
+                        MatchedContent::Index(doc_idx) => {
+                            // Resolve index to get actual content
+                            if let Some(content) = index.content_at(*doc_idx) {
+                                match content {
+                                    PageContent::Text(text_elem) => Some(text_elem),
+                                    PageContent::Image(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        MatchedContent::None => None,
+                    })
+                    .collect();
 
-    // Handle standalone TextChunk elements (not siblings of Section)
-    if template_element.name == "TextChunk" {
-        // Only process if this is a root-level TextChunk (not a sibling of Section)
-        if template_element.parent.is_none() {
-            return process_text_chunk(template_element, text_elements, inherited_metadata);
-        }
-        return Vec::new(); // Return empty vec for non-root TextChunks
-    }
-
-    // For Section elements, look for matches
-    if let Some(Value::String(match_str)) = template_element.attributes.get("match") {
-        info!(
-            "Looking for match: '{}' in {} elements",
-            match_str,
-            text_elements.len()
-        );
-
-        let threshold = if let Some(Value::Number(n)) = template_element.attributes.get("threshold")
-        {
-            (*n as f64) / 1000.0
-        } else {
-            0.75
-        };
-
-        let matched_elements = perform_matching(&text_elements, match_str, threshold);
-
-        if let Some(best_match) = select_best_match(matched_elements.clone(), &match_context) {
-            info!(
-                "Best match found on page {}: '{}'",
-                best_match.page_number, best_match.text
-            );
-
-            // Process text before the section starts
-            let pre_section_elements = text_elements
-                .iter()
-                .take_while(|e| {
-                    // Stop at the exact position of the section header
-                    e.page_number < best_match.page_number
-                        || (e.page_number == best_match.page_number
-                            && e.bbox.1 <= best_match.bbox.1 - best_match.font_size)
-                    // Subtract font size to avoid including the header
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-
-            // Only chunk pre-section content if there's a TextChunk sibling before this Section
-            if let Some(prev_sibling) = template_element.previous_sibling() {
-                if prev_sibling.as_ref().name == "TextChunk" {
-                    info!(
-                        "Chunking pre-section content ({} elements) up to '{}' on page {}",
-                        pre_section_elements.len(),
-                        best_match.text,
-                        best_match.page_number
+                if !text_elements_to_chunk.is_empty() {
+                    let chunk_outputs = process_text_chunk_elements(
+                        &text_elements_to_chunk,
+                        &match_item.template_element,
+                        &match_item.metadata,
                     );
-                    all_chunks.extend(process_text_chunk(
-                        prev_sibling.as_ref(),
-                        &pre_section_elements,
-                        inherited_metadata,
-                    ));
-                }
-            }
-
-            let mut metadata = inherited_metadata.clone();
-            if let Some(Value::String(alias)) = template_element.attributes.get("as") {
-                metadata.insert(alias.clone(), Value::String(alias.clone()));
-            }
-
-            // Extract the end_match string and find the end element
-            let end_match_str = template_element.attributes.get("end_match").and_then(|v| {
-                if let Value::String(s) = v {
-                    Some(s.as_str())
-                } else {
-                    None
-                }
-            });
-
-            let end_element = if let Some(end_str) = end_match_str {
-                let end_matched_elements = perform_matching(&text_elements, end_str, threshold);
-                select_best_match(end_matched_elements, &match_context)
-            } else {
-                None
-            };
-
-            // Extract section content
-            let section_text_elements =
-                extract_section_content(text_elements, &best_match, end_element.as_ref());
-
-            // Process child elements within the section boundaries
-            for child in &template_element.children {
-                all_chunks.extend(process_template_element(
-                    child,
-                    &section_text_elements,
-                    doc,
-                    &metadata,
-                ));
-            }
-
-            // Process text after the section ends if there's a TextChunk sibling after this Section
-            if let Some(end_elem) = end_element {
-                if let Some(next_sibling) = template_element.next_sibling() {
-                    if next_sibling.as_ref().name == "TextChunk" {
-                        let post_section_elements = text_elements
-                            .iter()
-                            .skip_while(|e| {
-                                e.page_number < end_elem.page_number
-                                    || (e.page_number == end_elem.page_number
-                                        && e.bbox.1 <= end_elem.bbox.1)
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-
-                        all_chunks.extend(process_text_chunk(
-                            next_sibling.as_ref(),
-                            &post_section_elements,
-                            inherited_metadata,
-                        ));
+                    for chunk_output in chunk_outputs {
+                        output_elements.push(ProcessedOutput::Text(chunk_output));
                     }
                 }
             }
+            ElementType::Section => {
+                if !match_item.children.is_empty() {
+                    output_elements.extend(process_matched_content(&match_item.children, index));
+                } else {
+                    let section_text_elements: Vec<TextElement> = match_item
+                        .matched_content
+                        .iter()
+                        .filter_map(|mc_ref| match mc_ref {
+                            MatchedContent::Index(doc_idx) => {
+                                // Resolve index to get actual content
+                                if let Some(content) = index.content_at(*doc_idx) {
+                                    match content {
+                                        PageContent::Text(text_elem) => Some(text_elem),
+                                        PageContent::Image(_) => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            MatchedContent::None => None,
+                        })
+                        .collect();
+
+                    if !section_text_elements.is_empty() {
+                        let chunk_outputs = process_text_chunk_elements(
+                            &section_text_elements,
+                            &match_item.template_element,
+                            &match_item.metadata,
+                        );
+                        for chunk_output in chunk_outputs {
+                            output_elements.push(ProcessedOutput::Text(chunk_output));
+                        }
+                    }
+                }
+            }
+            ElementType::Image => {
+                let mut image_processed = false;
+                for mc_ref in &match_item.matched_content {
+                    if let MatchedContent::Index(doc_idx) = mc_ref {
+                        // Resolve index to get actual content
+                        if let Some(content) = index.content_at(*doc_idx) {
+                            if let PageContent::Image(image_elem) = content {
+                                output_elements.push(process_image_element(
+                                    &image_elem,
+                                    &match_item.template_element,
+                                    &match_item.metadata,
+                                ));
+                                image_processed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !image_processed {
+                    warn!(
+                        "Image template element '{}' did not find any MatchedContent::Index with Image content.",
+                        match_item.template_element.name
+                    );
+                }
+            }
+            ElementType::Table => {
+                warn!(
+                    "Processing for ElementType::Table in process_matched_content is simplified."
+                );
+                let table_text_elements: Vec<TextElement> = match_item
+                    .matched_content
+                    .iter()
+                    .filter_map(|mc_ref| match mc_ref {
+                        MatchedContent::Index(doc_idx) => {
+                            // Resolve index to get actual content
+                            if let Some(content) = index.content_at(*doc_idx) {
+                                match content {
+                                    PageContent::Text(text_elem) => Some(text_elem),
+                                    PageContent::Image(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        MatchedContent::None => None,
+                    })
+                    .collect();
+                if !table_text_elements.is_empty() {
+                    let chunk_outputs = process_text_chunk_elements(
+                        &table_text_elements,
+                        &match_item.template_element,
+                        &match_item.metadata,
+                    );
+                    for chunk_output in chunk_outputs {
+                        output_elements.push(ProcessedOutput::Text(chunk_output));
+                    }
+                }
+            }
+            ElementType::ImageSummary
+            | ElementType::ImageBytes
+            | ElementType::ImageCaption
+            | ElementType::ImageEmbedding => {
+                warn!(
+                    "Encountered {:?} as a top-level matched element. These are typically processed as children of an Image element.",
+                    match_item.template_element.element_type
+                );
+            }
+            ElementType::Unknown => {
+                warn!(
+                    "Encountered ElementType::Unknown for template element: {}",
+                    match_item.template_element.name
+                );
+            }
         }
     }
 
-    all_chunks
+    output_elements
 }
 
-// Helper function to process TextChunk elements
-fn process_text_chunk(
+// Helper function to process a matched Image element based on its children
+fn process_image_element(
+    image_element: &crate::parse::ImageElement,
     template_element: &Element,
-    section_text_elements: &[TextElement],
     metadata: &HashMap<String, Value>,
-) -> Vec<ChunkOutput> {
-    let chunk_size = if let Some(Value::Number(n)) = template_element.attributes.get("chunkSize") {
-        *n as usize
-    } else {
-        500
+) -> ProcessedOutput {
+    // Convert existing metadata from Value to serde_json::Value
+    let mut json_metadata: HashMap<String, serde_json::Value> = HashMap::new();
+    for (key, value) in metadata {
+        let json_value = match value {
+            Value::String(s) => serde_json::Value::String(s.clone()),
+            Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+            Value::Boolean(b) => serde_json::Value::Bool(*b),
+            Value::Array(arr) => {
+                let json_arr: Vec<serde_json::Value> = arr
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => serde_json::Value::String(s.clone()),
+                        Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+                        Value::Boolean(b) => serde_json::Value::Bool(*b),
+                        _ => serde_json::Value::String(format!("{:?}", v)),
+                    })
+                    .collect();
+                serde_json::Value::Array(json_arr)
+            }
+            Value::Identifier(s) => serde_json::Value::String(s.clone()),
+        };
+        json_metadata.insert(key.clone(), json_value);
+    }
+
+    let mut image_output = ImageOutput {
+        id: image_element.id.to_string(),
+        page_number: image_element.page_number,
+        bbox: (
+            image_element.bbox.x0,
+            image_element.bbox.y0,
+            image_element.bbox.x1,
+            image_element.bbox.y1,
+        ),
+        caption: None,
+        bytes_base64: None,
+        summary: None,
+        embedding: None,
+        metadata: json_metadata,
     };
 
-    let chunk_overlap =
-        if let Some(Value::Number(n)) = template_element.attributes.get("chunkOverlap") {
-            *n as usize
-        } else {
-            150
-        };
+    // Attempt to decode image bytes once if needed by any child
+    let needs_bytes = template_element.children.iter().any(|child| {
+        matches!(
+            child.element_type,
+            ElementType::ImageBytes | ElementType::ImageSummary | ElementType::ImageEmbedding
+        )
+    });
 
-    // Default to character-based chunking
+    let image_bytes_result = if needs_bytes {
+        decode_image_object(&image_element.image_object)
+    } else {
+        Err("Bytes not needed".to_string()) // Indicate bytes weren't requested
+    };
+
+    // Iterate through children of the Image template element
+    for child_template in &template_element.children {
+        match child_template.element_type {
+            ElementType::ImageBytes => {
+                match &image_bytes_result {
+                    Ok(bytes) => {
+                        image_output.bytes_base64 = Some(BASE64_STANDARD.encode(bytes));
+                        println!("Successfully decoded and encoded image bytes for ImageBytes.");
+                    }
+                    Err(e) => {
+                        if e != "Bytes not needed" {
+                            // Don't warn if bytes weren't requested
+                            warn!("Could not get image bytes for ImageBytes: {}", e);
+                        }
+                        image_output.bytes_base64 = None; // Ensure it's None on error
+                    }
+                }
+            }
+            ElementType::ImageCaption => {
+                // TODO: Implement actual caption finding logic
+                // This likely involves searching nearby TextElements in the PdfIndex
+                // based on the image_element.bbox and page_number.
+                println!("Placeholder: Need to implement caption finding for ImageCaption");
+                image_output.caption = Some("PLACEHOLDER_IMAGE_CAPTION".to_string());
+            }
+            ElementType::ImageSummary => {
+                let model = child_template
+                    .attributes
+                    .get("model")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let prompt = child_template
+                    .attributes
+                    .get("prompt")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let target_schema = child_template
+                    .attributes
+                    .get("targetSchema")
+                    .and_then(|v| v.as_string());
+
+                let config = LLMConfig {
+                    model,
+                    prompt,
+                    target_schema,
+                };
+
+                match &image_bytes_result {
+                    Ok(_bytes) => {
+                        // TODO: Implement actual call to external LLM for summary
+                        // let summary = call_llm_summary(&config, bytes);
+                        println!("Placeholder: Call external summary model ('{:?}')", config);
+                        image_output.summary =
+                            Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", config.model));
+                    }
+                    Err(e) => {
+                        if e != "Bytes not needed" {
+                            warn!("Could not get image bytes for ImageSummary: {}", e);
+                        }
+                        image_output.summary = None;
+                    }
+                }
+            }
+            ElementType::ImageEmbedding => {
+                let model_str = child_template
+                    .attributes
+                    .get("model")
+                    .and_then(|v| v.as_string())
+                    .unwrap_or("clip".to_string());
+                let embedding_model = EmbeddingModel::from(model_str.as_str());
+
+                match &image_bytes_result {
+                    Ok(bytes) => {
+                        // Call the placeholder embedding function
+                        match generate_embedding(&embedding_model, bytes) {
+                            Ok(embedding) => {
+                                image_output.embedding = Some(embedding);
+                                println!(
+                                    "Successfully generated placeholder embedding using {:?}.",
+                                    embedding_model
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Embedding generation failed for model {:?}: {}",
+                                    embedding_model, e
+                                );
+                                image_output.embedding = None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e != "Bytes not needed" {
+                            warn!("Could not get image bytes for ImageEmbedding: {}", e);
+                        }
+                        image_output.embedding = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ProcessedOutput::Image(image_output)
+}
+
+fn process_text_chunk_elements(
+    elements: &[TextElement],
+    template_element: &Element,
+    metadata: &HashMap<String, Value>,
+) -> Vec<ChunkOutput> {
+    let chunk_size = template_element
+        .attributes
+        .get("chunkSize")
+        .map_or(500, |v| {
+            if let Value::Number(n) = v {
+                *n as usize
+            } else {
+                500
+            }
+        });
+
+    let chunk_overlap = template_element
+        .attributes
+        .get("chunkOverlap")
+        .map_or(150, |v| {
+            if let Value::Number(n) = v {
+                *n as usize
+            } else {
+                150
+            }
+        });
+
+    // Use your existing chunking logic
     let strategy = ChunkingStrategy::Characters {
         max_chars: chunk_size,
     };
-
-    let chunks = chunk_text_elements(section_text_elements, &strategy, chunk_overlap);
+    let chunks = chunk_text_elements(elements, &strategy, chunk_overlap);
 
     chunks
         .iter()
@@ -395,11 +779,124 @@ fn process_text_chunk(
                 .collect::<Vec<_>>()
                 .join(" ");
 
+            // Calculate page number metadata
+            let mut page_char_counts: std::collections::HashMap<u32, usize> =
+                std::collections::HashMap::new();
+            let mut all_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+            for element in chunk {
+                all_pages.insert(element.page_number);
+                *page_char_counts.entry(element.page_number).or_insert(0) += element.text.len();
+            }
+
+            // Find the primary page (page with most content by character count)
+            let primary_page = page_char_counts
+                .iter()
+                .max_by_key(|(_, &count)| count)
+                .map(|(&page, _)| page)
+                .unwrap_or(1); // Default to page 1 if no elements
+
+            // Convert page numbers to sorted Vec for consistent ordering
+            let mut page_numbers: Vec<u32> = all_pages.into_iter().collect();
+            page_numbers.sort();
+
+            // Convert existing metadata from Value to serde_json::Value
+            let mut enhanced_metadata: HashMap<String, serde_json::Value> = HashMap::new();
+            for (key, value) in metadata {
+                let json_value = match value {
+                    Value::String(s) => serde_json::Value::String(s.clone()),
+                    Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+                    Value::Boolean(b) => serde_json::Value::Bool(*b),
+                    Value::Array(arr) => {
+                        let json_arr: Vec<serde_json::Value> = arr
+                            .iter()
+                            .map(|v| match v {
+                                Value::String(s) => serde_json::Value::String(s.clone()),
+                                Value::Number(n) => {
+                                    serde_json::Value::Number(serde_json::Number::from(*n))
+                                }
+                                Value::Boolean(b) => serde_json::Value::Bool(*b),
+                                _ => serde_json::Value::String(format!("{:?}", v)),
+                            })
+                            .collect();
+                        serde_json::Value::Array(json_arr)
+                    }
+                    Value::Identifier(s) => serde_json::Value::String(s.clone()),
+                };
+                enhanced_metadata.insert(key.clone(), json_value);
+            }
+
+            // Add page metadata as plain JSON values
+            enhanced_metadata.insert(
+                "primary_page".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(primary_page)),
+            );
+            enhanced_metadata.insert(
+                "page_numbers".to_string(),
+                serde_json::Value::Array(
+                    page_numbers
+                        .iter()
+                        .map(|&p| serde_json::Value::Number(serde_json::Number::from(p)))
+                        .collect(),
+                ),
+            );
+            enhanced_metadata.insert(
+                "chunk_element_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(chunk.len())),
+            );
+            enhanced_metadata.insert(
+                "chunk_char_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(chunk_text.len())),
+            );
+
             ChunkOutput {
                 text: chunk_text,
-                metadata: metadata.clone(),
+                metadata: enhanced_metadata,
                 chunk_index: i,
             }
         })
         .collect()
+}
+
+fn decode_image_object(image_object: &Object) -> Result<Vec<u8>, String> {
+    if let Ok(stream) = image_object.as_stream() {
+        Ok(stream.content.clone())
+    } else {
+        Err("Image object is not a stream".to_string())
+    }
+}
+
+// Placeholder function for generating embeddings
+fn generate_embedding(model: &EmbeddingModel, image_bytes: &[u8]) -> Result<Vec<f32>, String> {
+    match model {
+        EmbeddingModel::Clip => {
+            // --- Placeholder Logic ---
+            println!(
+                "Placeholder: Simulating CLIP embedding generation for image ({} bytes)",
+                image_bytes.len()
+            );
+            // Basic validation: Try to guess format and check dimensions (optional)
+            match image::guess_format(image_bytes) {
+                Ok(format) => {
+                    println!("Placeholder: Detected image format: {:?}", format);
+                    match image::load_from_memory(image_bytes) {
+                        Ok(img) => {
+                            println!(
+                                "Placeholder: Image dimensions {}x{}",
+                                img.width(),
+                                img.height()
+                            );
+                            // In real implementation, send `image_bytes` or processed image to CLIP API
+                            // Here, return a dummy vector
+                            Ok(vec![0.5; 512]) // Example: Return a 512-dimension vector of 0.5s
+                        }
+                        Err(e) => Err(format!("Placeholder: Failed to load image: {}", e)),
+                    }
+                }
+                Err(_) => Err("Placeholder: Could not guess image format".to_string()),
+            }
+            // --- End Placeholder Logic ---
+        }
+        EmbeddingModel::Unknown(name) => Err(format!("Embedding model '{}' not implemented", name)),
+    }
 }

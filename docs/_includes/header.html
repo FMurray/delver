@@ -1,0 +1,36 @@
+<header class="site-header" role="banner">
+  <div class="wrapper">
+    <a class="site-title" rel="author" href="{{ '/' | relative_url }}">
+      <img src="{{ '/assets/images/logo.png' | relative_url }}" alt="{{ site.title }}" class="site-logo">
+      {{ site.title | escape }}
+    </a>
+
+    <nav class="site-nav">
+      <input type="checkbox" id="nav-trigger" class="nav-trigger" />
+      <label for="nav-trigger">
+        <span class="menu-icon">
+          <svg viewBox="0 0 18 15" width="18px" height="15px">
+            <path d="m18,1.484c0,0.82-0.665,1.484-1.484,1.484h-15.032c-0.819,0-1.484-0.665-1.484-1.484s0.665-1.484,1.484-1.484h15.032c0.819,0,1.484,0.665,1.484,1.484zm0,5.516c0,0.82-0.665,1.484-1.484,1.484h-15.032c-0.819,0-1.484-0.665-1.484-1.484s0.665-1.484,1.484-1.484h15.032c0.819,0,1.484,0.665,1.484,1.484zm0,5.516c0,0.82-0.665,1.484-1.484,1.484h-15.032c-0.819,0-1.484-0.665-1.484-1.484s0.665-1.484,1.484-1.484h15.032c0.819,0,1.484,0.665,1.484,1.484z"/>
+          </svg>
+        </span>
+      </label>
+
+      <div class="trigger">
+        {%- for item in site.navigation -%}
+          {%- if item.submenu -%}
+            <div class="nav-dropdown">
+              <a class="page-link" href="{{ item.url | relative_url }}">{{ item.title }}</a>
+              <div class="dropdown-content">
+                {%- for subitem in item.submenu -%}
+                  <a href="{{ subitem.url | relative_url }}">{{ subitem.title }}</a>
+                {%- endfor -%}
+              </div>
+            </div>
+          {%- else -%}
+            <a class="page-link" href="{{ item.url | relative_url }}">{{ item.title }}</a>
+          {%- endif -%}
+        {%- endfor -%}
+      </div>
+    </nav>
+  </div>
+</header>
