@@ -1,13 +1,10 @@
+use opentelemetry::{global, trace::Tracer, KeyValue};
 use std::fmt::Write;
-use std::sync::{Arc, Mutex};
 use tracing::Subscriber;
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{layer::SubscriberExt, Layer};
-
-use serde_json;
-use std::collections::HashMap;
 use uuid::Uuid;
 
 // Define log targets as constants
@@ -32,387 +29,30 @@ pub const REL_TYPE: &str = "rel_type";
 
 enum EntityType {
     Line,
-    Template, // Add a new entity type for templates
+    Template,
 }
 
-#[derive(Clone, Default)]
-pub struct DebugDataStore {
-    message_arena: Arc<Mutex<Vec<String>>>,
-    events: Arc<Mutex<HashMap<Uuid, Vec<usize>>>>,
-    lineage: Arc<Mutex<LineageStore>>,
-    // Add template-match tracking
-    pub template_matches: Arc<Mutex<HashMap<Uuid, (Uuid, f32)>>>,
-    // Add template names storage
-    pub template_names: Arc<Mutex<HashMap<Uuid, String>>>,
-}
+/// Re-export for backwards compatibility
+pub use crate::persistent_store::{PersistentDebugStore as DebugDataStore, EntityEvents};
 
-#[derive(Default)]
-struct LineageStore {
-    children: HashMap<Uuid, Vec<Uuid>>,
-    parents: HashMap<Uuid, Uuid>,
-    entity_events: HashMap<Uuid, Vec<usize>>,
-}
-
-#[derive(Debug, Default)]
-pub struct EntityEvents {
-    pub messages: Vec<String>,
-    pub children: Vec<EntityEvents>,
-}
-
-impl DebugDataStore {
-    pub fn get_entity_lineage(&self, entity_id: Uuid) -> Vec<String> {
-        let arena = self.message_arena.lock().unwrap();
-        let lineage = self.lineage.lock().unwrap();
-
-        let mut events = Vec::new();
-
-        if let Some(indices) = lineage.entity_events.get(&entity_id) {
-            for &idx in indices {
-                if let Some(event) = arena.get(idx) {
-                    events.push(event.clone());
-                }
-            }
-        }
-
-        if let Some(children) = lineage.children.get(&entity_id) {
-            for child in children {
-                if let Some(child_indices) = lineage.entity_events.get(child) {
-                    for &idx in child_indices {
-                        if let Some(msg) = arena.get(idx) {
-                            events.push(msg.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        events
-    }
-
-    pub fn record_relationship(&self, parent: Option<Uuid>, children: Vec<Uuid>, _rel_type: &str) {
-        let mut lineage = self.lineage.lock().unwrap();
-
-        if let Some(parent_id) = parent {
-            // Check for circular reference
-            if children.contains(&parent_id) {
-                eprintln!(
-                    "Circular relationship detected between {} and {:?}",
-                    parent_id, children
-                );
-                return;
-            }
-
-            // Update parent -> children mapping
-            let existing_children = lineage.children.entry(parent_id).or_default();
-            for child_id in &children {
-                if !existing_children.contains(child_id) {
-                    existing_children.push(*child_id);
-                }
-            }
-
-            // Update child -> parent mapping
-            for child_id in &children {
-                if let Some(existing_parent) = lineage.parents.get(child_id) {
-                    if *existing_parent != parent_id {
-                        eprintln!("Child {} already has parent {}", child_id, existing_parent);
-                        continue;
-                    }
-                }
-                lineage.parents.insert(*child_id, parent_id);
-            }
-        }
-    }
-
-    pub fn get_children(&self, entity_id: Uuid) -> Vec<Uuid> {
-        self.lineage
-            .lock()
-            .unwrap()
-            .children
-            .get(&entity_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    pub fn get_parent(&self, entity_id: Uuid) -> Option<Uuid> {
-        self.lineage
-            .lock()
-            .unwrap()
-            .parents
-            .get(&entity_id)
-            .copied()
-    }
-
-    pub fn get_entity_events(&self, entity_id: Uuid) -> EntityEvents {
-        // First collect all data we need while holding the lock
-        let (messages, children_ids) = {
-            let lineage = self.lineage.lock().unwrap();
-            let arena = self.message_arena.lock().unwrap();
-
-            let messages = lineage
-                .entity_events
-                .get(&entity_id)
-                .map(|indices| {
-                    indices
-                        .iter()
-                        .filter_map(|&idx| arena.get(idx).cloned())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let children_ids = lineage
-                .children
-                .get(&entity_id)
-                .cloned()
-                .unwrap_or_default();
-
-            (messages, children_ids)
-        }; // Locks released here
-
-        // Now process children without holding the lock
-        let mut children = Vec::new();
-        for child_id in children_ids {
-            children.push(self.get_entity_events(child_id));
-        }
-
-        EntityEvents { messages, children }
-    }
-
-    fn record_entity(&self, entity_id: Uuid, _entity_type: EntityType, message: String) {
-        let mut arena = self.message_arena.lock().unwrap();
-        let idx = arena.len();
-        arena.push(message.clone());
-
-        let mut lineage = self.lineage.lock().unwrap();
-        lineage
-            .entity_events
-            .entry(entity_id)
-            .or_default()
-            .push(idx);
-    }
-
-    pub fn record_template_match(&self, template_id: Uuid, content_id: Uuid, score: f32) {
-        let mut matches = self.template_matches.lock().unwrap();
-        matches.insert(content_id, (template_id, score));
-
-        self.record_relationship(Some(template_id), vec![content_id], "template_match");
-    }
-
-    // Get matches for a specific template
-    pub fn get_template_matches(&self, template_id: Uuid) -> Vec<(Uuid, f32)> {
-        let matches = self.template_matches.lock().unwrap();
-
-        let children = self.get_children(template_id);
-
-        children
-            .iter()
-            .filter_map(|content_id| {
-                matches.get(content_id).map(|(t_id, score)| {
-                    if *t_id == template_id {
-                        (*content_id, *score)
-                    } else {
-                        (*content_id, *score)
-                    }
-                })
-            })
-            .collect()
-    }
-
-    // Get the template that matched a content element
-    pub fn get_matching_template(&self, content_id: Uuid) -> Option<(Uuid, f32)> {
-        let matches = self.template_matches.lock().unwrap();
-        matches.get(&content_id).copied()
-    }
-
-    // Add this method to store template names
-    pub fn set_template_name(&self, template_id: Uuid, name: String) {
-        let mut names = self.template_names.lock().unwrap();
-        names.insert(template_id, name);
-    }
-
-    // Implement get_template_name correctly
-    pub fn get_template_name(&self, template_id: Uuid) -> Option<String> {
-        let names = self.template_names.lock().unwrap();
-        names.get(&template_id).cloned()
-    }
-
-    // Get template structure (from events)
-    pub fn get_template_structure(&self, template_id: Uuid) -> Option<Vec<String>> {
-        // Extract structure from template events
-        let events = self.get_entity_events(template_id);
-        if events.messages.is_empty() {
-            return None;
-        }
-
-        // Parse structure from event messages - this is a simplified approach
-        // You may need to customize based on your actual event format
-        let structure = events
-            .messages
-            .iter()
-            .filter_map(|msg| {
-                if let Some(start) = msg.find("element_type = ") {
-                    let element_info = &msg[start + "element_type = ".len()..];
-                    if let Some(end) = element_info.find(';') {
-                        return Some(element_info[..end].trim().to_string());
-                    }
-                }
-                None
-            })
-            .collect::<Vec<_>>();
-
-        if structure.is_empty() {
-            None
-        } else {
-            Some(structure)
-        }
-    }
-
-    // Get events by target type
-    pub fn get_events_by_target(&self, target: &str) -> Vec<String> {
-        let events = self.events.lock().unwrap();
-        let messages = self.message_arena.lock().unwrap();
-
-        let mut result = Vec::new();
-        for (_, event_indices) in events.iter() {
-            for idx in event_indices {
-                if let Some(msg) = messages.get(*idx) {
-                    if msg.contains(&format!("target={}", target)) {
-                        result.push(msg.clone());
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
-    // Add this method to count all traces
-    pub fn count_all_traces(&self) -> usize {
-        let events = self.events.lock().unwrap();
-        let mut total = 0;
-        for (_, indices) in events.iter() {
-            total += indices.len();
-        }
-        total
-    }
-
-    // Add a method to get all templates
-    pub fn get_templates(&self) -> Vec<(Uuid, String)> {
-        // Collect template IDs from template_names
-        let templates = self.template_names.lock().unwrap();
-
-        // Return a list of (template_id, name) pairs
-        templates
-            .iter()
-            .map(|(id, name)| (*id, name.clone()))
-            .collect()
-    }
-
-    // Count matches for a template using existing relationship tracking
-    pub fn count_matches_for_template(&self, template_id: &Uuid) -> usize {
-        let children = self.get_children(*template_id);
-        let matches = self.template_matches.lock().unwrap();
-
-        // Count children that are actually in template_matches
-        children
-            .iter()
-            .filter(|child_id| matches.contains_key(child_id))
-            .count()
-    }
-
-    // Get content matches for a template
-    pub fn get_content_matches_for_template(&self, template_id: &Uuid) -> Vec<Uuid> {
-        self.get_children(*template_id)
-    }
-
-    // Add method to get content text by ID
-    pub fn get_content_by_id(&self, content_id: &Uuid) -> Option<String> {
-        // Use events collection to find content
-        let events = self.events.lock().unwrap();
-        if let Some(indices) = events.get(content_id) {
-            if !indices.is_empty() {
-                let messages = self.message_arena.lock().unwrap();
-                let message = &messages[indices[0]];
-                return Some(message.clone());
-            }
-        }
-
-        // If no direct message, return the UUID as string
-        Some(content_id.to_string())
-    }
-
-    // In the DebugDataStore implementation, add this method to directly inspect the matches
-    pub fn debug_dump_all_matches(&self) -> Vec<(Uuid, Uuid, f32)> {
-        let matches = self.template_matches.lock().unwrap();
-        matches
-            .iter()
-            .map(|(content_id, (template_id, score))| (*content_id, *template_id, *score))
-            .collect()
-    }
-}
-
-pub struct DebugLayer {
-    store: DebugDataStore,
-}
+/// OpenTelemetry-based debug layer that sends traces to Jaeger
+pub struct OtelDebugLayer;
 
 #[derive(Default)]
 struct SpanData {
     element_id: Option<Uuid>,
     line_id: Option<Uuid>,
-    template_id: Option<Uuid>, // Add tracking for template IDs
-    match_id: Option<Uuid>,    // Add tracking for match IDs
+    template_id: Option<Uuid>,
+    match_id: Option<Uuid>,
 }
 
-// Add these debug helpers
-use std::sync::atomic::{AtomicUsize, Ordering};
-static EVENT_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
-    // Reset counter for this session
-    EVENT_COUNTER.store(0, Ordering::SeqCst);
-
-    // Print debug information
-    println!("LOGGING: Initializing debug logging system");
-
-    // Create a debug layer with the store
-    let debug_layer = DebugLayer::new(store);
-
-    // Create a non-blocking file appender to get the WorkerGuard
-    let (_non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
-
-    // Create a filter that explicitly allows our targets
-    let filter = tracing_subscriber::filter::filter_fn(|metadata| {
-        let target = metadata.target();
-
-        if target.contains("matcher_operations")
-            || target.contains("template_match")
-            || target.contains("logging")
-        {
-            println!("LOGGING: Allowing event with target: {}", target);
-            return true;
-        }
-
-        // Filter other targets as needed
-        target.starts_with("delver_pdf") || target.contains("pdf") || target.contains("template")
-    });
-
-    // Install the subscriber
-    let subscriber = tracing_subscriber::registry()
-        .with(debug_layer)
-        .with(filter);
-
-    println!("LOGGING: Setting global default subscriber");
-
-    // Set the global default
-    match tracing::subscriber::set_global_default(subscriber) {
-        Ok(_) => println!("LOGGING: Global subscriber set successfully"),
-        Err(e) => println!("LOGGING: Failed to set global subscriber: {}", e),
+impl OtelDebugLayer {
+    pub fn new() -> Self {
+        OtelDebugLayer
     }
-
-    // Return the guard to keep logging active
-    guard
 }
 
-impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
+impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for OtelDebugLayer {
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         // Extract IDs from event
         let mut id_visitor = IdVisitor {
@@ -443,15 +83,20 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
             }
         }
 
-        // println!(
-        //     "EXTRACTED: element_id={:?}, line_id={:?}, template_id={:?}, match_id={:?}",
-        //     id_visitor.element_id, id_visitor.line_id, id_visitor.template_id, id_visitor.match_id
-        // );
-
         // Capture message from the event
         let mut message = String::new();
         let mut message_visitor = MessageVisitor(&mut message);
         event.record(&mut message_visitor);
+
+        // Get tracer for the appropriate domain
+        let tracer_name = match event.metadata().target() {
+            target if target.contains("template") => "delver-templates",
+            target if target.contains("matcher") => "delver-template-matching",
+            target if target.contains("pdf") => "delver-pdf-parsing",
+            _ => "delver-entities",
+        };
+
+        let tracer = global::tracer(tracer_name);
 
         // Handle entity recording based on ID types
         match (
@@ -462,40 +107,40 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
         ) {
             // Template registration (template without a match)
             (_, _, Some(template_id), None) => {
-                println!(
-                    "CAPTURE: Found template_id={} in registration event",
-                    template_id
-                );
-                self.store
-                    .record_entity(template_id, EntityType::Template, message.clone());
+                let span = tracer
+                    .span_builder("template_registration")
+                    .with_attributes(vec![
+                        KeyValue::new("template_id", template_id.to_string()),
+                        KeyValue::new("entity_type", "template"),
+                        KeyValue::new("message", message.clone()),
+                        KeyValue::new("target", event.metadata().target()),
+                    ])
+                    .start(&tracer);
 
-                // Extract template name if this is a registration
-                // Find template name in message
-                let mut template_name = None;
+                // Extract template name if available
                 if let Some(name_start) = message.find("template_name = ") {
                     if let Some(name_end) = message[name_start..].find(';') {
                         let raw_name = &message[name_start + 16..name_start + name_end];
                         let name = raw_name.trim_matches('"');
-                        template_name = Some(name.to_string());
+                        
+                        let span_with_name = tracer
+                            .span_builder("template_registration")
+                            .with_attributes(vec![
+                                KeyValue::new("template_id", template_id.to_string()),
+                                KeyValue::new("template_name", name),
+                                KeyValue::new("entity_type", "template"),
+                                KeyValue::new("message", message.clone()),
+                                KeyValue::new("target", event.metadata().target()),
+                            ])
+                            .start(&tracer);
+                        span_with_name.end();
                     }
                 }
 
-                // Store template name if available
-                if let Some(name) = template_name {
-                    println!(
-                        "REGISTRATION: Recording template: {} = {}",
-                        template_id, name
-                    );
-                    let mut templates = self.store.template_names.lock().unwrap();
-                    templates.insert(template_id, name);
-                }
+                span.end();
             }
+            // Template match
             (_, Some(line_id), Some(template_id), Some(_match_id)) => {
-                println!(
-                    "CAPTURE: Found template match between template={} and line={}",
-                    template_id, line_id
-                );
-
                 // Extract score from the event
                 let mut score = 0.0;
                 if let Some(score_start) = message.find("score = ") {
@@ -509,42 +154,68 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
                     }
                 }
 
-                println!("MATCH: Recording template match with score {}", score);
+                let span = tracer
+                    .span_builder("template_match")
+                    .with_attributes(vec![
+                        KeyValue::new("template_id", template_id.to_string()),
+                        KeyValue::new("content_id", line_id.to_string()),
+                        KeyValue::new("match_score", score.to_string()),
+                        KeyValue::new("match_type", "template_content_match"),
+                        KeyValue::new("message", message),
+                        KeyValue::new("target", event.metadata().target()),
+                    ])
+                    .start(&tracer);
 
-                // Record template match with score
-                self.store
-                    .record_template_match(template_id, line_id, score);
+                span.end();
 
-                // Record relationship between template and line
-                self.store
-                    .record_relationship(Some(template_id), vec![line_id], "template_match");
+                // Also record relationship
+                let rel_span = tracer
+                    .span_builder("record_relationship")
+                    .with_attributes(vec![
+                        KeyValue::new("parent_id", template_id.to_string()),
+                        KeyValue::new("children", format!("[{}]", line_id)),
+                        KeyValue::new("relationship_type", "template_match"),
+                    ])
+                    .start(&tracer);
+                rel_span.end();
             }
             // Standard element case
             (Some(e_id), _, _, _) => {
-                self.store.record_entity(e_id, EntityType::Line, message);
+                let span = tracer
+                    .span_builder("entity_line")
+                    .with_attributes(vec![
+                        KeyValue::new("entity_id", e_id.to_string()),
+                        KeyValue::new("entity_type", "element"),
+                        KeyValue::new("message", message),
+                        KeyValue::new("target", event.metadata().target()),
+                    ])
+                    .start(&tracer);
+                span.end();
             }
             // Standard line case
             (_, Some(l_id), _, _) => {
-                self.store.record_entity(l_id, EntityType::Line, message);
+                let span = tracer
+                    .span_builder("entity_line")
+                    .with_attributes(vec![
+                        KeyValue::new("entity_id", l_id.to_string()),
+                        KeyValue::new("entity_type", "line"),
+                        KeyValue::new("message", message),
+                        KeyValue::new("target", event.metadata().target()),
+                    ])
+                    .start(&tracer);
+                span.end();
             }
-            // Other combinations - record all available entities
+            // Generic event
             _ => {
-                if let Some(e_id) = *id_visitor.element_id {
-                    self.store
-                        .record_entity(e_id, EntityType::Line, message.clone());
-                }
-                if let Some(l_id) = *id_visitor.line_id {
-                    self.store
-                        .record_entity(l_id, EntityType::Line, message.clone());
-                }
-                // Let in this position unstable?
-                // if let Some(t_id) = *id_visitor.template_id
-                //     && event.metadata().target() != TEMPLATE_MATCH
-                // {
-                //     // Only record template here if not already handled in specific patterns
-                //     self.store
-                //         .record_entity(t_id, EntityType::Template, message.clone());
-                // }
+                let span = tracer
+                    .span_builder("generic_event")
+                    .with_attributes(vec![
+                        KeyValue::new("message", message),
+                        KeyValue::new("target", event.metadata().target()),
+                        KeyValue::new("level", event.metadata().level().to_string()),
+                    ])
+                    .start(&tracer);
+                span.end();
             }
         }
 
@@ -559,23 +230,37 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
         event.record(&mut rel_visitor);
 
         if !rel_children.is_empty() {
-            self.store.record_relationship(rel_parent, rel_children, "");
+            if let Some(parent_id) = rel_parent {
+                let span = tracer
+                    .span_builder("record_relationship")
+                    .with_attributes(vec![
+                        KeyValue::new("parent_id", parent_id.to_string()),
+                        KeyValue::new("children", format!("{:?}", rel_children)),
+                        KeyValue::new("relationship_type", "generic"),
+                    ])
+                    .start(&tracer);
+                span.end();
+            }
         }
     }
 }
 
-impl DebugLayer {
-    pub fn new(store: DebugDataStore) -> Self {
-        DebugLayer { store }
-    }
+/// Initialize OpenTelemetry-based debug logging
+/// This is a compatibility function for the old API
+pub fn init_debug_logging(_store: DebugDataStore) -> tokio::task::JoinHandle<()> {
+    // Return a dummy join handle since OpenTelemetry is initialized elsewhere
+    tokio::spawn(async {
+        // This is just a placeholder for compatibility
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    })
 }
 
 #[derive(Debug)]
 struct IdVisitor<'a> {
     element_id: &'a mut Option<Uuid>,
     line_id: &'a mut Option<Uuid>,
-    template_id: &'a mut Option<Uuid>, // Add template ID field
-    match_id: &'a mut Option<Uuid>,    // Add match ID field
+    template_id: &'a mut Option<Uuid>,
+    match_id: &'a mut Option<Uuid>,
 }
 
 impl tracing::field::Visit for IdVisitor<'_> {
@@ -583,8 +268,8 @@ impl tracing::field::Visit for IdVisitor<'_> {
         match field.name() {
             "line_id" => *self.line_id = Uuid::parse_str(value).ok(),
             "element_id" => *self.element_id = Uuid::parse_str(value).ok(),
-            "template_id" => *self.template_id = Uuid::parse_str(value).ok(), // Handle template ID
-            "match_id" => *self.match_id = Uuid::parse_str(value).ok(),       // Handle match ID
+            "template_id" => *self.template_id = Uuid::parse_str(value).ok(),
+            "match_id" => *self.match_id = Uuid::parse_str(value).ok(),
             _ => {}
         }
     }
@@ -633,16 +318,3 @@ impl tracing::field::Visit for RelationshipVisitor<'_> {
         self.record_str(field, &value)
     }
 }
-
-// pub struct SubscriberConfig {
-//     pub subscriber: ,
-//     pub _guard: tracing_appender::non_blocking::WorkerGuard,
-// }
-
-// pub fn init_logging(
-//     debug_ops: bool,
-//     store: DebugDataStore,
-// ) -> Result<(), Box<dyn std::error::Error>> {
-//     init_debug_logging(store)?;
-//     Ok(())
-// }

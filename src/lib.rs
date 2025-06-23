@@ -7,6 +7,7 @@ pub mod layout;
 pub mod logging;
 pub mod matcher;
 pub mod parse;
+pub mod persistent_store;
 pub mod search_index;
 
 use crate::dom::{parse_template, process_matched_content, ChunkOutput, ProcessedOutput};
