@@ -71,8 +71,8 @@ kramdown:
 # SEO settings
 lang: en
 author: Delver Team
-logo: /assets/images/logo.png
+logo: /assets/images/logo.bmp
 social:
   name: Delver
   links:
-    - https://github.com/yourusername/delver
+    - https://github.com/fmurray/delver
