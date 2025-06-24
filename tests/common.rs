@@ -39,7 +39,7 @@ pub fn get_test_pdf_path() -> PathBuf {
 }
 
 pub fn load_test_template() -> String {
-    include_str!("../10k.tmpl").to_string()
+    include_str!("./10k.tmpl").to_string()
 }
 
 // Test builders and helpers for more readable tests

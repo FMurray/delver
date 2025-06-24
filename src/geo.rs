@@ -1,5 +1,3 @@
-use geo::Point;
-
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq)]
 pub struct Rect {
     pub x0: f32,

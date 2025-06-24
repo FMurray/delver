@@ -7,7 +7,6 @@ use crate::{
 use lopdf::Object;
 use ordered_float::NotNan;
 use rstar::{RTree, RTreeObject, AABB};
-use std::collections::BinaryHeap;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
@@ -51,30 +50,41 @@ struct StyleKey(u64);
 
 impl StyleKey {
     #[inline]
-    fn new(
-        font_id: u16,
-        size_bin: u16,
-        z_bin: i8,
-        pos_bin: u8,
-        caps: bool,
-        title: bool,
-    ) -> Self {
+    fn new(font_id: u16, size_bin: u16, z_bin: i8, pos_bin: u8, caps: bool, title: bool) -> Self {
         let mut v = 0u64;
-        v |= font_id as u64;               // bits 0‑15
-        v |= (size_bin as u64) << 16;      // 16‑31
-        v |= ((z_bin as i16) as u64) << 32;// 32‑39 (sign‑extended)
-        v |= (pos_bin as u64) << 40;       // 40‑43
-        v |= (caps as u64) << 48;          // 48
-        v |= (title as u64) << 49;         // 49
+        v |= font_id as u64; // bits 0‑15
+        v |= (size_bin as u64) << 16; // 16‑31
+        v |= ((z_bin as i16) as u64) << 32; // 32‑39 (sign‑extended)
+        v |= (pos_bin as u64) << 40; // 40‑43
+        v |= (caps as u64) << 48; // 48
+        v |= (title as u64) << 49; // 49
         StyleKey(v)
     }
 
-    #[inline] pub fn font_id(self)  -> u16 {  (self.0        & 0xFFFF) as u16 }
-    #[inline] pub fn size_bin(self) -> u16 { ((self.0 >> 16) & 0xFFFF) as u16 }
-    #[inline] pub fn z_bin(self)    -> i8  { ((self.0 >> 32) as i16) as i8 }
-    #[inline] pub fn pos_bin(self)  -> u8  { ((self.0 >> 40) & 0x0F)  as u8 }
-    #[inline] pub fn caps(self)     -> bool{ ((self.0 >> 48) & 0x1) != 0 }
-    #[inline] pub fn title(self)    -> bool{ ((self.0 >> 49) & 0x1) != 0 }
+    #[inline]
+    pub fn font_id(self) -> u16 {
+        (self.0 & 0xFFFF) as u16
+    }
+    #[inline]
+    pub fn size_bin(self) -> u16 {
+        ((self.0 >> 16) & 0xFFFF) as u16
+    }
+    #[inline]
+    pub fn z_bin(self) -> i8 {
+        ((self.0 >> 32) as i16) as i8
+    }
+    #[inline]
+    pub fn pos_bin(self) -> u8 {
+        ((self.0 >> 40) & 0x0F) as u8
+    }
+    #[inline]
+    pub fn caps(self) -> bool {
+        ((self.0 >> 48) & 0x1) != 0
+    }
+    #[inline]
+    pub fn title(self) -> bool {
+        ((self.0 >> 49) & 0x1) != 0
+    }
 
     #[inline]
     fn with_bins(self, new_z: i8, new_pos: u8) -> Self {
@@ -93,11 +103,13 @@ impl StyleKey {
 fn intern_font(opt_name: &Option<String>) -> u16 {
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
-    static INTERN: Lazy<Mutex<HashMap<String,u16>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-    let name = crate::fonts::canonicalize::canonicalize_font_name(opt_name.as_deref().unwrap_or(""));
+    static INTERN: Lazy<Mutex<HashMap<String, u16>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+    let name =
+        crate::fonts::canonicalize::canonicalize_font_name(opt_name.as_deref().unwrap_or(""));
     let mut map = INTERN.lock().unwrap();
-    if let Some(&id) = map.get(&name) { id }
-    else {
+    if let Some(&id) = map.get(&name) {
+        id
+    } else {
         let id = map.len() as u16;
         map.insert(name, id);
         id
@@ -167,11 +179,9 @@ pub struct PdfIndex {
     pub fonts: HashMap<(String, NotNan<f32>), FontUsage>,
     pub font_name_frequency_index: Vec<(u32, String)>,
     pub font_size_stats: FontSizeStats,
-    // NEW: Efficient style-based similarity search structures
-    style_key: Vec<StyleKey>,                        // row → key
+    style_key: Vec<StyleKey>,                          // row → key
     style_buckets: HashMap<StyleKey, Vec<TextHandle>>, // key → rows for O(1) similarity lookup
-    font_name_totals: HashMap<String, u32>,          // font name → total usage count
-    page_y_values: HashMap<u32, Vec<f32>>,           // page → sorted Y positions for percentile calc
+    page_y_values: HashMap<u32, Vec<f32>>, // page → sorted Y positions for percentile calc
 }
 
 impl PdfIndex {
@@ -189,7 +199,7 @@ impl PdfIndex {
         let mut order: Vec<ContentHandle> = Vec::new();
         let mut text_store = TextStore::default();
         let mut image_store = ImageStore::default();
-        
+
         // NEW: Collect data for statistics
         let mut font_sizes = Vec::new();
         let mut page_y_values: HashMap<u32, Vec<f32>> = HashMap::new();
@@ -225,11 +235,13 @@ impl PdfIndex {
                         )
                     });
                     font_entry.add_usage(current_content_index);
-                    
+
                     // NEW: Collect statistics data
                     font_sizes.push(current_font_size);
-                    page_y_values.entry(*page_number).or_default()
-                                 .push((text_elem.bbox.1 + text_elem.bbox.3) * 0.5); // center Y
+                    page_y_values
+                        .entry(*page_number)
+                        .or_default()
+                        .push((text_elem.bbox.1 + text_elem.bbox.3) * 0.5); // center Y
                     *font_name_totals.entry(canonical_font_name).or_insert(0) += 1;
                 }
                 current_content_index += 1;
@@ -275,19 +287,9 @@ impl PdfIndex {
         let sd = font_size_stats.std_dev.max(1e-6); // avoid div‑by‑zero
 
         // Sort Y values for percentile calculations
-        for ys in page_y_values.values_mut() { 
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap()); 
+        for ys in page_y_values.values_mut() {
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
         }
-
-        let perc_of = |page: u32, y: f32| -> f32 {
-            if let Some(vec) = page_y_values.get(&page) {
-                match vec.binary_search_by(|val| val.partial_cmp(&y).unwrap()) {
-                    Ok(idx) | Err(idx) => idx as f32 / vec.len() as f32,
-                }
-            } else { 
-                0.0 
-            }
-        };
 
         // Build style keys and buckets for efficient similarity search
         let mut style_key = Vec::with_capacity(text_store.id.len());
@@ -306,15 +308,17 @@ impl PdfIndex {
 
             let txt = &text_store.text[row];
             let caps = txt.chars().all(|c| !c.is_lowercase());
-            let title = txt.split_whitespace()
-                           .filter(|w| w.len() > 3)
-                           .all(|w| w.chars().next().unwrap_or_default().is_uppercase());
+            let title = txt
+                .split_whitespace()
+                .filter(|w| w.len() > 3)
+                .all(|w| w.chars().next().unwrap_or_default().is_uppercase());
 
             let key = StyleKey::new(font_id, size_bin, z_bin, horiz_bin, caps, title);
             style_key.push(key);
-            style_buckets.entry(key)
-                         .or_default()
-                         .push(TextHandle(row as u32));
+            style_buckets
+                .entry(key)
+                .or_default()
+                .push(TextHandle(row as u32));
         }
 
         font_size_index_construction
@@ -343,10 +347,9 @@ impl PdfIndex {
             fonts: fonts_map,
             font_name_frequency_index,
             font_size_stats,
-            
+
             style_key,
             style_buckets,
-            font_name_totals,
             page_y_values,
         }
     }
@@ -634,8 +637,14 @@ impl PdfIndex {
         let mut results = Vec::new();
 
         // Debug: print what we're searching for
-        println!("[find_text_matches] Searching for '{}' with threshold {}", text, threshold);
-        println!("[find_text_matches] Text store has {} elements", self.text_store.text.len());
+        println!(
+            "[find_text_matches] Searching for '{}' with threshold {}",
+            text, threshold
+        );
+        println!(
+            "[find_text_matches] Text store has {} elements",
+            self.text_store.text.len()
+        );
 
         // Iterate through the text column only (cache-friendly)
         for (text_store_idx, text_content) in self.text_store.text.iter().enumerate() {
@@ -645,10 +654,13 @@ impl PdfIndex {
                     continue; // Skip elements before start position
                 }
             }
-            
+
             let score = normalized_levenshtein(text, text_content);
-            println!("[find_text_matches] Text '{}' vs '{}' = score {}", text, text_content, score);
-            
+            println!(
+                "[find_text_matches] Text '{}' vs '{}' = score {}",
+                text, text_content, score
+            );
+
             if score >= threshold {
                 // Find the corresponding document index for this text element
                 if let Some(doc_idx) = self.find_doc_index_for_text(text_store_idx) {
@@ -661,18 +673,27 @@ impl PdfIndex {
                                 break;
                             }
                         }
-                        
-                        println!("[find_text_matches] Match found: text_idx={}, doc_idx={}, score={}", text_store_idx, doc_idx, score);
+
+                        println!(
+                            "[find_text_matches] Match found: text_idx={}, doc_idx={}, score={}",
+                            text_store_idx, doc_idx, score
+                        );
                         results.push((TextHandle(text_store_idx as u32), score));
                     } else {
-                        println!("[find_text_matches] Match found but doc_idx {} < start {}", doc_idx, start);
+                        println!(
+                            "[find_text_matches] Match found but doc_idx {} < start {}",
+                            doc_idx, start
+                        );
                     }
                 } else {
-                    println!("[find_text_matches] Match found but no doc_idx for text_idx {}", text_store_idx);
+                    println!(
+                        "[find_text_matches] Match found but no doc_idx for text_idx {}",
+                        text_store_idx
+                    );
                 }
             }
         }
-        
+
         println!("[find_text_matches] Returning {} results", results.len());
         results
     }
@@ -774,10 +795,14 @@ impl PdfIndex {
         // --- 4. slice filter + de-dup -------------------------------------
         let mut seen = std::collections::HashSet::<u32>::new();
         handles.retain(|h| {
-            if !seen.insert(h.0) { return false; }
+            if !seen.insert(h.0) {
+                return false;
+            }
             if let Some(doc_idx) = self.text_idx_to_doc_idx(h.0 as usize) {
                 doc_idx >= start_idx && doc_idx < end_idx
-            } else { false }
+            } else {
+                false
+            }
         });
 
         // --- 5. cap to k ---------------------------------------------------
@@ -785,13 +810,16 @@ impl PdfIndex {
     }
 
     /// Compute style key for any TextElement (not necessarily in the index)
+    #[allow(dead_code)]
     fn compute_style_key_for_element(&self, element: &TextElement) -> StyleKey {
         let font_id = intern_font(&element.font_name);
         let size_bin = ((element.font_size * 2.0).round() as u16).min(400);
-        
+
         let mean = self.font_size_stats.mean;
         let sd = self.font_size_stats.std_dev.max(1e-6);
-        let z_bin = (((element.font_size - mean) / sd) * 2.0).round().clamp(-8.0, 8.0) as i8;
+        let z_bin = (((element.font_size - mean) / sd) * 2.0)
+            .round()
+            .clamp(-8.0, 8.0) as i8;
 
         let y_cent = (element.bbox.1 + element.bbox.3) * 0.5;
         let pos_bin = if let Some(ys) = self.page_y_values.get(&element.page_number) {
@@ -801,30 +829,31 @@ impl PdfIndex {
                     (percentile * 10.0).floor().clamp(0.0, 9.0) as u8
                 }
             }
-        } else { 
-            0 
+        } else {
+            0
         };
 
         let txt = &element.text;
         let caps = txt.chars().all(|c| !c.is_lowercase());
-        let title = txt.split_whitespace()
-                       .filter(|w| w.len() > 3)
-                       .all(|w| w.chars().next().unwrap_or_default().is_uppercase());
+        let title = txt
+            .split_whitespace()
+            .filter(|w| w.len() > 3)
+            .all(|w| w.chars().next().unwrap_or_default().is_uppercase());
 
         StyleKey::new(font_id, size_bin, z_bin, pos_bin, caps, title)
     }
 
     /// Helper method to translate document index to text store index
-    #[inline] 
+    #[inline]
     fn text_row_to_text_idx(&self, doc_idx: usize) -> Option<usize> {
         match self.order.get(doc_idx)? {
             ContentHandle::Text(text_idx) => Some(*text_idx),
             ContentHandle::Image(_) => None,
         }
     }
-    
+
     /// Helper method to translate text store index to document index
-    #[inline] 
+    #[inline]
     fn text_idx_to_doc_idx(&self, text_idx: usize) -> Option<usize> {
         let text_id = self.text_store.id.get(text_idx)?;
         self.element_id_to_index.get(text_id).copied()
@@ -1156,23 +1185,6 @@ impl PdfIndex {
         self.font_size_stats.clone()
     }
 
-    /// Find elements with statistically significant font sizes
-    pub fn elements_by_font_size_percentile(&self, percentile: f32) -> Vec<PageContent> {
-        let stats = self.font_size_stats();
-        let threshold = stats.percentiles[3]; // Using 90th percentile as default
-
-        // Cache-efficient: iterate through font_size column directly
-        let mut results = Vec::new();
-        for (idx, &font_size) in self.text_store.font_size.iter().enumerate() {
-            if font_size >= threshold {
-                if let Some(text_elem) = self.text_store.get(idx) {
-                    results.push(PageContent::Text(text_elem));
-                }
-            }
-        }
-        results
-    }
-
     /// Find elements that are likely section boundaries - cache-efficient
     pub fn find_potential_section_boundaries(&self) -> Vec<PageContent> {
         let stats = self.font_size_stats();
@@ -1189,7 +1201,6 @@ impl PdfIndex {
         }
         results
     }
-
 
     /// Zero-copy access to text element via typed handle
     #[inline]
@@ -1238,34 +1249,40 @@ impl PdfIndex {
     }
 
     /// Get elements that match a similar style to the given text element (NEW: efficient style-based lookup)
-    pub fn elements_by_similar_style(&self, seed: &TextElement, max_results: Option<usize>) -> Vec<PageContent> {
+    pub fn elements_by_similar_style(
+        &self,
+        seed: &TextElement,
+        max_results: Option<usize>,
+    ) -> Vec<PageContent> {
         // Get the seed element's style key
         let seed_doc_idx = match self.element_id_to_index.get(&seed.id) {
             Some(&idx) => idx,
             None => return Vec::new(),
         };
-        
+
         let seed_text_idx = match self.text_row_to_text_idx(seed_doc_idx) {
             Some(idx) => idx,
             None => return Vec::new(),
         };
-        
+
         let seed_key = self.style_key[seed_text_idx];
-        
+
         // O(1) lookup of elements with same style signature
-        let candidates = self.style_buckets.get(&seed_key)
+        let candidates = self
+            .style_buckets
+            .get(&seed_key)
             .map(|v| v.clone())
             .unwrap_or_default();
-        
+
         let max_results = max_results.unwrap_or(candidates.len());
         let mut results = Vec::new();
-        
+
         for text_handle in candidates.into_iter().take(max_results) {
             let txt_ref = self.text(text_handle);
             if txt_ref.id == seed.id {
                 continue; // skip self
             }
-            
+
             let txt = TextElement {
                 id: txt_ref.id,
                 text: txt_ref.text.to_string(),
@@ -1274,10 +1291,10 @@ impl PdfIndex {
                 bbox: txt_ref.bbox,
                 page_number: txt_ref.page_number,
             };
-            
+
             results.push(PageContent::Text(txt));
         }
-        
+
         results
     }
 
@@ -1324,10 +1341,10 @@ impl FontSizeStats {
 
     pub fn from_sizes(sizes: &[f32]) -> Self {
         if sizes.is_empty() {
-            return Self { 
-                mean: 12.0, 
-                std_dev: 0.0, 
-                percentiles: [12.0; 5] 
+            return Self {
+                mean: 12.0,
+                std_dev: 0.0,
+                percentiles: [12.0; 5],
             };
         }
         let mut v: Vec<f32> = sizes.to_vec();
@@ -1337,7 +1354,7 @@ impl FontSizeStats {
         let sd = var.sqrt();
         let idx = |p: f32| v[((p * (v.len() as f32)) as usize).min(v.len() - 1)];
         Self {
-            mean, 
+            mean,
             std_dev: sd,
             percentiles: [idx(0.25), idx(0.50), idx(0.75), idx(0.90), idx(0.95)],
         }

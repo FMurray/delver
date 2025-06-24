@@ -7,9 +7,7 @@ use uuid::Uuid;
 
 use crate::geo::{multiply_matrices, pre_translate, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
 use crate::layout::MatchContext;
-use lopdf::{
-    Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult, Stream,
-};
+use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};

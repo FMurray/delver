@@ -1,32 +1,18 @@
-use crate::dom::{Element, ElementType, MatchConfig, MatchType, Value};
-use crate::layout::{group_text_into_lines, TextBlock, TextLine};
-use crate::logging::TEMPLATE_MATCH;
-use crate::parse::{ContentHandle, ImageElement, PageContent, TextElement};
+use crate::dom::{Element, ElementType, MatchConfig, Value};
+use crate::layout::TextLine;
+use crate::parse::{ContentHandle, PageContent, TextElement};
 use crate::search_index::PdfIndex;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use strsim::normalized_levenshtein;
-use tracing::{event, warn, Level};
+use tracing::warn;
 use uuid::Uuid;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+// use crate::logging::TEMPLATE_MATCH;
 
 // Maximum recursion depth to prevent runaway recursion
 const MAX_RECURSION_DEPTH: usize = 10;
-
-// Global counters for debugging infinite loops
-static MATCH_SECTION_CALLS: AtomicUsize = AtomicUsize::new(0);
-static ALIGN_TEMPLATE_CALLS: AtomicUsize = AtomicUsize::new(0);
-static FIND_START_BOUNDARY_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-// Progress tracking structure
-#[derive(Debug, Clone)]
-struct MatchingProgress {
-    start_search_index: usize,
-    template_name: String,
-    call_count: usize,
-    visited_positions: std::collections::HashSet<usize>, // Track visited positions
-}
 
 #[derive(Debug, Clone)]
 pub struct TemplateContentMatch<'a> {
@@ -45,7 +31,7 @@ pub struct SectionBoundaries {
 
 #[derive(Debug, Clone)]
 pub enum MatchedContent {
-    Index(usize),  // Document-order index that can be resolved through PdfIndex
+    Index(usize), // Document-order index that can be resolved through PdfIndex
     None,
 }
 
@@ -58,7 +44,7 @@ impl MatchedContent {
             MatchedContent::None => None,
         }
     }
-    
+
     /// Get the actual content by resolving the index through the PdfIndex
     pub fn resolve<'a>(&self, index: &'a PdfIndex) -> Option<PageContent> {
         match self {
@@ -66,7 +52,7 @@ impl MatchedContent {
             MatchedContent::None => None,
         }
     }
-    
+
     /// Check if this represents text content without materializing it
     pub fn is_text(&self, index: &PdfIndex) -> bool {
         match self {
@@ -80,7 +66,7 @@ impl MatchedContent {
             MatchedContent::None => false,
         }
     }
-    
+
     /// Check if this represents image content without materializing it
     pub fn is_image(&self, index: &PdfIndex) -> bool {
         match self {
@@ -159,12 +145,6 @@ fn align_template_with_content_with_depth<'a>(
     parent_or_prev_sibling_match_context: Option<&TemplateContentMatch<'a>>,
     recursion_depth: usize,
 ) -> Option<Vec<TemplateContentMatch<'a>>> {
-    // Increment and check call counter for infinite loop detection
-    let call_count = ALIGN_TEMPLATE_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
-    if call_count > 10000 {
-        panic!("Infinite loop detected: align_template_with_content called {} times", call_count);
-    }
-
     if template_elements.is_empty() {
         return None;
     }
@@ -178,19 +158,11 @@ fn align_template_with_content_with_depth<'a>(
         return None;
     }
 
-    println!(
-        "MATCHER: align_template_with_content called for {} elements at depth {}. Context: {}. Call #{}", 
-        template_elements.len(),
-        recursion_depth,
-        parent_or_prev_sibling_match_context.map_or("None", |m| m.template_element.name.as_str()),
-        call_count
-    );
-
     let default_metadata = HashMap::new();
     let actual_inherited_metadata = inherited_metadata.unwrap_or(&default_metadata);
 
     let mut elements_by_page_view: BTreeMap<u32, Vec<PageContent>> = BTreeMap::new();
-    for (page_num, page_elements) in index.by_page.iter() {
+    for (page_num, _page_elements) in index.by_page.iter() {
         let page_content = index.elements_on_page(*page_num);
         if !page_content.is_empty() {
             elements_by_page_view.insert(*page_num, page_content);
@@ -244,7 +216,7 @@ fn align_template_with_content_with_depth<'a>(
             let is_last_section = template_elements
                 .iter()
                 .skip_while(|e| !std::ptr::eq(*e, template_element)) // slice from current
-                .skip(1)                                             // look ahead
+                .skip(1) // look ahead
                 .find(|e| e.element_type == ElementType::Section)
                 .is_none();
 
@@ -260,9 +232,16 @@ fn align_template_with_content_with_depth<'a>(
                     // If the previous section has an end marker, start from that end marker
                     // Otherwise, start after the previous section's start marker
                     if let Some(end_marker) = &boundaries.end_marker {
-                        index.element_id_to_index.get(&end_marker.id()).copied().unwrap_or(start_search_index)
+                        index
+                            .element_id_to_index
+                            .get(&end_marker.id())
+                            .copied()
+                            .unwrap_or(start_search_index)
                     } else {
-                        index.element_id_to_index.get(&boundaries.start_marker.id()).copied()
+                        index
+                            .element_id_to_index
+                            .get(&boundaries.start_marker.id())
+                            .copied()
                             .map(|idx| idx + 1)
                             .unwrap_or(start_search_index)
                     }
@@ -272,7 +251,7 @@ fn align_template_with_content_with_depth<'a>(
             } else {
                 start_search_index
             };
-            
+
             // Allow the section to start after the previous section's end marker
             // Often Siblings are adjacent
             if let Some(prev_end) = last_section_end_index {
@@ -288,7 +267,6 @@ fn align_template_with_content_with_depth<'a>(
                     prev_end
                 );
             }
-
 
             log_mem("before match_section");
             if let Some(section_match) = match_section(
@@ -320,7 +298,7 @@ fn align_template_with_content_with_depth<'a>(
                                                           // The section partition includes content UP TO but NOT INCLUDING the end marker
                                                           // TextChunks after sections should start AFTER the end marker
                     content_partitions.push((start_idx, end_idx));
-                    
+
                     // Update position tracking to prevent backtracking
                     last_section_end_index = Some(end_idx);
                 }
@@ -442,12 +420,14 @@ struct BoundaryCandidate {
 
 /// Represents the flow of content between elements
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ContentFlow<'a> {
     elements: Vec<&'a PageContent>,
     relationships: Vec<(usize, usize, RelationshipType)>,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum RelationshipType {
     Before,
     After,
@@ -474,7 +454,7 @@ fn match_section<'a, 'map_lt>(
         effective_search_start_index,
         prev_match_for_context.map_or("None", |m| m.template_element.name.as_str())
     );
-    
+
     // ------------------------------------------------------------------
     // Limit the start‑marker text search to the parent section’s boundary,
     // if we are inside a parent.  This prevents a child from matching text
@@ -484,7 +464,6 @@ fn match_section<'a, 'map_lt>(
         .and_then(|sb| sb.end_marker.as_ref())
         .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
         .filter(|&end_idx| end_idx > effective_search_start_index);
-
 
     // 1. Find start boundary candidates
     let start_candidates = find_start_boundary_candidates(
@@ -531,18 +510,25 @@ fn match_section<'a, 'map_lt>(
                     (end_idx > start_idx).then_some(end)
                 })
         });
-    
+
     // If we still have no end marker, create a virtual end marker at document end
     // or find the next significant element that could serve as a natural boundary
     let end_marker_final = if let Some(end_marker) = end_marker_option {
         Some(end_marker.clone())
     } else {
         // Try to find the next element that could serve as a natural boundary
-        let start_idx = index.element_id_to_index.get(&start_marker.id()).copied().unwrap_or(0);
+        let start_idx = index
+            .element_id_to_index
+            .get(&start_marker.id())
+            .copied()
+            .unwrap_or(0);
         let next_boundary_idx = start_idx + 1;
-        
+
         // Look for the next element that has similar characteristics to the start marker
-        if let Some(next_content) = index.content_slice(next_boundary_idx, index.doc_len()).first() {
+        if let Some(next_content) = index
+            .content_slice(next_boundary_idx, index.doc_len())
+            .first()
+        {
             if let PageContent::Text(next_text) = next_content {
                 if let PageContent::Text(start_text) = start_marker {
                     // If next element has similar font size, use it as boundary
@@ -573,12 +559,17 @@ fn match_section<'a, 'map_lt>(
     debug_assert!(
         !(section_content_handles.is_empty() && template.element_type == ElementType::Section),
         "Section {} produced empty handle slice: start {:?} end {:?}",
-        template.name, start_marker, end_marker_final
+        template.name,
+        start_marker,
+        end_marker_final
     );
-    
 
     // Calculate indices before moving end_marker_final
-    let start_idx = index.element_id_to_index.get(&start_marker.id()).copied().unwrap_or(0);
+    let start_idx = index
+        .element_id_to_index
+        .get(&start_marker.id())
+        .copied()
+        .unwrap_or(0);
     let end_idx = end_marker_final
         .as_ref()
         .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
@@ -587,10 +578,10 @@ fn match_section<'a, 'map_lt>(
     // Create section match
     let mut result = TemplateContentMatch::with_section_boundaries(
         template,
-        start_marker.clone(),       // Clone for storage
-        end_marker_final,           // May be None if section extends to document end
+        start_marker.clone(), // Clone for storage
+        end_marker_final,     // May be None if section extends to document end
     );
-    
+
     // Generate MatchedContent with document indices
     result.matched_content = (start_idx..end_idx)
         .map(|idx| MatchedContent::Index(idx))
@@ -714,7 +705,7 @@ fn find_end_boundary_candidates<'a>(
     start_content: &'a PageContent,
     template: &Element,
     index: &'a PdfIndex,
-    children: &[Element],
+    _children: &[Element],
     match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
 ) -> Option<Vec<BoundaryCandidate>> {
@@ -727,7 +718,6 @@ fn find_end_boundary_candidates<'a>(
         template.name, template.attributes
     );
     let mut candidates = Vec::new();
-    let mut has_end_match = false;
 
     // Get the start marker's index so we can search after it
     let start_marker_index = index.element_id_to_index.get(&start_content.id()).copied();
@@ -752,7 +742,7 @@ fn find_end_boundary_candidates<'a>(
                 &end_str,
                 match_config.threshold,
                 search_start_index, // Use match_config.threshold instead of hardcoded value
-                None
+                None,
             );
             println!(
                 "[find_end_boundary_candidates] Found {} text candidates for end_match.",
@@ -769,12 +759,8 @@ fn find_end_boundary_candidates<'a>(
                     page_number: txt_ref.page_number,
                 });
 
-
                 // Boost explicit end markers, but allow high-quality similarity matches to compete
-                has_end_match = true;
-                let mut bc = score_candidate(
-                    &element, index, template, score, prev_match,
-                );
+                let mut bc = score_candidate(&element, index, template, score, prev_match);
                 bc.score += 0.5; // Moderate boost to prioritize explicit markers while allowing high-similarity competition
                 bc.reasons.push("Explicit end marker".to_string());
 
@@ -852,7 +838,10 @@ fn find_end_boundary_candidates<'a>(
                     bbox: txt_ref.bbox,
                     page_number: txt_ref.page_number,
                 });
-                println!("[find_end_boundary_candidates] Similar text element: {:?}", pc);
+                println!(
+                    "[find_end_boundary_candidates] Similar text element: {:?}",
+                    pc
+                );
 
                 // Avoid duplicates – if already present, just update its score
                 if let Some(existing) = candidates.iter_mut().find(|c| c.content.id() == pc.id()) {
@@ -901,7 +890,7 @@ fn find_end_boundary_candidates<'a>(
 fn score_candidate<'a>(
     content: &'a PageContent,
     index: &PdfIndex,
-    template: &Element,
+    _template: &Element,
     base_score: f64,
     prev_match: Option<&TemplateContentMatch<'a>>,
 ) -> BoundaryCandidate {
@@ -966,147 +955,8 @@ fn score_candidate<'a>(
     }
 }
 
-/// Finds natural boundaries based on content changes
-// fn find_natural_boundaries<'a>(
-//     start_content: &'a PageContent,
-//     index: &'a PdfIndex,
-//     children: &[Element],
-// ) -> Vec<BoundaryCandidate> {
-//     let mut candidates = Vec::new();
-
-//     match start_content {
-//         PageContent::Text(start_text) => {
-//             // Find font changes
-//             let avg_font_size = calculate_average_font_size(index);
-//             let font_candidates =
-//                 index.elements_by_font(None, Some(avg_font_size * 1.2), None, Some(1));
-
-//             for element in font_candidates {
-//                 candidates.push(score_candidate(
-//                     element.clone(),
-//                     index,
-//                     &Element::new("Section".to_string(), ElementType::Section),
-//                     0.0,
-//                     None,
-//                 ));
-//             }
-//         }
-//         PageContent::Image(_) => (),
-//     }
-
-//     candidates
-// }
-
-/// Validates boundary candidates based on child element requirements
-// fn validate_boundary_candidates<'a>(
-//     candidates: &[BoundaryCandidate],
-//     children: &[Element],
-//     index: &PdfIndex,
-// ) -> Vec<BoundaryCandidate> {
-//     // Build content flow graph
-//     let flow = build_content_flow(candidates, children, index);
-
-//     // Filter candidates based on child element requirements
-//     candidates
-//         .iter()
-//         .filter(|candidate| {
-//             // Check if candidate respects child element positions
-//             children
-//                 .iter()
-//                 .all(|child| validate_child_position(child, candidate, &flow))
-//         })
-//         .cloned()
-//         .collect()
-// }
-
-/// Builds a graph of content relationships
-// fn build_content_flow<'a>(
-//     candidates: &[BoundaryCandidate],
-//     children: &[Element],
-//     index: &PdfIndex,
-// ) -> ContentFlow<'a> {
-//     let mut elements = Vec::new();
-//     let mut relationships = Vec::new();
-
-//     // Add all candidate elements
-//     for candidate in candidates {
-//         elements.push(candidate.content);
-//     }
-
-//     // Build relationships
-//     for (i, elem1) in elements.iter().enumerate() {
-//         for (j, elem2) in elements.iter().enumerate() {
-//             if i != j {
-//                 if let (PageContent::Text(t1), PageContent::Text(t2)) = (elem1, elem2) {
-//                     // Check if t2 comes after t1
-//                     if let (Some(idx1), Some(idx2)) = (
-//                         index.element_id_to_index.get(&t1.id),
-//                         index.element_id_to_index.get(&t2.id),
-//                     ) {
-//                         if idx2 > idx1 {
-//                             relationships.push((i, j, RelationshipType::After));
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//     }
-
-//     ContentFlow {
-//         elements,
-//         relationships,
-//     }
-// }
-
-/// Validates if a candidate respects child element positions
-fn validate_child_position<'a>(
-    child: &Element,
-    candidate: &BoundaryCandidate,
-    flow: &ContentFlow<'a>,
-) -> bool {
-    // Implement child position validation logic
-    // This is a placeholder - actual implementation would depend on specific requirements
-    true
-}
-
-/// Selects the best boundary from candidates
-fn select_best_boundary<'a>(
-    candidates: Vec<BoundaryCandidate>,
-    previous_content: Option<&PageContent>,
-    children: &[Element],
-    index: &PdfIndex,
-) -> Option<PageContent> {
-    candidates
-        .into_iter()
-        .map(|candidate| {
-            let mut score = candidate.score;
-
-            // Consider content type compatibility
-            if let Some(prev) = &previous_content {
-                if content_types_compatible(prev, &candidate.content) {
-                    score += 0.2;
-                }
-            }
-
-            // Consider child element requirements
-            if satisfies_child_requirements(&candidate, children, index) {
-                score += 0.3;
-            }
-
-            // Consider document flow
-            if let Some(prev) = &previous_content {
-                if maintains_document_flow(prev, &candidate.content, index) {
-                    score += 0.2;
-                }
-            }
-
-            (candidate, score)
-        })
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
-        .map(|(candidate, _)| candidate.content.clone())
-}
-
 /// Checks if two content types are compatible
+#[allow(dead_code)]
 fn content_types_compatible(a: &PageContent, b: &PageContent) -> bool {
     match (a, b) {
         (PageContent::Text(_), PageContent::Text(_)) => true,
@@ -1115,18 +965,8 @@ fn content_types_compatible(a: &PageContent, b: &PageContent) -> bool {
     }
 }
 
-/// Checks if a candidate satisfies child element requirements
-fn satisfies_child_requirements<'a>(
-    candidate: &BoundaryCandidate,
-    children: &[Element],
-    index: &PdfIndex,
-) -> bool {
-    // Implement child requirement validation
-    // This is a placeholder - actual implementation would depend on specific requirements
-    true
-}
-
 /// Checks if document flow is maintained between two content elements
+#[allow(dead_code)]
 fn maintains_document_flow<'a>(
     prev: &PageContent,
     current: &PageContent,
@@ -1155,25 +995,6 @@ fn match_text_chunk_with_boundaries<'a>(
     content_start_idx: usize,
     content_end_idx: usize,
 ) -> Option<TemplateContentMatch<'a>> {
-    println!(
-        "[match_text_chunk_with_boundaries] Template: '{}', boundaries: {} to {}",
-        template.name, content_start_idx, content_end_idx
-    );
-
-    // Extract content slice based on explicit boundaries
-    let content_slice =
-        if content_start_idx < content_end_idx && content_start_idx < index.doc_len() {
-            let end_idx = content_end_idx.min(index.doc_len());
-            index.content_slice(content_start_idx, end_idx)
-        } else {
-            Vec::new()
-        };
-
-    println!(
-        "[match_text_chunk_with_boundaries] Processing {} elements",
-        content_slice.len()
-    );
-
     let mut matched_content_for_chunk: Vec<MatchedContent> = Vec::new();
     let mut has_text_content = false;
 
@@ -1308,7 +1129,11 @@ pub fn extract_section_content_handles<'a>(
     );
 
     // Get the start and end indices in the document
-    let start_idx = index.element_id_to_index.get(&start_marker.id()).copied().unwrap_or(0);
+    let start_idx = index
+        .element_id_to_index
+        .get(&start_marker.id())
+        .copied()
+        .unwrap_or(0);
     let end_idx = end_marker_option
         .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
         .unwrap_or(index.doc_len());

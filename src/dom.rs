@@ -1,11 +1,11 @@
 use crate::chunker::{chunk_text_elements, ChunkingStrategy};
 use crate::matcher::{MatchedContent, TemplateContentMatch};
-use crate::parse::{ImageElement, PageContent, TextElement};
+use crate::parse::{PageContent, TextElement};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use image;
 use log::{error, info, warn};
-use lopdf::{Dictionary as LoPdfDictionary, Document, Object, Stream};
+use lopdf::Object;
 use pest::iterators::Pair;
 use pest::Parser as PestParser;
 use pest_derive::Parser as PestParserDerive;
@@ -130,8 +130,8 @@ pub struct ChunkOutput {
     pub text: String,
     pub metadata: HashMap<String, serde_json::Value>,
     pub chunk_index: usize,
-    pub parent_name: Option<String>,    // Immediate containing section name
-    pub parent_index: Option<usize>,    // Immediate containing section index
+    pub parent_name: Option<String>, // Immediate containing section name
+    pub parent_index: Option<usize>, // Immediate containing section index
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -144,8 +144,8 @@ pub struct ImageOutput {
     pub summary: Option<String>,
     pub embedding: Option<Vec<f32>>, // Assuming embedding is Vec<f32>
     pub metadata: HashMap<String, serde_json::Value>,
-    pub parent_name: Option<String>,    // Immediate containing section name
-    pub parent_index: Option<usize>,    // Immediate containing section index
+    pub parent_name: Option<String>, // Immediate containing section name
+    pub parent_index: Option<usize>, // Immediate containing section index
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -424,20 +424,20 @@ fn process_value(pair: Pair<Rule>) -> Value {
 // Process the matched content to generate chunks or image data
 pub fn process_matched_content(
     matched_items: &Vec<TemplateContentMatch>,
-    index: &crate::search_index::PdfIndex,  // Add index parameter to resolve handles
+    index: &crate::search_index::PdfIndex, // Add index parameter to resolve handles
 ) -> Vec<ProcessedOutput> {
     let mut global_chunk_counter = 0;
     let mut all_outputs = Vec::new();
-    
+
     // Process all content and then fix parent references
     process_matched_content_recursive(
-        matched_items, 
-        index, 
+        matched_items,
+        index,
         &mut all_outputs,
         &mut global_chunk_counter,
         None, // parent_info: Option<(String, usize)>
     );
-    
+
     all_outputs
 }
 
@@ -486,7 +486,7 @@ fn process_matched_content_recursive(
             }
             ElementType::Section => {
                 let current_section_name = match_item.template_element.name.clone();
-                
+
                 // First, process the section's own content if it has any
                 let section_text_elements: Vec<TextElement> = match_item
                     .matched_content
@@ -524,7 +524,7 @@ fn process_matched_content_recursive(
                         section_has_content = true;
                     }
                 }
-                
+
                 // Determine parent info for children - children should reference THIS section
                 let child_parent_info = if section_has_content {
                     // If this section itself has a parent, then its children should reference this section
@@ -543,7 +543,7 @@ fn process_matched_content_recursive(
                     // Section has no content, children inherit the same parent
                     parent_info.clone()
                 };
-                
+
                 // Process any children with updated parent info
                 if !match_item.children.is_empty() {
                     // Special handling: if this is a root-level section (parent_info is None),
@@ -557,10 +557,10 @@ fn process_matched_content_recursive(
                                 } else {
                                     child_parent_info.clone() // Nested section's TextChunk children have parent
                                 };
-                                
+
                                 process_matched_content_recursive(
-                                    &vec![child_match.clone()], 
-                                    index, 
+                                    &vec![child_match.clone()],
+                                    index,
                                     all_outputs,
                                     global_chunk_counter,
                                     textchunk_parent_info,
@@ -569,8 +569,8 @@ fn process_matched_content_recursive(
                             ElementType::Section => {
                                 // Section children always get this section as parent (regardless of nesting level)
                                 process_matched_content_recursive(
-                                    &vec![child_match.clone()], 
-                                    index, 
+                                    &vec![child_match.clone()],
+                                    index,
                                     all_outputs,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
@@ -579,8 +579,8 @@ fn process_matched_content_recursive(
                             _ => {
                                 // Other types use the default logic
                                 process_matched_content_recursive(
-                                    &vec![child_match.clone()], 
-                                    index, 
+                                    &vec![child_match.clone()],
+                                    index,
                                     all_outputs,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
@@ -896,9 +896,10 @@ fn process_text_chunk_elements_simple(
         std::sync::Arc::new(out)
     };
 
-    let tokenizer = Tokenizer::from_pretrained("Qwen/Qwen2-7B-Instruct", None).unwrap_or_else(|e| {
-        panic!("Failed to load tokenizer: {}", e);
-    });
+    let tokenizer =
+        Tokenizer::from_pretrained("Qwen/Qwen2-7B-Instruct", None).unwrap_or_else(|e| {
+            panic!("Failed to load tokenizer: {}", e);
+        });
     let strategy = ChunkingStrategy::Tokens {
         max_tokens: chunk_size,
         chunk_overlap,
@@ -921,7 +922,7 @@ fn process_text_chunk_elements_simple(
     // -------- 5. build outputs --------
     let mut outputs = Vec::with_capacity(chunks.len());
 
-    for (idx, chunk) in chunks.iter().enumerate() {
+    for (_idx, chunk) in chunks.iter().enumerate() {
         // a) pre‑compute char capacity
         let est_chars: usize = chunk.iter().map(|e| e.text.len()).sum();
         let mut chunk_text = String::with_capacity(est_chars + chunk.len()); // +spaces
@@ -936,7 +937,10 @@ fn process_text_chunk_elements_simple(
             }
 
             // accumulate char counts per page without HashMap
-            match page_char_counts.iter_mut().find(|(p, _)| *p == elem.page_number) {
+            match page_char_counts
+                .iter_mut()
+                .find(|(p, _)| *p == elem.page_number)
+            {
                 Some((_, cnt)) => *cnt += elem.text.len(),
                 None => page_char_counts.push((elem.page_number, elem.text.len())),
             }
@@ -986,7 +990,7 @@ fn process_text_chunk_elements_simple(
             parent_name: parent_name.clone(),
             parent_index,
         });
-        
+
         *global_chunk_counter += 1;
     }
 

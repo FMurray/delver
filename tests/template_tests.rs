@@ -13,7 +13,7 @@ fn test_10k_template_parsing() -> std::io::Result<()> {
     common::setup();
 
     // First test template parsing
-    let template_str = include_str!("../10k.tmpl");
+    let template_str = include_str!("./10k.tmpl");
     let root = parse_template(template_str)?;
 
     assert!(!root.elements.is_empty());
@@ -30,12 +30,12 @@ fn test_10k_template_parsing() -> std::io::Result<()> {
     let section = &root.elements[1];
     assert_eq!(section.name, "Section");
     if let Some(Value::String(s)) = section.attributes.get("match") {
-        let expected = "Management's Discussion and Analysis of Financial Condition and Results of Operations";
+        let expected =
+            "Management's Discussion and Analysis of Financial Condition and Results of Operations";
         let normalized_actual = s.replace("\u{2019}", "'"); // Replace Unicode right single quote with ASCII apostrophe
-        
+
         assert_eq!(
-            normalized_actual,
-            expected,
+            normalized_actual, expected,
             "Match string should exactly match the expected value after normalizing apostrophes"
         );
     }

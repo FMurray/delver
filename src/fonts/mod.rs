@@ -1,5 +1,6 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
 mod generated;
-
 
 // use crate::geo::Rect;
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ pub use generated::*;
 // Re-export the generated types
 // pub use super::FontMetrics;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct FontMetrics {
     pub ascent: f32,

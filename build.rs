@@ -41,6 +41,7 @@ pub struct FontMetrics {
 fn main() {
     let mut output = String::new();
     output.push_str("// AUTO-GENERATED FILE - DO NOT EDIT\n");
+    output.push_str("#[allow(unused_imports)]\n");
     output.push_str("use super::FontMetrics;\nuse lazy_static::lazy_static;\nuse std::collections::HashMap;\n\n");
 
     let afm_dir = Path::new("src/fonts/afm/");
