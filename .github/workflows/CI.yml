@@ -41,7 +41,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         env:
           OPENSSL_STATIC: 1
-          RING_PREGENERATE_ASM: 1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
@@ -72,7 +71,6 @@ jobs:
         uses: PyO3/maturin-action@v1
         env:
           OPENSSL_STATIC: 1
-          RING_PREGENERATE_ASM: 1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
