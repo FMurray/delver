@@ -249,18 +249,9 @@ fn navigate_to_match(viewer: &mut DebugViewer, content_id: Uuid) {
 fn collect_template_matches(viewer: &DebugViewer) -> HashMap<Uuid, Vec<(Uuid, f32)>> {
     let mut result = HashMap::new();
 
-    // Print diagnostic information
-    println!("DEBUG: Collecting template matches...");
-
     // Directly inspect all matches
     let all_matches = viewer.debug_data.debug_dump_all_matches();
-    println!("DEBUG: Raw matches in store: {}", all_matches.len());
     for (content_id, template_id, score) in &all_matches {
-        println!(
-            "DEBUG: Match: content={}, template={}, score={:.2}",
-            content_id, template_id, score
-        );
-
         // Add this match to our result
         result
             .entry(*template_id)
@@ -268,35 +259,12 @@ fn collect_template_matches(viewer: &DebugViewer) -> HashMap<Uuid, Vec<(Uuid, f3
             .push((*content_id, *score));
     }
 
-    // Get template names for reference
-    let templates_lock = viewer.debug_data.template_names.lock().unwrap();
-    let templates_count = templates_lock.len();
-    println!("DEBUG: Found {} templates in store", templates_count);
-    for (id, name) in templates_lock.iter() {
-        println!("DEBUG: Template {} = '{}'", id, name);
-
-        // Check children directly
-        let children = viewer.debug_data.get_children(*id);
-        println!("DEBUG: Template '{}' has {} children", name, children.len());
-
-        // Check if this template ID is in our result
-        if result.contains_key(id) {
-            println!(
-                "DEBUG: Template {} is in results with {} matches",
-                id,
-                result[id].len()
-            );
-        } else {
-            println!("DEBUG: Template {} is NOT in results", id);
-        }
-    }
-
     // Sort matches by score (descending)
     for matches in result.values_mut() {
         matches.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    println!("DEBUG: Returning {} template match groups", result.len());
+
     result
 }
 

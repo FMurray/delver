@@ -95,10 +95,7 @@ impl DebugDataStore {
         if let Some(parent_id) = parent {
             // Check for circular reference
             if children.contains(&parent_id) {
-                eprintln!(
-                    "Circular relationship detected between {} and {:?}",
-                    parent_id, children
-                );
+                
                 return;
             }
 
@@ -114,7 +111,7 @@ impl DebugDataStore {
             for child_id in &children {
                 if let Some(existing_parent) = lineage.parents.get(child_id) {
                     if *existing_parent != parent_id {
-                        eprintln!("Child {} already has parent {}", child_id, existing_parent);
+    
                         continue;
                     }
                 }
@@ -370,8 +367,7 @@ pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
     // Reset counter for this session
     EVENT_COUNTER.store(0, Ordering::SeqCst);
 
-    // Print debug information
-    println!("LOGGING: Initializing debug logging system");
+
 
     // Create a debug layer with the store
     let debug_layer = DebugLayer::new(store);
@@ -387,7 +383,6 @@ pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
             || target.contains("template_match")
             || target.contains("logging")
         {
-            println!("LOGGING: Allowing event with target: {}", target);
             return true;
         }
 
@@ -400,13 +395,8 @@ pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
         .with(debug_layer)
         .with(filter);
 
-    println!("LOGGING: Setting global default subscriber");
-
     // Set the global default
-    match tracing::subscriber::set_global_default(subscriber) {
-        Ok(_) => println!("LOGGING: Global subscriber set successfully"),
-        Err(e) => println!("LOGGING: Failed to set global subscriber: {}", e),
-    }
+    tracing::subscriber::set_global_default(subscriber).ok();
 
     // Return the guard to keep logging active
     guard
@@ -462,10 +452,6 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
         ) {
             // Template registration (template without a match)
             (_, _, Some(template_id), None) => {
-                println!(
-                    "CAPTURE: Found template_id={} in registration event",
-                    template_id
-                );
                 self.store
                     .record_entity(template_id, EntityType::Template, message.clone());
 
@@ -482,19 +468,11 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
 
                 // Store template name if available
                 if let Some(name) = template_name {
-                    println!(
-                        "REGISTRATION: Recording template: {} = {}",
-                        template_id, name
-                    );
                     let mut templates = self.store.template_names.lock().unwrap();
                     templates.insert(template_id, name);
                 }
             }
             (_, Some(line_id), Some(template_id), Some(_match_id)) => {
-                println!(
-                    "CAPTURE: Found template match between template={} and line={}",
-                    template_id, line_id
-                );
 
                 // Extract score from the event
                 let mut score = 0.0;
@@ -509,7 +487,7 @@ impl<S: Subscriber + for<'span> LookupSpan<'span>> Layer<S> for DebugLayer {
                     }
                 }
 
-                println!("MATCH: Recording template match with score {}", score);
+
 
                 // Record template match with score
                 self.store

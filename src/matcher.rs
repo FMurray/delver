@@ -1,3 +1,9 @@
+//! # Template Matching Engine
+//!
+//! This module implements the core template matching algorithm that aligns template elements
+//! with document content. It uses a two-pass algorithm to handle sections and text chunks
+//! efficiently while maintaining document order and spatial relationships.
+
 use crate::dom::{Element, ElementType, MatchConfig, MatchType, Value};
 use crate::layout::{group_text_into_lines, TextBlock, TextLine};
 use crate::logging::TEMPLATE_MATCH;
@@ -11,41 +17,56 @@ use tracing::{event, warn, Level};
 use uuid::Uuid;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-// Maximum recursion depth to prevent runaway recursion
+/// Maximum recursion depth to prevent runaway recursion during template matching
 const MAX_RECURSION_DEPTH: usize = 10;
 
-// Global counters for debugging infinite loops
+/// Global counters for preventing infinite loops during matching operations
 static MATCH_SECTION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ALIGN_TEMPLATE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FIND_START_BOUNDARY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-// Progress tracking structure
+/// Progress tracking structure for template matching operations
 #[derive(Debug, Clone)]
 struct MatchingProgress {
     start_search_index: usize,
     template_name: String,
     call_count: usize,
-    visited_positions: std::collections::HashSet<usize>, // Track visited positions
+    visited_positions: std::collections::HashSet<usize>,
 }
 
+/// Represents a successful match between a template element and document content
+///
+/// This structure maintains the relationship between template elements and their
+/// matched content, including hierarchical relationships and metadata.
 #[derive(Debug, Clone)]
 pub struct TemplateContentMatch<'a> {
+    /// Reference to the template element that was matched
     pub template_element: &'a Element,
+    /// Content that was matched to this template element
     pub matched_content: Vec<MatchedContent>,
+    /// Child matches for nested template elements
     pub children: Vec<TemplateContentMatch<'a>>,
+    /// Metadata extracted during the matching process
     pub metadata: HashMap<String, Value>,
+    /// Section boundaries for Section-type elements
     pub section_boundaries: Option<SectionBoundaries>,
 }
 
+/// Defines the start and end boundaries of a document section
 #[derive(Debug, Clone)]
 pub struct SectionBoundaries {
+    /// The content element that marks the start of the section
     pub start_marker: PageContent,
+    /// Optional content element that marks the end of the section
     pub end_marker: Option<PageContent>,
 }
 
+/// Represents matched content that can be resolved through the document index
 #[derive(Debug, Clone)]
 pub enum MatchedContent {
-    Index(usize),  // Document-order index that can be resolved through PdfIndex
+    /// Document-order index that can be resolved through PdfIndex
+    Index(usize),
+    /// No content matched
     None,
 }
 
@@ -135,7 +156,21 @@ impl<'a> TemplateContentMatch<'a> {
     }
 }
 
-/// Aligns template elements with document content sequentially
+/// Aligns template elements with document content using a two-pass algorithm
+///
+/// This is the main entry point for template matching. It uses a sophisticated two-pass
+/// algorithm that first identifies section boundaries, then processes text chunks within
+/// those boundaries while maintaining document order.
+///
+/// # Arguments
+/// * `template_elements` - The template elements to match against the document
+/// * `index` - The document index containing searchable content
+/// * `inherited_metadata` - Metadata inherited from parent template elements
+/// * `parent_or_prev_sibling_match_context` - Context from previous matches for positioning
+///
+/// # Returns
+/// * `Some(Vec<TemplateContentMatch>)` if any matches were found
+/// * `None` if no matches were found
 pub fn align_template_with_content<'a>(
     template_elements: &'a [Element],
     index: &'a PdfIndex,
@@ -178,13 +213,7 @@ fn align_template_with_content_with_depth<'a>(
         return None;
     }
 
-    println!(
-        "MATCHER: align_template_with_content called for {} elements at depth {}. Context: {}. Call #{}", 
-        template_elements.len(),
-        recursion_depth,
-        parent_or_prev_sibling_match_context.map_or("None", |m| m.template_element.name.as_str()),
-        call_count
-    );
+
 
     let default_metadata = HashMap::new();
     let actual_inherited_metadata = inherited_metadata.unwrap_or(&default_metadata);
@@ -215,10 +244,7 @@ fn align_template_with_content_with_depth<'a>(
                     .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
                     .unwrap_or(index.doc_len());
 
-                println!(
-                    "MATCHER: Processing children within section boundaries {} to {}",
-                    start_idx, end_idx
-                );
+
                 (start_idx, end_idx)
             } else {
                 // Sibling elements start after previous match
@@ -290,7 +316,7 @@ fn align_template_with_content_with_depth<'a>(
             }
 
 
-            log_mem("before match_section");
+
             if let Some(section_match) = match_section(
                 template_element,
                 index,
@@ -300,10 +326,7 @@ fn align_template_with_content_with_depth<'a>(
                 effective_start_index,
                 recursion_depth,
             ) {
-                println!(
-                    "  PASS 1: Found Section '{}' boundaries",
-                    template_element.name
-                );
+
 
                 // Extract partition boundaries and update position tracking
                 if let Some(boundaries) = &section_match.section_boundaries {
@@ -335,10 +358,7 @@ fn align_template_with_content_with_depth<'a>(
 
     for (template_idx, template_element) in template_elements.iter().enumerate() {
         if template_element.element_type == ElementType::TextChunk {
-            println!(
-                "  PASS 2: Processing TextChunk '{}' (template order: {})",
-                template_element.name, template_idx
-            );
+
 
             // Determine which content partition this TextChunk should process
             let (content_start, content_end) = if content_partitions.is_empty() {
@@ -354,10 +374,7 @@ fn align_template_with_content_with_depth<'a>(
                     if template_idx < first_section_idx {
                         // TextChunk comes before first section - process content before first section
                         let first_partition_start = content_partitions[0].0;
-                        println!(
-                            "    TextChunk '{}' processes content BEFORE first section: {} to {}",
-                            template_element.name, start_search_index, first_partition_start
-                        );
+
                         (start_search_index, first_partition_start)
                     } else {
                         // TextChunk comes after sections - process content after last section
@@ -372,12 +389,7 @@ fn align_template_with_content_with_depth<'a>(
                             } else {
                                 last_partition_end
                             };
-                        println!(
-                            "    TextChunk '{}' processes content AFTER sections: {} to {}",
-                            template_element.name,
-                            content_start_after_section,
-                            max_content_boundary
-                        );
+
                         (content_start_after_section, max_content_boundary)
                     }
                 } else {
@@ -394,13 +406,10 @@ fn align_template_with_content_with_depth<'a>(
                 content_start,
                 content_end,
             ) {
-                println!("    SUCCESS: Matched TextChunk '{}'", template_element.name);
+
                 textchunk_matches.push(textchunk_match);
             } else {
-                println!(
-                    "    FAILURE: No match for TextChunk '{}'",
-                    template_element.name
-                );
+
             }
         }
     }
@@ -468,12 +477,7 @@ fn match_section<'a, 'map_lt>(
     let match_config = template.attributes.get("match")?.as_match_config()?;
 
     let effective_search_start_index = current_search_start_index;
-    println!(
-        "[match_section] For '{}', using effective_search_start_index: {}. Prev_match_context: {}",
-        template.name,
-        effective_search_start_index,
-        prev_match_for_context.map_or("None", |m| m.template_element.name.as_str())
-    );
+
     
     // ------------------------------------------------------------------
     // Limit the start‑marker text search to the parent section’s boundary,
@@ -509,7 +513,7 @@ fn match_section<'a, 'map_lt>(
         prev_match_for_context,
     );
 
-    println!("[match_section] End candidates: {:?}", end_candidates_opt);
+
 
     // Choose end marker:
     //   a) the best explicit/style candidate, OR
@@ -624,11 +628,7 @@ fn match_section<'a, 'map_lt>(
 
     // Handle child elements
     if !template.children.is_empty() {
-        println!(
-            "[match_section] Parent '{}' has {} children in template.",
-            template.name,
-            template.children.len()
-        );
+
         if let Some(child_matches) = align_template_with_content_with_depth(
             &template.children,
             index,
@@ -636,21 +636,14 @@ fn match_section<'a, 'map_lt>(
             Some(&result),
             recursion_depth + 1, // Increment depth for child processing
         ) {
-            println!("[match_section] Parent '{}' got Some(child_matches) with len: {}. Assigning to result.children.", template.name, child_matches.len());
+    
             result.children = child_matches;
         } else {
-            println!("[match_section] Parent '{}' got None for child_matches. result.children will be empty.", template.name);
+    
         }
-        println!(
-            "[match_section] After child processing, Parent '{}' result.children.len is now: {}",
-            template.name,
-            result.children.len()
-        );
+        
     } else {
-        println!(
-            "[match_section] Parent '{}' has no children in template.",
-            template.name
-        );
+
     }
 
     Some(result)
@@ -667,7 +660,7 @@ fn find_start_boundary_candidates<'a>(
 ) -> Option<Vec<BoundaryCandidate>> {
     let mut candidates = Vec::new();
 
-    println!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
+
     // 1. Text-based candidates
     let text_matches = index.find_text_matches(
         &match_config.pattern,
@@ -675,10 +668,7 @@ fn find_start_boundary_candidates<'a>(
         Some(start_index),
         max_search_index,
     );
-    println!(
-        "[find_start_boundary_candidates] Text-based candidates found: {}",
-        text_matches.len()
-    );
+
 
     for (text_handle, score) in text_matches {
         let txt_ref = index.text(text_handle);
@@ -696,14 +686,11 @@ fn find_start_boundary_candidates<'a>(
     }
 
     if candidates.is_empty() {
-        println!("[find_start_boundary_candidates] No candidates found. Returning None.");
+
         None
     } else {
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        println!(
-            "[find_start_boundary_candidates] Returning {} sorted candidates.",
-            candidates.len()
-        );
+
         Some(candidates)
     }
 }
@@ -718,35 +705,23 @@ fn find_end_boundary_candidates<'a>(
     match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
 ) -> Option<Vec<BoundaryCandidate>> {
-    println!(
-        "[find_end_boundary_candidates] Looking for end for section starting with: {:?}",
-        start_content.text()
-    );
-    println!(
-        "[find_end_boundary_candidates] Template name: '{}', attributes: {:?}",
-        template.name, template.attributes
-    );
+
+
     let mut candidates = Vec::new();
     let mut has_end_match = false;
 
     // Get the start marker's index so we can search after it
     let start_marker_index = index.element_id_to_index.get(&start_content.id()).copied();
-    println!(
-        "[find_end_boundary_candidates] Start marker index: {:?}",
-        start_marker_index
-    );
+
 
     // 1. Template-based end markers
     if let Some(end_match_attr) = template.attributes.get("end_match") {
         if let Some(end_str) = end_match_attr.as_string() {
-            println!(
-                "[find_end_boundary_candidates] Using end_match attribute: '{}', threshold: {}",
-                end_str, match_config.threshold
-            );
+
 
             // Start search after the start marker, not from the beginning of the document
             let search_start_index = start_marker_index.map(|idx| idx + 1);
-            println!("[find_end_boundary_candidates] Searching for end markers starting from index: {:?}", search_start_index);
+
 
             let end_text_matches = index.find_text_matches(
                 &end_str,
@@ -754,10 +729,7 @@ fn find_end_boundary_candidates<'a>(
                 search_start_index, // Use match_config.threshold instead of hardcoded value
                 None
             );
-            println!(
-                "[find_end_boundary_candidates] Found {} text candidates for end_match.",
-                end_text_matches.len()
-            );
+
             for (text_handle, score) in end_text_matches {
                 let txt_ref = index.text(text_handle);
                 let element = PageContent::Text(TextElement {
@@ -781,12 +753,10 @@ fn find_end_boundary_candidates<'a>(
                 candidates.push(bc);
             }
         } else {
-            println!(
-                "[find_end_boundary_candidates] end_match attribute found but not a string value."
-            );
+
         }
     } else {
-        println!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");
+
         // If no end_match is specified, we might want a default behavior,
         // for example, consider all elements after start_content on the same page,
         // or up to the start of a *next* identifiable section if one exists soon.
@@ -827,10 +797,7 @@ fn find_end_boundary_candidates<'a>(
                 index.doc_len()
             };
 
-            println!(
-                "[find_end_boundary_candidates] Max content boundary: {}",
-                max_content_boundary
-            );
+
 
             let similar = index.top_k_similar_text(
                 start_text,
@@ -838,10 +805,7 @@ fn find_end_boundary_candidates<'a>(
                 max_content_boundary, // bounded by previous section boundaries
                 K_SIMILAR,
             );
-            println!(
-                "[find_end_boundary_candidates] Found {} similar text elements.",
-                similar.len()
-            );
+
             for (text_handle, sim) in similar {
                 let txt_ref = index.text(text_handle);
                 let pc = PageContent::Text(TextElement {
@@ -852,7 +816,7 @@ fn find_end_boundary_candidates<'a>(
                     bbox: txt_ref.bbox,
                     page_number: txt_ref.page_number,
                 });
-                println!("[find_end_boundary_candidates] Similar text element: {:?}", pc);
+
 
                 // Avoid duplicates – if already present, just update its score
                 if let Some(existing) = candidates.iter_mut().find(|c| c.content.id() == pc.id()) {
@@ -874,7 +838,7 @@ fn find_end_boundary_candidates<'a>(
     }
 
     if candidates.is_empty() {
-        println!("[find_end_boundary_candidates] No end candidates found. Returning None.");
+
         None
     } else {
         // Order by document position to pick the first valid boundary.
@@ -889,10 +853,7 @@ fn find_end_boundary_candidates<'a>(
                 })
         });
 
-        println!(
-            "[find_end_boundary_candidates] Returning {} sorted end candidates.",
-            candidates.len()
-        );
+
         Some(candidates)
     }
 }
@@ -1155,10 +1116,7 @@ fn match_text_chunk_with_boundaries<'a>(
     content_start_idx: usize,
     content_end_idx: usize,
 ) -> Option<TemplateContentMatch<'a>> {
-    println!(
-        "[match_text_chunk_with_boundaries] Template: '{}', boundaries: {} to {}",
-        template.name, content_start_idx, content_end_idx
-    );
+
 
     // Extract content slice based on explicit boundaries
     let content_slice =
@@ -1169,10 +1127,7 @@ fn match_text_chunk_with_boundaries<'a>(
             Vec::new()
         };
 
-    println!(
-        "[match_text_chunk_with_boundaries] Processing {} elements",
-        content_slice.len()
-    );
+
 
     let mut matched_content_for_chunk: Vec<MatchedContent> = Vec::new();
     let mut has_text_content = false;
@@ -1192,7 +1147,7 @@ fn match_text_chunk_with_boundaries<'a>(
     }
 
     if !has_text_content {
-        println!("[match_text_chunk_with_boundaries] No text content found");
+
         return None;
     }
 
@@ -1302,10 +1257,7 @@ pub fn extract_section_content_handles<'a>(
         PageContent::Text(t) => format!("Text('{}', ID: {})", t.text, t.id),
         PageContent::Image(i) => format!("Image(ID: {})", i.id),
     });
-    println!(
-        "[extract_section_content] Start: {}, End: {}",
-        start_debug_info, end_debug_info
-    );
+
 
     // Get the start and end indices in the document
     let start_idx = index.element_id_to_index.get(&start_marker.id()).copied().unwrap_or(0);
@@ -1313,10 +1265,7 @@ pub fn extract_section_content_handles<'a>(
         .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
         .unwrap_or(index.doc_len());
 
-    println!(
-        "[extract_section_content_handles] Extracting handles from index {} to {}",
-        start_idx, end_idx
-    );
+
 
     // Extract handles directly from the index order
     let mut handles = Vec::new();
@@ -1326,10 +1275,7 @@ pub fn extract_section_content_handles<'a>(
         }
     }
 
-    println!(
-        "[extract_section_content_handles] Total collected handles: {}",
-        handles.len()
-    );
+
 
     handles
 }
@@ -1476,9 +1422,3 @@ fn get_next_match_index<'a>(
     }
 }
 
-fn log_mem(tag: &str) {
-    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-        let rss: usize = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
-        eprintln!("[mem] {tag}: {:.1} MB", rss as f64 * 4096.0 / 1e6);
-    }
-}

@@ -1,3 +1,12 @@
+//! # Document Search Index
+//!
+//! This module provides efficient indexing and search capabilities for PDF document content.
+//! It uses multiple index structures including spatial R-trees, font-based indexes, and
+//! style-based buckets to enable fast similarity searches and content retrieval.
+//!
+//! The search index is designed to support the template matching algorithm by providing
+//! O(1) and O(log n) access patterns for common search operations.
+
 use crate::{
     layout::{MatchContext, TextLine},
     parse::{
@@ -154,24 +163,42 @@ impl FontUsage {
     }
 }
 
+/// Multi-index structure for efficient PDF document content search and retrieval
+///
+/// The PdfIndex uses a Struct-of-Arrays (SoA) design for cache efficiency and supports
+/// multiple query patterns including spatial, textual, and style-based searches.
 #[derive(Debug)]
 pub struct PdfIndex {
+    /// Elements organized by page number for page-based queries
     pub by_page: BTreeMap<u32, Vec<usize>>,
+    /// Font size index for range queries, sorted by size
     pub font_size_index: Vec<(f32, usize)>,
+    /// Reference count index for finding frequently referenced elements
     pub reference_count_index: Vec<(u32, usize)>,
+    /// Spatial R-tree for region-based queries
     pub spatial_rtree: RTree<SpatialPageContent>,
+    /// Maps element UUIDs to document indices for fast lookup
     pub element_id_to_index: HashMap<Uuid, usize>,
-    pub order: Vec<ContentHandle>, // document sequence (SoA handle)
-    pub text_store: TextStore,     // SoA payload ‑ text
-    pub image_store: ImageStore,   // SoA payload ‑ images
+    /// Document sequence preserving original order (SoA handles)
+    pub order: Vec<ContentHandle>,
+    /// Structure-of-Arrays storage for text elements
+    pub text_store: TextStore,
+    /// Structure-of-Arrays storage for image elements
+    pub image_store: ImageStore,
+    /// Font usage analysis by (name, size) pairs
     pub fonts: HashMap<(String, NotNan<f32>), FontUsage>,
+    /// Font names sorted by usage frequency
     pub font_name_frequency_index: Vec<(u32, String)>,
+    /// Precomputed font size statistics
     pub font_size_stats: FontSizeStats,
-    // NEW: Efficient style-based similarity search structures
-    style_key: Vec<StyleKey>,                        // row → key
-    style_buckets: HashMap<StyleKey, Vec<TextHandle>>, // key → rows for O(1) similarity lookup
-    font_name_totals: HashMap<String, u32>,          // font name → total usage count
-    page_y_values: HashMap<u32, Vec<f32>>,           // page → sorted Y positions for percentile calc
+    /// Style keys for each text element (private)
+    style_key: Vec<StyleKey>,
+    /// Style-based buckets for O(1) similarity lookup (private)
+    style_buckets: HashMap<StyleKey, Vec<TextHandle>>,
+    /// Total usage count per font name (private)
+    font_name_totals: HashMap<String, u32>,
+    /// Sorted Y positions per page for percentile calculations (private)
+    page_y_values: HashMap<u32, Vec<f32>>,
 }
 
 impl PdfIndex {
@@ -634,8 +661,7 @@ impl PdfIndex {
         let mut results = Vec::new();
 
         // Debug: print what we're searching for
-        println!("[find_text_matches] Searching for '{}' with threshold {}", text, threshold);
-        println!("[find_text_matches] Text store has {} elements", self.text_store.text.len());
+
 
         // Iterate through the text column only (cache-friendly)
         for (text_store_idx, text_content) in self.text_store.text.iter().enumerate() {
@@ -647,7 +673,7 @@ impl PdfIndex {
             }
             
             let score = normalized_levenshtein(text, text_content);
-            println!("[find_text_matches] Text '{}' vs '{}' = score {}", text, text_content, score);
+            
             
             if score >= threshold {
                 // Find the corresponding document index for this text element
@@ -657,23 +683,23 @@ impl PdfIndex {
                         // Check if we've exceeded the max_content_index limit
                         if let Some(max_idx) = max_content_index {
                             if doc_idx >= max_idx {
-                                println!("[find_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
+    
                                 break;
                             }
                         }
                         
-                        println!("[find_text_matches] Match found: text_idx={}, doc_idx={}, score={}", text_store_idx, doc_idx, score);
+
                         results.push((TextHandle(text_store_idx as u32), score));
                     } else {
-                        println!("[find_text_matches] Match found but doc_idx {} < start {}", doc_idx, start);
+
                     }
                 } else {
-                    println!("[find_text_matches] Match found but no doc_idx for text_idx {}", text_store_idx);
+
                 }
             }
         }
         
-        println!("[find_text_matches] Returning {} results", results.len());
+
         results
     }
 
@@ -1043,90 +1069,39 @@ impl PdfIndex {
         let start_id = start_element.id();
         let end_id = end_element.map(|e| e.id());
 
-        println!(
-            "[get_elements_between_markers] Looking for start_id: {}",
-            start_id
-        );
-        if let Some(end_id) = end_id {
-            println!(
-                "[get_elements_between_markers] Looking for end_id: {}",
-                end_id
-            );
-        } else {
-            println!("[get_elements_between_markers] No end element specified");
-        }
 
-        println!(
-            "[get_elements_between_markers] element_id_to_index contains {} mappings",
-            self.element_id_to_index.len()
-        );
 
         let start_idx_inclusive = match self.element_id_to_index.get(&start_id) {
-            Some(&idx) => {
-                println!(
-                    "[get_elements_between_markers] Found start_id at index: {}",
-                    idx
-                );
-                idx
-            }
-            None => {
-                println!(
-                    "[get_elements_between_markers] Start element ID {} not found in index",
-                    start_id
-                );
-                return Vec::new(); // Start element not found in index
-            }
+            Some(&idx) => idx,
+            None => return Vec::new(), // Start element not found in index
         };
 
         let end_idx_exclusive = match end_element {
             Some(end) => {
                 let end_id = end.id();
                 match self.element_id_to_index.get(&end_id) {
-                    Some(&idx) => {
-                        println!(
-                            "[get_elements_between_markers] Found end_id at index: {}",
-                            idx
-                        );
-                        idx // This index is exclusive for the slice
-                    }
-                    None => {
-                        println!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
-                        self.order.len() // End element not found, go to end of document
-                    }
+                    Some(&idx) => idx, // This index is exclusive for the slice
+                    None => self.order.len(), // End element not found, go to end of document
                 }
             }
-            None => {
-                println!("[get_elements_between_markers] No end element, using document end");
-                self.order.len() // No end element, go to end of document
-            }
+            None => self.order.len(), // No end element, go to end of document
         };
-
-        println!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
-                 start_idx_inclusive, end_idx_exclusive, self.order.len());
 
         // Now, start_idx_inclusive will be used directly for the slice start.
         // Ensure start_idx_inclusive is not past end_idx_exclusive or bounds.
         if start_idx_inclusive >= end_idx_exclusive || start_idx_inclusive >= self.order.len() {
-            println!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
-                     start_idx_inclusive, end_idx_exclusive, self.order.len());
             return Vec::new();
         }
 
         // Ensure the slice end is within bounds.
         let effective_end_idx = std::cmp::min(end_idx_exclusive, self.order.len());
 
-        println!(
-            "[get_elements_between_markers] Effective slice: [{}..{}]",
-            start_idx_inclusive, effective_end_idx
-        );
+
 
         // Use cache-efficient content_slice method
         let result = self.content_slice(start_idx_inclusive, effective_end_idx);
 
-        println!(
-            "[get_elements_between_markers] Returning {} elements",
-            result.len()
-        );
+
         result
     }
 

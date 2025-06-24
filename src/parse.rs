@@ -1,3 +1,11 @@
+//! # PDF Parsing and Content Extraction
+//!
+//! This module handles the low-level parsing of PDF documents, extracting text elements,
+//! images, and other content while preserving spatial relationships and metadata.
+//! 
+//! The parsing process converts PDF content streams into structured data that can be
+//! efficiently searched and matched against templates.
+
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -205,13 +213,23 @@ struct PositionedGlyph {
     _advance: f32,
 }
 
+/// Represents a text element extracted from a PDF document
+///
+/// Each text element corresponds to a piece of text found in the PDF with its
+/// associated formatting and positioning information.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextElement {
+    /// Unique identifier for this text element
     pub id: Uuid,
+    /// The actual text content
     pub text: String,
+    /// Font size in points
     pub font_size: f32,
+    /// Name of the font family, if available
     pub font_name: Option<String>,
+    /// Bounding box coordinates (x0, y0, x1, y1) in PDF coordinate space
     pub bbox: (f32, f32, f32, f32),
+    /// Page number where this element appears (1-indexed)
     pub page_number: u32,
 }
 
@@ -241,14 +259,17 @@ impl fmt::Display for TextElement {
     }
 }
 
-// Define ImageElement struct
+/// Represents an image element extracted from a PDF document
 #[derive(Debug, Clone)]
 pub struct ImageElement {
+    /// Unique identifier for this image element
     pub id: Uuid,
+    /// Page number where this image appears (1-indexed)
     pub page_number: u32,
-    pub bbox: Rect, // Use geo::Rect
-    pub image_object: Object, // Store the raw lopdf image object for now
-                    // format, bytes etc. would be derived later from image_object
+    /// Bounding box coordinates in PDF coordinate space
+    pub bbox: Rect,
+    /// Raw PDF image object containing the image data
+    pub image_object: Object,
 }
 
 /// Lightweight handle that preserves document order

@@ -72,7 +72,7 @@ fn main() -> Result<()> {
 
     match args.output {
         Some(path) => fs::write(&path, json)?,
-        None => println!("{}", json),
+        None => print!("{}", json),
     }
     Ok(())
 }

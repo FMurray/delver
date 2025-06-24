@@ -1,3 +1,21 @@
+//! # Delver PDF
+//!
+//! A library for extracting structured data from PDF documents using template-based matching.
+//! 
+//! This library provides functionality to:
+//! - Parse PDF documents and extract text and image content
+//! - Define templates that describe the structure of data to extract
+//! - Match template elements against document content using various algorithms
+//! - Output structured data as JSON with semantic information preserved
+//!
+//! ## Main Features
+//!
+//! - **Template-based extraction**: Define sections, text chunks, and image processing rules
+//! - **Fuzzy text matching**: Uses Levenshtein distance for robust text matching
+//! - **Spatial layout analysis**: Groups text into lines and blocks based on positioning
+//! - **Multi-modal content**: Handles both text and image content with configurable processing
+//! - **Efficient indexing**: Uses spatial and style-based indexes for fast content lookup
+
 pub mod chunker;
 pub mod debug_viewer;
 pub mod dom; 
