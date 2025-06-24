@@ -29,10 +29,6 @@ jobs:
           - runner: ubuntu-22.04
             target: x86
           - runner: ubuntu-22.04
-            target: aarch64
-          - runner: ubuntu-22.04
-            target: armv7
-          - runner: ubuntu-22.04
             target: s390x
           - runner: ubuntu-22.04
             target: ppc64le
@@ -41,23 +37,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          OPENSSL_STATIC: 1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: 'true'
           manylinux: auto
-          before-script-linux: |
-            if command -v yum &> /dev/null; then
-              yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic
-              # For i686, symlink libatomic if needed
-              if [[ ! -d "/usr/lib64" ]]; then
-                ln -s /usr/lib/libatomic.so.1 /usr/lib/libatomic.so
-              fi
-            else
-              apt update -y && apt-get install -y libssl-dev openssl pkg-config
-            fi
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -74,9 +66,6 @@ jobs:
           - runner: ubuntu-22.04
             target: x86
           - runner: ubuntu-22.04
-            target: aarch64
-          - runner: ubuntu-22.04
-            target: armv7
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -84,21 +73,13 @@ jobs:
           python-version: 3.x
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          OPENSSL_STATIC: 1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: 'true'
           manylinux: musllinux_1_2
-          before-script-linux: |
-            if command -v yum &> /dev/null; then
-              yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic
-              # For i686, symlink libatomic if needed
-              if [[ ! -d "/usr/lib64" ]]; then
-                ln -s /usr/lib/libatomic.so.1 /usr/lib/libatomic.so
-              fi
-            else
-              apt update -y && apt-get install -y libssl-dev openssl pkg-config
-            fi
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
