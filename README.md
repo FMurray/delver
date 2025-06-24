@@ -81,14 +81,11 @@ DocQL supports a tree-based syntax where sections and elements are matched based
 Section(match="Section 1: Management Discussion & Analysis", as="section1") {
   Section(match="Section 1.1: Risks", as="section1_1") {
     Section(match="Section 1.1b: Fiscal Risks", as="section1_1b") {
-      Summarize(model="some_vlm")
       TextChunk(
         chunkSize=500,
         chunkOverlap=150,
         addMeta=[section1, section1_1, section1_1b]
       )
-
-      Table(model="some_vlm")
     }
   }
 }
@@ -100,27 +97,6 @@ This template will:
 - Split all the text between the "About Me" heading and the "My Projects" heading into chunks of 500 tokens, overlapping by 150 tokens.
 - Add the `mysection` metadata to each chunk.
 
-#### Example 2: Processing Tables with a Model
-
-```plaintext
-{ match: table | model: some_vlm }
-```
-
-This template will pass all table elements to a specified machine learning model (`some_vlm`).
-
-#### Example 3: Fuzzy Matching
-
-```plaintext
-{ match: # Introduction | fuzziness: 2 | as: intro_section }
-```
-support nesting
-{ match: # {
-    { match: ## {
-        
-    }}
-} }
-
-This will match headings similar to "Introduction" within a Levenshtein distance of 2, accounting for minor typos or variations.
 
 ## Technical Details
 
@@ -180,7 +156,7 @@ The system is composed of layered stages: parsing DocQL templates, matching docu
 - **Rust Crates**:
   - `lopdf` for PDF manipulation.
   - `tokenizers` for text tokenization.
-  - `Nom` or `winnow` for parsing the template DSL.
+  - `pest` for parsing the template DSL.
   - `PyO3` for Python bindings.
 - **Optional**:
   - Machine learning models (e.g., vision-language models).
@@ -194,6 +170,7 @@ The system is composed of layered stages: parsing DocQL templates, matching docu
 - **Support for More Formats**: Extend support to additional document formats (e.g., DOCX, HTML).
 - **Cloud Integration**: Offer cloud-based processing options for scalability.
 - **Advanced NLP Features**: Integrate natural language processing techniques for better semantic understanding.
+- **Model Training**: Train model on index features to enhance matching
 
 ## Contributing
 
