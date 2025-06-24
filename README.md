@@ -10,8 +10,8 @@ A high-performance, declarative tool for parsing and splitting unstructured docu
 - [Motivation](#motivation)
 - [Goals](#goals)
 - [Features](#features)
-- [Usage](#usage)
-  - [Template Syntax](#template-syntax)
+- [Using DocQL](#using-docql)
+  - [DocQL Syntax](#docql-syntax)
   - [Examples](#examples)
 - [Technical Details](#technical-details)
   - [Architecture Overview](#architecture-overview)
@@ -26,7 +26,7 @@ A high-performance, declarative tool for parsing and splitting unstructured docu
 
 ## Introduction
 
-Processing unstructured data, especially from scanned PDFs, poses significant challenges due to the lack of inherent structure and metadata. Traditional methods like regex-based parsing are often insufficient for complex documents. Delver aims to provide a robust and flexible solution for parsing and splitting such documents, focusing on semantic elements and leveraging modern technologies for performance and extensibility.
+Processing unstructured data poses significant challenges due to the lack of inherent structure and metadata. Delver is an engine for DocQL, a declarative query language for semantic extraction from unstructured documents. Inspired by the principles of SQL and DOM parsing, Delver/DocQL enables users to define semantic patterns and relationships between elements, making document parsing intuitive, modular, and scalable.
 
 ## Motivation
 
@@ -37,29 +37,31 @@ Processing unstructured data, especially from scanned PDFs, poses significant ch
 
 ## Goals
 
-- Provide a declarative way to parse and split unstructured documents.
-- Implement a robust templating system that is easier and more powerful than regex.
-- Focus on semantic matching with prebuilt patterns like "title element", "table element", "image caption", etc.
-- Support fuzzy matching techniques like Levenshtein distance.
+- Define a structured query language (DocQL) for extracting meaningful sections and content from raw documents.
+- Replace brittle heuristics with composable, testable semantic match rules.
+- Allow hierarchical expressions to traverse and segment documents with awareness of layout and semantics
+- Support multiple matching techniques like string similarity, cosine similarity.
 - Ensure high performance through efficient implementation in Rust.
-- Offer optional integration with local machine learning models and GPU resources.
+- Offer optional integration with local and remote machine learning models and GPU resources.
 
 ## Features
 
-- **Declarative Templating**: Define parsing rules using an intuitive and expressive templating language.
-- **Semantic Matching**: Match document elements based on their semantics rather than just text patterns.
-- **Fuzzy Matching**: Utilize fuzzy matching techniques for more flexible pattern recognition.
+- **DocQL Syntax**: Express powerful hierarchical match logic using a custom declarative language inspired by SQL and HTML.
+- **DOM Construction**: Build a logical document tree from raw elements using semantic and layout-based queries.
+- **Search Index**: search over text and image metrics, spatial properties, document metadata (ref counts, annotations)
 - **High Performance**: Built in Rust for speed and efficiency, suitable for processing large documents.
 - **Extensible Architecture**: Supports integration with machine learning models as optional extras.
+- **Document Viewer**: View and annotate Delver outputs
+- **Tracing**: OpenTelemetry tracing for Delver engine pipeline
 - **Python Bindings**: Accessible from Python via PyO3 bindings for easy integration into existing workflows.
 
-## Usage
+## Using DocQL
 
-The tool uses a declarative template to define how the document should be parsed and split.
+DocQL enables structured queries over document layout, allowing you to define how sections, tables, and text blocks should be matched and transformed.
 
-### Template Syntax
+### DocQL Syntax
 
-The template uses a simple and expressive syntax where each rule is enclosed in `{}` and parameters are separated by `|`.
+DocQL supports a tree-based syntax where sections and elements are matched based on text, font, layout metadata, or model-based classification. Blocks can be nested, and additional attributes control chunking and model routing.
 
 #### Parameters
 
@@ -124,7 +126,7 @@ This will match headings similar to "Introduction" within a Levenshtein distance
 
 ### Architecture Overview
 
-The system consists of several key components, each responsible for a specific part of the parsing and splitting process.
+The system is composed of layered stages: parsing DocQL templates, matching document nodes to build a semantic DOM, and executing transformations or model inferences on matched content.
 
 ### Key Components
 
@@ -187,7 +189,7 @@ The system consists of several key components, each responsible for a specific p
 ## Future Enhancements
 
 - **OCR Support**: Incorporate OCR capabilities to extract text from scanned images.
-- **Enhanced DSL**: Develop a more powerful domain-specific language or consider adopting an existing one like JSX.
+- **Advanced DocQL Features**: Expand the expressiveness of the query language to support joins, negations, and layout-based conditions.
 - **GUI Development**: Create a user-friendly graphical interface for defining templates.
 - **Support for More Formats**: Extend support to additional document formats (e.g., DOCX, HTML).
 - **Cloud Integration**: Offer cloud-based processing options for scalability.
