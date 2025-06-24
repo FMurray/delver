@@ -43,25 +43,25 @@ jobs:
           python-version: 3.x
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          OPENSSL_STATIC: 1
+          RING_PREGENERATE_ASM: 1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: 'true'
           manylinux: auto
           before-script-linux: |
+            # Install basic dependencies
             if command -v yum &> /dev/null; then
-              yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic
               # For i686, symlink libatomic if needed
               if [[ ! -d "/usr/lib64" ]]; then
                 ln -s /usr/lib/libatomic.so.1 /usr/lib/libatomic.so
               fi
             else
-              apt update -y && apt-get install -y libssl-dev openssl pkg-config gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              apt update -y && apt-get install -y libssl-dev openssl pkg-config
             fi
-            # Set ARM architecture for ring compilation
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-            export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -88,25 +88,25 @@ jobs:
           python-version: 3.x
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          OPENSSL_STATIC: 1
+          RING_PREGENERATE_ASM: 1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: 'true'
           manylinux: musllinux_1_2
           before-script-linux: |
+            # Install basic dependencies
             if command -v yum &> /dev/null; then
-              yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic
               # For i686, symlink libatomic if needed
               if [[ ! -d "/usr/lib64" ]]; then
                 ln -s /usr/lib/libatomic.so.1 /usr/lib/libatomic.so
               fi
             else
-              apt update -y && apt-get install -y libssl-dev openssl pkg-config gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              apt update -y && apt-get install -y libssl-dev openssl pkg-config
             fi
-            # Set ARM architecture for ring compilation
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-            export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

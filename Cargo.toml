@@ -28,12 +28,9 @@ serde = { version = "1.0.213", features = ["derive"] }
 serde_json = "1.0.132"
 shellexpand = "3.1.0"
 strsim = "0.11.1"
-tokenizers = { version = "0.20.3", features = ["http"] }
+tokenizers = { version = "0.20.3", default-features = false, features = ["http", "onig"] }
 openssl = { version = "0.10", features = ["vendored"] }
-
-# Force specific versions to avoid ring compilation issues
-[target.'cfg(target_arch = "aarch64")'.dependencies]
-ring = { version = "0.16", features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = "1.41.0"
 unicode-normalization = "0.1.24"
 tracing = "0.1.41"
