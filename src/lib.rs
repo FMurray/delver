@@ -5,16 +5,18 @@ pub mod fonts;
 pub mod geo;
 pub mod layout;
 pub mod logging;
+pub mod matcher;
 pub mod parse;
+pub mod search_index;
 
-use crate::dom::{parse_template, process_template_element};
-use crate::fonts::FontMetrics;
-use crate::parse::{get_pdf_text, group_text_into_lines_and_blocks};
-use logging::{PDF_TEXT_BLOCK, PDF_TEXT_OBJECT};
+use crate::dom::{parse_template, process_matched_content, ProcessedOutput};
+use crate::layout::{group_text_into_lines_and_blocks, TextBlock};
+use crate::matcher::align_template_with_content;
+use crate::parse::{get_page_content, get_refs, TextElement};
+use anyhow::Result;
 use lopdf::Document;
-use parse::TextBlock;
-use std::collections::HashMap;
-use tracing::event;
+use search_index::PdfIndex;
+use std::collections::BTreeMap;
 
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
@@ -30,45 +32,51 @@ use pyo3::prelude::*;
 pub fn process_pdf(
     pdf_bytes: &[u8],
     template_str: &str,
-) -> Result<(Document, Vec<TextBlock>), Box<dyn std::error::Error>> {
-    // let dom = parse_template(template_str)?;
+) -> Result<(String, Vec<TextBlock>, Document)> {
+    let dom = parse_template(template_str)?;
+
     let doc = Document::load_mem(pdf_bytes)?;
-    let text_elements = get_pdf_text(&doc)?;
+    let pages_map = get_page_content(&doc)?;
 
-    let line_join_threshold = 5.0; // Example threshold in PDF units
-    let block_join_threshold = 12.0; // Example threshold in PDF units
-    let blocks =
-        group_text_into_lines_and_blocks(&text_elements, line_join_threshold, block_join_threshold);
+    let mut text_pages_map: BTreeMap<u32, Vec<TextElement>> = BTreeMap::new();
+    for (page_num, page_contents) in &pages_map {
+        let text_elements = page_contents.text_elements();
+        if !text_elements.is_empty() {
+            text_pages_map.insert(*page_num, text_elements);
+        }
+    }
 
-    // let mut all_chunks = Vec::new();
+    let line_join_threshold = 5.0;
+    let block_join_threshold = 12.0;
+    let blocks = group_text_into_lines_and_blocks(
+        &text_pages_map,
+        line_join_threshold,
+        block_join_threshold,
+    );
 
-    // // Process the template DOM recursively and collect chunks
-    // for element in dom.elements {
-    //     let mut metadata = HashMap::new();
-    //     all_chunks.extend(process_template_element(
-    //         &element,
-    //         &text_elements,
-    //         &doc,
-    //         &mut metadata,
-    //     ));
-    // }
+    let match_context = get_refs(&doc)?;
 
-    // // Convert chunks to JSON
-    // let json = serde_json::to_string_pretty(&all_chunks)?;
-    // Ok(json)
-    Ok((doc, blocks))
+    let mut all_outputs: Vec<ProcessedOutput> = Vec::new();
+
+    let index = PdfIndex::new(&pages_map, &match_context);
+
+    if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None) {
+        let outputs = process_matched_content(&matched_content, &index);
+        all_outputs.extend(outputs);
+    }
+
+    let json = serde_json::to_string_pretty(&all_outputs)?;
+    Ok((json, blocks, doc))
 }
 
 /// Process a PDF file using a template and return extracted data as JSON
 #[cfg(feature = "extension-module")]
 #[pyfunction]
 fn process_pdf_file(pdf_path: String, template_path: String) -> PyResult<String> {
-    // Read the files
     let pdf_bytes = std::fs::read(pdf_path)?;
     let template_str = std::fs::read_to_string(template_path)?;
 
-    // Process using existing function
-    let json = process_pdf(&pdf_bytes, &template_str)
+    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     Ok(json)

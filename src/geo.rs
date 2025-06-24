@@ -26,6 +26,17 @@ impl Rect {
     }
 }
 
+impl From<(f32, f32, f32, f32)> for Rect {
+    fn from(value: (f32, f32, f32, f32)) -> Self {
+        Self {
+            x0: value.0,
+            y0: value.1,
+            x1: value.2,
+            y1: value.3,
+        }
+    }
+}
+
 impl From<(u32, u32, u32, u32)> for Rect {
     fn from(value: (u32, u32, u32, u32)) -> Self {
         Self {
@@ -34,6 +45,15 @@ impl From<(u32, u32, u32, u32)> for Rect {
             x1: value.2 as f32,
             y1: value.3 as f32,
         }
+    }
+}
+
+impl Into<geo::Rect<f32>> for Rect {
+    fn into(self) -> geo::Rect<f32> {
+        geo::Rect::new(
+            geo::Point::new(self.x0, self.y0),
+            geo::Point::new(self.x1, self.y1),
+        )
     }
 }
 

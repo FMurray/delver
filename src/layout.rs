@@ -1,267 +1,470 @@
+use crate::parse::{PageContent, TextElement};
 use indexmap::IndexMap;
-use log::info;
-use lopdf::Dictionary;
 use lopdf::Object;
-use rayon::prelude::*;
-use std::collections::BTreeMap;
-use strsim::normalized_levenshtein;
 
-use crate::parse::TextElement;
+use std::collections::BTreeMap;
+use std::fmt::Debug;
+use uuid::Uuid;
 
 // Add this struct at the module level
 #[derive(Debug, Default)]
 pub struct MatchContext {
     pub destinations: IndexMap<String, Object>,
-    pub fonts: Option<BTreeMap<Vec<u8>, Dictionary>>,
 }
 
-pub fn perform_matching(
-    text_elements: &[TextElement],
-    search_string: &str,
-    threshold: f64,
-) -> Vec<TextElement> {
-    let search_normalized = search_string.to_lowercase();
-
-    text_elements
-        .par_iter()
-        .filter(|mi| {
-            let text_normalized = mi.text.to_lowercase();
-            let similarity = normalized_levenshtein(&text_normalized, &search_normalized);
-            similarity >= threshold
-        })
-        .cloned()
-        .collect()
+/// Represents a single line of text on the page after grouping TextElements.
+#[derive(Debug, Clone)]
+pub struct TextLine {
+    pub id: Uuid,
+    pub text: String,
+    pub page_number: u32,
+    pub elements: Vec<TextElement>,
+    /// A bounding box for the entire line (x_min, y_min, x_max, y_max).
+    pub bbox: (f32, f32, f32, f32),
 }
 
-pub fn select_best_match(
-    matched_elements: Vec<TextElement>,
-    context: &MatchContext,
-) -> Option<TextElement> {
-    matched_elements.into_par_iter().max_by(|a, b| {
-        let score_a = score_match(a, context);
-        let score_b = score_match(b, context);
-        score_a
-            .partial_cmp(&score_b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
+impl TextLine {
+    pub fn from_elements(page_number: u32, items: Vec<TextElement>) -> Self {
+        let id = Uuid::new_v4();
+        let mut line_min_x = f32::MAX;
+        let mut line_min_y = f32::MAX;
+        let mut line_max_x = f32::MIN;
+        let mut line_max_y = f32::MIN;
+        let mut combined_text = String::with_capacity(items.iter().map(|e| e.text.len()).sum());
 
-fn score_match(mi: &TextElement, context: &MatchContext) -> f32 {
-    let mut score = 0.0;
+        for (_, it) in items.iter().enumerate() {
+            line_min_x = line_min_x.min(it.bbox.0);
+            line_max_x = line_max_x.max(it.bbox.2);
+            line_min_y = line_min_y.min(it.bbox.1);
+            line_max_y = line_max_y.max(it.bbox.3);
 
-    // Font size score (normalize assuming max font size of 72pt)
-    let font_size_score = (mi.font_size / 72.0).min(1.0);
-    score += font_size_score * 0.3; // 30% weight
-
-    // Font characteristics score
-    let font_score = if let Some(font_ref) = &mi.font_name {
-        let font_bytes = font_ref.as_bytes().to_vec();
-        if let Some(fonts) = &context.fonts {
-            if let Some(font_dict) = fonts.get(&font_bytes) {
-                // Get the actual font name from BaseFont
-                let base_font = font_dict
-                    .get(b"BaseFont")
-                    .and_then(|bf| bf.as_name())
-                    .map(|n| String::from_utf8_lossy(n).to_string())
-                    .unwrap_or_default();
-
-                let font_lower = base_font.to_lowercase();
-
-                if font_lower.contains("bold")
-                    || font_lower.contains("heavy")
-                    || font_lower.contains("black")
-                    || font_lower.ends_with("-b")
-                    || font_lower.ends_with(".b")
-                {
-                    1.0
-                } else if font_lower.contains("medium")
-                    || font_lower.contains("semibold")
-                    || font_lower.contains("demi")
-                {
-                    0.7
-                } else if font_lower.contains("regular") || font_lower.contains("roman") {
-                    0.5
-                } else {
-                    0.3
-                }
-            } else {
-                0.0
-            }
-        } else {
-            0.0
+            combined_text.push_str(&it.text);
         }
-    } else {
-        0.0
-    };
-    score += font_score * 0.2; // 20% weight
 
-    // Vertical position score (normalize based on typical page height ~842pt)
-    let position_score = if mi.bbox.1 > 700.0 || mi.bbox.1 < 200.0 {
-        1.0
-    } else {
-        0.0
-    };
-    score += position_score * 0.1; // 10% weight
+        let line = TextLine {
+            id,
+            text: combined_text,
+            page_number,
+            elements: items,
+            bbox: (line_min_x, line_min_y, line_max_x, line_max_y),
+        };
 
-    // Left alignment score (normalize based on typical page width ~595pt)
-    let left_align_score = if mi.bbox.0 < 100.0 { 1.0 } else { 0.0 };
-    score += left_align_score * 0.1; // 10% weight
+        tracing::debug!(
+            line_id = %line.id,
+            parent = %line.id,
+            children = %serde_json::to_string(&line.elements.iter().map(|e| e.id).collect::<Vec<_>>()).unwrap(),
+            rel_type = "line_to_elements",
+            "Created text line with {} elements",
+            line.elements.len()
+        );
 
-    // Text case score
-    let case_score = if mi.text.chars().all(|c| c.is_uppercase()) {
-        1.0 // All caps
-    } else if mi.text.chars().next().map_or(false, |c| c.is_uppercase()) {
-        0.7 // Title case
-    } else {
-        0.3 // Normal case
-    };
-    score += case_score * 0.1; // 10% weight
+        line
+    }
 
-    // Reference count score (normalize assuming max 10 references)
-    let mut reference_count = 0;
-    for (_name, dest_obj) in context.destinations.iter() {
-        if let Object::Array(dest_array) = dest_obj {
-            if dest_array.len() >= 4 {
-                let dest_page = match &dest_array[0] {
-                    Object::Integer(page) => (*page as u32) + 1,
-                    _ => continue,
-                };
+    /// Get all elements in this line
+    pub fn elements(&self) -> &[TextElement] {
+        &self.elements
+    }
 
-                if dest_page == mi.page_number {
-                    let dest_y = match &dest_array[3] {
-                        Object::Real(y) => *y,
-                        Object::Integer(y) => *y as f32,
-                        _ => continue,
-                    };
+    /// Get the first element in this line
+    pub fn first_element(&self) -> Option<&TextElement> {
+        self.elements.first()
+    }
 
-                    // Tighter vertical position matching
-                    if (dest_y - mi.bbox.1).abs() < 20.0 {
-                        reference_count += 1;
+    /// Get the font name for this line (from the first element)
+    /// Since lines are now split by font changes, all elements should have the same font
+    pub fn font_name(&self) -> Option<&str> {
+        self.elements
+            .first()
+            .and_then(|elem| elem.font_name.as_deref())
+    }
+
+    /// Get the font size for this line (from the first element)
+    /// Since lines are now split by font changes, all elements should have the same font size
+    pub fn font_size(&self) -> f32 {
+        self.elements
+            .first()
+            .map(|elem| elem.font_size)
+            .unwrap_or(0.0)
+    }
+
+    /// Check if all elements in this line have the same font metadata
+    pub fn has_consistent_font(&self) -> bool {
+        if self.elements.len() <= 1 {
+            return true;
+        }
+
+        let first_font_name = &self.elements[0].font_name;
+        let first_font_size = self.elements[0].font_size;
+
+        self.elements.iter().skip(1).all(|elem| {
+            elem.font_name == *first_font_name && (elem.font_size - first_font_size).abs() < 0.1
+        })
+    }
+}
+
+impl<'a> From<&'a TextLine> for Vec<&'a TextElement> {
+    fn from(line: &'a TextLine) -> Self {
+        line.elements.iter().collect()
+    }
+}
+
+// Collection utility for multiple lines
+pub fn elements_from_lines<'a>(lines: &[&'a TextLine]) -> Vec<&'a TextElement> {
+    lines.iter().flat_map(|line| line.elements.iter()).collect()
+}
+
+/// Represents a "block" of consecutive lines that are close in vertical spacing.
+#[derive(Debug, Clone)]
+pub struct TextBlock {
+    pub id: Uuid,
+    pub page_number: u32,
+    pub lines: Vec<TextLine>,
+    /// A bounding box for the entire block (x_min, y_min, x_max, y_max).
+    pub bbox: (f32, f32, f32, f32),
+}
+
+impl TextBlock {
+    pub fn from_lines(page_number: u32, lines: Vec<TextLine>) -> Self {
+        let id = Uuid::new_v4();
+        let (x_min, y_min, x_max, y_max) = lines.iter().fold(
+            (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
+            |(xmin, ymin, xmax, ymax), line| {
+                (
+                    xmin.min(line.bbox.0),
+                    ymin.min(line.bbox.1),
+                    xmax.max(line.bbox.2),
+                    ymax.max(line.bbox.3),
+                )
+            },
+        );
+
+        let block = Self {
+            id,
+            page_number,
+            lines,
+            bbox: (x_min, y_min, x_max, y_max),
+        };
+
+        tracing::debug!(
+            block_id = %block.id,
+            "Created text block with {} lines",
+            block.lines.len()
+        );
+
+        block
+    }
+}
+
+/// Group text elements into lines and blocks based on spatial relationships
+pub fn group_text_into_lines_and_blocks(
+    pages_map: &BTreeMap<u32, Vec<TextElement>>,
+    line_join_threshold: f32,
+    block_join_threshold: f32,
+) -> Vec<TextBlock> {
+    let mut all_blocks = Vec::new();
+
+    for (page_number, elements) in pages_map.into_iter() {
+        let mut elements = elements.clone();
+        elements.sort_by(|a, b| {
+            b.bbox
+                .1
+                .partial_cmp(&a.bbox.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.bbox
+                        .0
+                        .partial_cmp(&b.bbox.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+
+        let mut lines = Vec::new();
+        let mut current_line = Vec::new();
+
+        let mut last_y = f32::MAX;
+        let mut last_font_name: Option<String> = None;
+        let mut last_font_size: Option<f32> = None;
+
+        for elem in elements {
+            let current_font_name = elem.font_name.clone();
+            let current_font_size = Some(elem.font_size);
+
+            if current_line.is_empty() {
+                current_line.push(elem.clone());
+                last_y = elem.bbox.1;
+                last_font_name = current_font_name;
+                last_font_size = current_font_size;
+            } else {
+                let y_close = (last_y - elem.bbox.1).abs() < line_join_threshold;
+                let font_matches = last_font_name == current_font_name
+                    && last_font_size.map_or(false, |last_size| {
+                        current_font_size
+                            .map_or(false, |curr_size| (last_size - curr_size).abs() < 0.1)
+                    });
+
+                if y_close && font_matches {
+                    current_line.push(elem.clone());
+                } else {
+                    lines.push(TextLine::from_elements(*page_number, current_line));
+                    current_line = vec![elem.clone()];
+                    last_y = elem.bbox.1;
+                    last_font_name = current_font_name;
+                    last_font_size = current_font_size;
+                }
+            }
+        }
+
+        if !current_line.is_empty() {
+            lines.push(TextLine::from_elements(*page_number, current_line));
+        }
+
+        for line in &mut lines {
+            line.elements.sort_by(|a, b| {
+                a.bbox
+                    .0
+                    .partial_cmp(&b.bbox.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let mut blocks = Vec::new();
+        let mut current_block_lines = Vec::new();
+
+        let mut prev_line_y: Option<f32> = None;
+        for line in lines {
+            let line_y_top = line.bbox.1.min(line.bbox.3);
+            if let Some(py) = prev_line_y {
+                if (py - line_y_top).abs() > block_join_threshold {
+                    if !current_block_lines.is_empty() {
+                        blocks.push(TextBlock::from_lines(*page_number, current_block_lines));
+                        current_block_lines = Vec::new();
                     }
                 }
             }
+            prev_line_y = Some(line_y_top);
+            current_block_lines.push(line);
+        }
+
+        if !current_block_lines.is_empty() {
+            blocks.push(TextBlock::from_lines(*page_number, current_block_lines));
+        }
+
+        all_blocks.extend(blocks);
+    }
+
+    all_blocks
+}
+
+// Additional layout utility functions that focus on spatial relationships
+pub fn is_vertically_aligned(elem1: &TextElement, elem2: &TextElement, threshold: f32) -> bool {
+    let center1 = (elem1.bbox.0 + elem1.bbox.2) / 2.0;
+    let center2 = (elem2.bbox.0 + elem2.bbox.2) / 2.0;
+    (center1 - center2).abs() < threshold
+}
+
+pub fn is_horizontally_aligned(elem1: &TextElement, elem2: &TextElement, threshold: f32) -> bool {
+    let center1 = (elem1.bbox.1 + elem1.bbox.3) / 2.0;
+    let center2 = (elem2.bbox.1 + elem2.bbox.3) / 2.0;
+    (center1 - center2).abs() < threshold
+}
+
+// Other spatial utilities as needed
+
+/// Group text elements into lines without creating blocks
+pub fn group_text_into_lines(
+    text_elements: &Vec<TextElement>,
+    line_join_threshold: f32,
+) -> Vec<TextLine> {
+    let mut elements = text_elements.clone();
+    elements.sort_by(|a, b| {
+        b.bbox
+            .1
+            .partial_cmp(&a.bbox.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.bbox
+                    .0
+                    .partial_cmp(&b.bbox.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut lines = Vec::new();
+    let mut current_line = Vec::new();
+    let mut last_y = f32::MAX;
+    let mut last_font_name: Option<String> = None;
+    let mut last_font_size: Option<f32> = None;
+
+    for elem in elements {
+        let current_font_name = elem.font_name.clone();
+        let current_font_size = Some(elem.font_size);
+
+        if current_line.is_empty() {
+            current_line.push(elem.clone());
+            last_y = elem.bbox.1;
+            last_font_name = current_font_name;
+            last_font_size = current_font_size;
+        } else {
+            let y_close = (last_y - elem.bbox.1).abs() < line_join_threshold;
+            let font_matches = last_font_name == current_font_name
+                && last_font_size.map_or(false, |last_size| {
+                    current_font_size.map_or(false, |curr_size| (last_size - curr_size).abs() < 0.1)
+                });
+
+            if y_close && font_matches {
+                current_line.push(elem.clone());
+            } else {
+                if let Some(first_elem) = current_line.first() {
+                    let current_page_number = first_elem.page_number;
+                    lines.push(TextLine::from_elements(current_page_number, current_line));
+                }
+                current_line = vec![elem.clone()];
+                last_y = elem.bbox.1;
+                last_font_name = current_font_name;
+                last_font_size = current_font_size;
+            }
         }
     }
-    let reference_score = (reference_count as f32 / 10.0).min(1.0);
-    score += reference_score * 0.2; // 20% weight
 
-    // Debug logging with improved formatting
-    info!(
-        "Debug - Text Element:\n\
-        \tText: \"{}\"\n\
-        \tPage Number: {}\n\
-        \tFont Size: {:.2}\n\
-        \tFont Name: {:?}\n\
-        \tPosition: ({:.2}, {:.2})\n\
-        \tScores:\n\
-        \t\tFont Size Score: {:.2}\n\
-        \t\tFont Score: {:.2}\n\
-        \t\tPosition Score: {:.2}\n\
-        \t\tLeft Align Score: {:.2}\n\
-        \t\tCase Score: {:.2}\n\
-        \t\tReference Score: {:.2}\n\
-        \tTotal Score: {:.2}\n",
-        mi.text,
-        mi.page_number,
-        mi.font_size,
-        mi.font_name,
-        mi.bbox.0,
-        mi.bbox.1,
-        font_size_score,
-        font_score,
-        position_score,
-        left_align_score,
-        case_score,
-        reference_score,
-        score
+    if !current_line.is_empty() {
+        if let Some(first_elem) = current_line.first() {
+            let current_page_number = first_elem.page_number;
+            lines.push(TextLine::from_elements(current_page_number, current_line));
+        }
+    }
+
+    // Sort elements within each line
+    for line in &mut lines {
+        line.elements.sort_by(|a, b| {
+            a.bbox
+                .0
+                .partial_cmp(&b.bbox.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    lines
+}
+
+// FontUsage struct is now in search_index.rs
+
+/// Analyze the font usage patterns in a document to identify potential heading levels
+/// Uses the PdfIndex for efficient font usage analysis
+pub fn identify_heading_levels(
+    index: &crate::search_index::PdfIndex,
+    max_levels: usize,
+    start_index: Option<usize>,
+    end_index: Option<usize>,
+) -> Vec<((String, f32), u32)> {
+    // Get font statistics for the scope
+    let (mean, std_dev) = index.get_font_size_stats(start_index, end_index);
+    let text_element_count = index.get_text_element_count(start_index, end_index);
+
+    println!(
+        "[identify_heading_levels] Calculated avg_font_size: {}, std_dev: {}",
+        mean, std_dev
     );
 
-    score
-}
+    // Find fonts with moderate z-scores (not extreme outliers like titles)
+    // but above average (potential headings)
+    let font_candidates = index.find_fonts_by_z_score(0.1, start_index, end_index); // 0.1 std devs above mean
 
-pub fn extract_section_content(
-    all_text_elements: &[TextElement],
-    start_element: &TextElement,
-    end_element: Option<&TextElement>,
-) -> Vec<TextElement> {
-    // Find the index of the start element
-    let start_index = all_text_elements
-        .iter()
-        .position(|e| e == start_element)
-        .expect("Start element not found in text elements");
+    let mut candidates = Vec::new();
 
-    // Determine the end index
-    let end_index = if let Some(end_elem) = end_element {
-        let idx = all_text_elements
-            .iter()
-            .position(|e| e == end_elem)
-            .unwrap_or(all_text_elements.len());
-
-        // Ensure end_index is after start_index
-        if idx <= start_index {
-            info!("End element occurs before start element or not found. Using end of document as end index.");
-            all_text_elements.len()
+    for ((font_name, font_size), usage_count, z_score) in font_candidates {
+        // Criteria for heading detection:
+        // 1. Must appear multiple times (not unique like titles)
+        let min_abs_usage = 2;
+        // 2. Must not be too frequent (not more than 50% of text elements)
+        let max_rel_usage_threshold = if text_element_count > 0 {
+            std::cmp::max(2, text_element_count / 2)
         } else {
-            idx
-        }
-    } else {
-        all_text_elements.len()
-    };
+            0
+        };
 
-    // Extract elements between start_index and end_index
-    all_text_elements[start_index + 1..end_index].to_vec()
+        println!("[identify_heading_levels] Checking style: ({}, {}), usage: {}, z_score: {:.2}, text_count: {}, max_rel_thresh: {}", 
+            font_name, font_size, usage_count, z_score, text_element_count, max_rel_usage_threshold);
+
+        // Check if this font/size combination could be a heading:
+        if usage_count >= min_abs_usage
+            && (max_rel_usage_threshold == 0 || usage_count <= max_rel_usage_threshold)
+            && z_score > 0.0
+        // Must be above average
+        {
+            println!("    -> Candidate ACCEPTED");
+            candidates.push(((font_name, font_size), usage_count));
+        } else {
+            println!(
+                "    -> Candidate REJECTED (usage: {}, z_score_check: {}, rel_usage_check: {})",
+                usage_count >= min_abs_usage,
+                z_score > 0.0,
+                (max_rel_usage_threshold == 0 || usage_count <= max_rel_usage_threshold)
+            );
+        }
+    }
+
+    // Sort by font size (descending) then by usage count (descending)
+    candidates.sort_by(|a, b| {
+        b.0 .1
+            .partial_cmp(&a.0 .1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.1.cmp(&a.1))
+    });
+
+    candidates.into_iter().take(max_levels).collect()
 }
 
-// pub fn extract_sections(doc: &Document, _sections: &[&str]) -> Vec<(String, String)> {
-//     let results = Vec::new();
+/// Find elements in the document that match a specific font and size
+pub fn find_elements_by_font(
+    pages_map: &BTreeMap<u32, Vec<PageContent>>,
+    font_name_filter: Option<&str>,
+    target_font_size: Option<f32>,
+) -> Vec<PageContent> {
+    pages_map
+        .values()
+        .flat_map(|page_contents| page_contents.iter())
+        .filter_map(|content| match content {
+            PageContent::Text(text_elem) => {
+                let canonical_font_name = crate::fonts::canonicalize::canonicalize_font_name(
+                    text_elem.font_name.as_deref().unwrap_or_default(),
+                );
 
-//     let pages: Vec<Result<(u32, Vec<String>), Error>> = doc
-//         .get_pages()
-//         .into_par_iter()
-//         .map(
-//             |(page_num, page_id): (u32, (u32, u16))| -> Result<(u32, Vec<String>), Error> {
-//                 let text = doc.extract_text(&[page_num]).map_err(|e| {
-//                     Error::new(
-//                         ErrorKind::Other,
-//                         format!("Failed to extract text from page {page_num} id={page_id:?}: {e:}"),
-//                     )
-//                 })?;
-//                 Ok((
-//                     page_num,
-//                     text.split('\n')
-//                         .map(|s| s.trim_end().to_string())
-//                         .collect::<Vec<String>>(),
-//                 ))
-//             },
-//         )
-//         .collect();
+                let name_matches =
+                    font_name_filter.map_or(true, |fname| canonical_font_name == fname);
+                let size_matches = target_font_size
+                    .map_or(true, |tsize| (text_elem.font_size - tsize).abs() < 0.1);
 
-//     // let section_titles_pattern = sections
-//     //     .iter()
-//     //     .map(|s| regex::escape(s))
-//     //     .collect::<Vec<String>>()
-//     //     .join("|");
+                if name_matches && size_matches {
+                    Some(content.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
 
-//     // let pattern = format!(r"({})\s*(.*?)", section_titles_pattern);
+/// Find elements that are likely to be at a specific heading level using PdfIndex
+pub fn find_elements_at_heading_level(
+    index: &crate::search_index::PdfIndex,
+    font_name: &str,
+    font_size: f32,
+    start_index: Option<usize>,
+    end_index: Option<usize>,
+) -> Vec<PageContent> {
+    println!(
+        "Looking for heading elements with font '{}' and size {}",
+        font_name, font_size
+    );
 
-//     // println!("Debug - Section titles to match: {:?}", sections);
-//     // println!("Debug - Final regex pattern: {}", pattern);
+    // Find elements matching the font criteria
+    let elements = index.elements_by_font(Some(font_name), Some(font_size), None, None);
 
-//     // let re = Regex::new(&pattern).unwrap();
+    // Filter by index range if provided
+    let start = start_index.unwrap_or(0);
+    let end = end_index.unwrap_or(elements.len());
 
-//     // for m in re.find_iter(text) {
-//     //     println!(
-//     //         "Debug - Found match at position {}: {}",
-//     //         m.start(),
-//     //         m.as_str().chars().take(50).collect::<String>()
-//     //     );
-//     // }
-
-//     // for caps in re.captures_iter(text) {
-//     //     let title = caps.get(1).unwrap().as_str().to_string();
-//     //     let content = caps.get(2).unwrap().as_str().trim().to_string();
-//     //     results.push((title, content));
-//     // }
-
-//     results
-// }
+    elements.into_iter().skip(start).take(end - start).collect()
+}
