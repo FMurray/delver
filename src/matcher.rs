@@ -1,4 +1,4 @@
-use crate::dom::{Element, ElementType, MatchConfig, Value};
+use crate::docql::{Element, ElementType, MatchConfig, Value};
 use crate::layout::TextLine;
 use crate::parse::{ContentHandle, PageContent, TextElement};
 use crate::search_index::PdfIndex;

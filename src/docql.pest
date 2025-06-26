@@ -1,7 +1,23 @@
 WHITESPACE          = _{ " " | "\t" | "\r" | "\n" }
 NEWLINE             = _{ "\r\n" | "\n" }
 
-template            =  { SOI ~ expression* ~ EOI }
+template            =  { SOI ~ (match_definition | expression)* ~ EOI }
+
+// Match configuration definitions
+match_definition    =  { "Match" ~ "<" ~ identifier ~ ">" ~ identifier ~ match_body }
+match_body          =  { "{" ~ match_expression* ~ "}" }
+
+// Match expressions and types
+match_expression    =  { function_call | value }
+function_call       =  { identifier ~ "(" ~ function_args? ~ ")" }
+function_args       =  { function_arg ~ ("," ~ function_arg)* ~ ","? }
+function_arg        =  { (identifier ~ "=" ~ function_arg_value) | function_arg_value }
+function_arg_value  =  { comparison_expr | function_call | value }
+
+// Comparison operators for heuristics (used only in function arguments)
+comparison_op       =  { ">=" | "<=" | "==" | "!=" | ">" | "<" }
+comparison_expr     =  { identifier ~ comparison_op ~ comparison_value }
+comparison_value    =  { string | number | boolean | identifier }
 
 expression          =  { element }
 

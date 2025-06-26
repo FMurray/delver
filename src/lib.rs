@@ -1,6 +1,6 @@
 pub mod chunker;
 pub mod debug_viewer;
-pub mod dom;
+pub mod docql;
 pub mod fonts;
 pub mod geo;
 pub mod layout;
@@ -9,7 +9,7 @@ pub mod matcher;
 pub mod parse;
 pub mod search_index;
 
-use crate::dom::{parse_template, process_matched_content, ProcessedOutput};
+use crate::docql::{parse_template, process_matched_content, ProcessedOutput};
 use crate::layout::{group_text_into_lines_and_blocks, TextBlock};
 use crate::matcher::align_template_with_content;
 use crate::parse::{get_page_content, get_refs, TextElement};

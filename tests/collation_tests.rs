@@ -1,4 +1,4 @@
-use delver_pdf::dom::{Element, ElementType, MatchConfig, MatchType, Value};
+use delver_pdf::docql::{Element, ElementType, MatchConfig, MatchType, Value};
 use delver_pdf::matcher::{
     align_template_with_content, MatchedContent, SectionBoundaries, TemplateContentMatch,
 };
@@ -314,7 +314,7 @@ mod collation_flow_tests {
 
     #[test]
     fn test_multi_page_chunking_preserves_page_numbers() {
-        use delver_pdf::dom::process_matched_content;
+        use delver_pdf::docql::process_matched_content;
         
         // Build multi-page document content
         let mut doc = DocumentBuilder::new();
@@ -358,7 +358,7 @@ mod collation_flow_tests {
         let mut chunk_details = Vec::new();
         
         for output in &processed_outputs {
-            if let delver_pdf::dom::ProcessedOutput::Text(chunk) = output {
+            if let delver_pdf::docql::ProcessedOutput::Text(chunk) = output {
                 // Extract page numbers from metadata
                 if let Some(page_numbers_value) = chunk.metadata.get("page_numbers") {
                     if let Some(page_array) = page_numbers_value.as_array() {
@@ -415,7 +415,7 @@ mod collation_flow_tests {
         
         // Verify that chunk metadata is properly structured (no type tags)
         for output in &processed_outputs {
-            if let delver_pdf::dom::ProcessedOutput::Text(chunk) = output {
+            if let delver_pdf::docql::ProcessedOutput::Text(chunk) = output {
                 // Page numbers should be a plain JSON array, not tagged with "Array"
                 if let Some(page_numbers_value) = chunk.metadata.get("page_numbers") {
                     assert!(page_numbers_value.is_array(), "page_numbers should be a JSON array");

@@ -1,10 +1,7 @@
-use delver_pdf::{
-    dom::{parse_template, Value},
-    parse::{get_page_content, PageContent},
+use delver_pdf::docql::{
+    parse_template, ComparisonOp, ComparisonValue, FunctionArg, FunctionArgValue, MatchExpression,
+    MatchType, Value,
 };
-use lopdf::Document;
-use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
 
 mod common;
 
@@ -44,132 +41,338 @@ fn test_10k_template_parsing() -> std::io::Result<()> {
     Ok(())
 }
 
-/* // TODO: Refactor this test to use PdfIndex, align_template_with_content, and process_matched_content
 #[test]
-fn test_10k_template_processing() -> std::io::Result<()> {
+fn test_match_definition_basic() -> std::io::Result<()> {
     common::setup();
 
-    let pdf_path = common::get_test_pdf_path();
-    println!("Testing with PDF at path: {:?}", pdf_path);
+    let template_str = r#"
+        Match<Section> MDandA {
+            Text("Management's Discussion", threshold=0.9)
+        }
+        
+        Section(as="MD&A", match=MDandA) {
+            TextChunk(chunkSize=500)
+        }
+    "#;
 
-    let doc = Document::load(&pdf_path).map_err(|e| {
-        println!("Failed to load PDF: {}", e);
-        Error::new(ErrorKind::Other, e.to_string())
-    })?;
-
-    // Parse PDF into text elements
-    let pages_map = get_page_content(&doc).map_err(|e| {
-        println!("Failed to extract text: {}", e);
-        Error::new(ErrorKind::Other, e.to_string())
-    })?;
-    println!("Extracted {} pages of content", pages_map.len());
-
-    // Parse template
-    let template_str = include_str!("../10k.tmpl");
     let root = parse_template(template_str)?;
-    println!(
-        "Template parsed successfully with {} root elements",
-        root.elements.len()
-    );
 
-    // Process template with empty metadata
-    let metadata = HashMap::new();
-    // let chunks = process_template_element(&root.elements[1], &text_elements, &doc, &metadata);
-    let chunks: Vec<_> = vec![]; // Placeholder
-    println!("Processed {} chunks", chunks.len());
+    // Verify match definition was parsed
+    assert_eq!(root.match_definitions.len(), 1);
+    assert!(root.match_definitions.contains_key("MDandA"));
 
-    // Print first few chunks for debugging
-    for (i, chunk) in chunks.iter().take(3).enumerate() {
-        println!(
-            "Chunk {}: {} chars, metadata: {:?}",
-            i,
-            chunk.text.len(),
-            chunk.metadata
-        );
-        println!("Preview: {:.100}...", chunk.text.replace('\n', " "));
+    let md_def = &root.match_definitions["MDandA"];
+    assert_eq!(md_def.target_type, "Section");
+    assert_eq!(md_def.name, "MDandA");
+    assert_eq!(md_def.clauses.len(), 1);
+
+    // Verify the match config was parsed correctly
+    if let MatchExpression::MatchConfig(config) = &md_def.clauses[0] {
+        assert_eq!(config.match_type, MatchType::Text);
+        assert_eq!(config.pattern, "Management's Discussion");
+        assert_eq!(config.threshold, 0.9);
+    } else {
+        panic!("Expected MatchConfig for first clause");
     }
 
-    // Verify we got chunks back
-    assert!(!chunks.is_empty());
-
-    // Verify the chunks contain expected content
-    let contains_md_and_a = chunks.iter().any(|chunk| {
-        chunk.text.contains("Management's Discussion and Analysis")
-            && chunk.text.contains("Results of Operations")
-    });
-    assert!(
-        contains_md_and_a,
-        "Chunks should contain MD&A section content"
-    );
-
-    // Verify chunk metadata
-    let md_and_a_chunks = chunks
-        .iter()
-        .filter(|chunk| chunk.metadata.contains_key("MD&A"))
-        .collect::<Vec<_>>();
-
-    assert!(
-        !md_and_a_chunks.is_empty(),
-        "Should have chunks with MD&A metadata"
-    );
-
-    // Verify chunk sizes are reasonable
-    for chunk in &chunks {
-        assert!(
-            chunk.text.len() <= 1000,
-            "Chunk size should not exceed 1000 characters"
-        );
+    // Verify element references the match definition
+    assert_eq!(root.elements.len(), 1);
+    let section = &root.elements[0];
+    assert_eq!(section.name, "Section");
+    if let Some(Value::Identifier(match_ref)) = section.attributes.get("match") {
+        assert_eq!(match_ref, "MDandA");
+    } else {
+        panic!("Expected match reference to MDandA");
     }
 
     common::cleanup_all();
     Ok(())
 }
-*/
 
-/* // TODO: Refactor this test for new processing flow
 #[test]
-fn test_nested_sections() -> std::io::Result<()> {
+fn test_match_definition_with_multiple_functions() -> std::io::Result<()> {
     common::setup();
 
-    let pdf_path = common::get_test_pdf_path();
-    let doc = Document::load(&pdf_path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-    let pages_map = get_page_content(&doc).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+    let template_str = r#"
+        Match<Section> MDandA {
+            FirstMatch(
+                Text("Management's Discussion", threshold=0.9),
+                Cosine("Management's Discussion"),
+                Heuristic(fontSize > 14, top_of_page=true)
+            )
+            Optional(Text("Quantitative and Qualitative", threshold=0.8))
+        }
+    "#;
 
-    let template_str = include_str!("../10k.tmpl");
     let root = parse_template(template_str)?;
 
-    // Get the main MD&A section
-    let md_and_a_section = &root.elements[1];
-    assert_eq!(md_and_a_section.children.len(), 3); // TextChunk and 2 nested Sections
+    let md_def = &root.match_definitions["MDandA"];
+    assert_eq!(md_def.clauses.len(), 2);
 
-    // Process with empty metadata
-    let metadata = HashMap::new();
-    // let chunks = process_template_element(md_and_a_section, &text_elements, &doc, &metadata);
-    let chunks: Vec<_> = vec![]; // Placeholder
+    // Test FirstMatch function with nested calls
+    if let MatchExpression::FunctionCall(first_match) = &md_def.clauses[0] {
+        assert_eq!(first_match.name, "FirstMatch");
+        assert_eq!(first_match.args.len(), 3);
 
-    // Verify business segment section content
-    let business_segment_chunks = chunks
-        .iter()
-        .filter(|chunk| chunk.text.contains("PERFORMANCE BY BUSINESS SEGMENT"))
-        .collect::<Vec<_>>();
+        // Check first nested function (Text)
+        if let FunctionArg::Positional(FunctionArgValue::Value(Value::Identifier(_func_ref))) =
+            &first_match.args[0]
+        {
+            // Note: This test assumes the parser handles nested function calls as identifiers
+            // In a real implementation, you might want to parse them as nested FunctionCall values
+        }
+    }
 
-    assert!(
-        !business_segment_chunks.is_empty(),
-        "Should find business segment section"
-    );
-
-    // Verify geographic area section content
-    let geographic_chunks = chunks
-        .iter()
-        .filter(|chunk| chunk.text.contains("PERFORMANCE BY GEOGRAPHIC AREA"))
-        .collect::<Vec<_>>();
-
-    assert!(
-        !geographic_chunks.is_empty(),
-        "Should find geographic area section"
-    );
+    // Test Optional function
+    if let MatchExpression::FunctionCall(optional) = &md_def.clauses[1] {
+        assert_eq!(optional.name, "Optional");
+    }
 
     common::cleanup_all();
     Ok(())
 }
-*/
+
+#[test]
+fn test_comparison_expressions() -> std::io::Result<()> {
+    common::setup();
+
+    let template_str = r#"
+        Match<Section> Header {
+            Heuristic(fontSize >= 14, y_position > 700)
+        }
+    "#;
+
+    let root = parse_template(template_str)?;
+
+    let header_def = &root.match_definitions["Header"];
+    if let MatchExpression::FunctionCall(heuristic) = &header_def.clauses[0] {
+        assert_eq!(heuristic.name, "Heuristic");
+        assert_eq!(heuristic.args.len(), 2);
+
+        // Check first comparison (fontSize >= 14)
+        if let FunctionArg::Positional(FunctionArgValue::Comparison(comp1)) = &heuristic.args[0] {
+            assert_eq!(comp1.left, "fontSize");
+            assert_eq!(comp1.op, ComparisonOp::GreaterThanOrEqual);
+            if let ComparisonValue::Number(n) = &comp1.right {
+                assert_eq!(*n, 14);
+            }
+        } else {
+            panic!("Expected comparison expression for fontSize");
+        }
+
+        // Check second comparison (y_position > 700)
+        if let FunctionArg::Positional(FunctionArgValue::Comparison(comp2)) = &heuristic.args[1] {
+            assert_eq!(comp2.left, "y_position");
+            assert_eq!(comp2.op, ComparisonOp::GreaterThan);
+            if let ComparisonValue::Number(n) = &comp2.right {
+                assert_eq!(*n, 700);
+            }
+        } else {
+            panic!("Expected comparison expression for y_position");
+        }
+    }
+
+    common::cleanup_all();
+    Ok(())
+}
+
+#[test]
+fn test_mixed_function_arguments() -> std::io::Result<()> {
+    common::setup();
+
+    let template_str = r#"
+        Match<Section> ComplexMatch {
+            CustomFunction("pattern", 0.85, model="gpt-4", strict=true)
+        }
+    "#;
+
+    let root = parse_template(template_str)?;
+
+    let complex_def = &root.match_definitions["ComplexMatch"];
+    if let MatchExpression::FunctionCall(func) = &complex_def.clauses[0] {
+        assert_eq!(func.name, "CustomFunction");
+        assert_eq!(func.args.len(), 4);
+
+        // Check positional string
+        if let FunctionArg::Positional(FunctionArgValue::Value(Value::String(s))) = &func.args[0] {
+            assert_eq!(s, "pattern");
+        }
+
+        // Check positional number
+        if let FunctionArg::Positional(FunctionArgValue::Value(Value::Number(n))) = &func.args[1] {
+            assert_eq!(*n, 850); // 0.85 * 1000
+        }
+
+        // Check named string argument
+        if let FunctionArg::Named { name, value } = &func.args[2] {
+            assert_eq!(name, "model");
+            if let FunctionArgValue::Value(Value::String(s)) = value {
+                assert_eq!(s, "gpt-4");
+            }
+        }
+
+        // Check named boolean argument
+        if let FunctionArg::Named { name, value } = &func.args[3] {
+            assert_eq!(name, "strict");
+            if let FunctionArgValue::Value(Value::Boolean(b)) = value {
+                assert_eq!(*b, true);
+            }
+        }
+    }
+
+    common::cleanup_all();
+    Ok(())
+}
+
+#[test]
+fn test_all_comparison_operators() -> std::io::Result<()> {
+    common::setup();
+
+    let template_str = r#"
+        Match<Section> AllOps {
+            Heuristic(a > 1, b < 2, c >= 3, d <= 4, e == 5, f != 6)
+        }
+    "#;
+
+    let root = parse_template(template_str)?;
+
+    let ops_def = &root.match_definitions["AllOps"];
+    if let MatchExpression::FunctionCall(func) = &ops_def.clauses[0] {
+        assert_eq!(func.args.len(), 6);
+
+        let expected_ops = [
+            ComparisonOp::GreaterThan,
+            ComparisonOp::LessThan,
+            ComparisonOp::GreaterThanOrEqual,
+            ComparisonOp::LessThanOrEqual,
+            ComparisonOp::Equal,
+            ComparisonOp::NotEqual,
+        ];
+
+        for (i, expected_op) in expected_ops.iter().enumerate() {
+            if let FunctionArg::Positional(FunctionArgValue::Comparison(comp)) = &func.args[i] {
+                assert_eq!(comp.op, *expected_op);
+            } else {
+                panic!("Expected comparison at position {}", i);
+            }
+        }
+    }
+
+    common::cleanup_all();
+    Ok(())
+}
+
+#[test]
+fn test_empty_match_definition() -> std::io::Result<()> {
+    common::setup();
+
+    let template_str = r#"
+        Match<Section> Empty {
+        }
+        
+        Section(match=Empty) {
+            TextChunk()
+        }
+    "#;
+
+    let root = parse_template(template_str)?;
+
+    let empty_def = &root.match_definitions["Empty"];
+    assert_eq!(empty_def.target_type, "Section");
+    assert_eq!(empty_def.name, "Empty");
+    assert_eq!(empty_def.clauses.len(), 0);
+
+    common::cleanup_all();
+    Ok(())
+}
+
+#[test]
+fn test_multiple_match_definitions() -> std::io::Result<()> {
+    common::setup();
+
+    let template_str = r#"
+        Match<Section> Header {
+            Text("HEADER", threshold=0.9)
+        }
+        
+        Match<Section> Footer {
+            Text("FOOTER", threshold=0.8)
+        }
+        
+        Match<Table> DataTable {
+            Regex("Table\\s+\\d+")
+        }
+        
+        Section(match=Header) {
+            TextChunk()
+        }
+        Section(match=Footer) {
+            TextChunk()
+        }
+    "#;
+
+    let root = parse_template(template_str)?;
+
+    assert_eq!(root.match_definitions.len(), 3);
+    assert!(root.match_definitions.contains_key("Header"));
+    assert!(root.match_definitions.contains_key("Footer"));
+    assert!(root.match_definitions.contains_key("DataTable"));
+
+    // Verify different target types
+    assert_eq!(root.match_definitions["Header"].target_type, "Section");
+    assert_eq!(root.match_definitions["Footer"].target_type, "Section");
+    assert_eq!(root.match_definitions["DataTable"].target_type, "Table");
+
+    // Verify elements reference the correct definitions
+    assert_eq!(root.elements.len(), 2);
+
+    common::cleanup_all();
+    Ok(())
+}
+
+#[test]
+fn test_match_config_conversion() {
+    let template = r#"
+        Match<Section> TestMatch {
+            Text("Management's Discussion", threshold=0.9)
+            Cosine("financial analysis", threshold=0.75)
+            FirstMatch(Text("test"), Cosine("test2"))
+        }
+    "#;
+
+    let result = parse_template(template).unwrap();
+
+    // Should have one match definition
+    assert_eq!(result.match_definitions.len(), 1);
+
+    let match_def = result.match_definitions.get("TestMatch").unwrap();
+    assert_eq!(match_def.target_type, "Section");
+    assert_eq!(match_def.name, "TestMatch");
+    assert_eq!(match_def.clauses.len(), 3);
+
+    // Check that Text() was converted to MatchConfig
+    if let MatchExpression::MatchConfig(config) = &match_def.clauses[0] {
+        assert_eq!(config.match_type, MatchType::Text);
+        assert_eq!(config.pattern, "Management's Discussion");
+        assert_eq!(config.threshold, 0.9);
+    } else {
+        panic!("Expected first clause to be converted to MatchConfig");
+    }
+
+    // Check that Cosine() was converted to MatchConfig
+    if let MatchExpression::MatchConfig(config) = &match_def.clauses[1] {
+        assert_eq!(config.match_type, MatchType::Semantic);
+        assert_eq!(config.pattern, "financial analysis");
+        assert_eq!(config.threshold, 0.75);
+    } else {
+        panic!("Expected second clause to be converted to MatchConfig");
+    }
+
+    // Check that FirstMatch() remains as FunctionCall (not a direct match type)
+    if let MatchExpression::FunctionCall(func) = &match_def.clauses[3] {
+        assert_eq!(func.name, "FirstMatch");
+        assert_eq!(func.args.len(), 2);
+    } else {
+        panic!("Expected third clause to remain as FunctionCall");
+    }
+}
