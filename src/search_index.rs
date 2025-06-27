@@ -636,16 +636,6 @@ impl PdfIndex {
         // Cache-efficient: iterate through text store directly
         let mut results = Vec::new();
 
-        // Debug: print what we're searching for
-        println!(
-            "[find_text_matches] Searching for '{}' with threshold {}",
-            text, threshold
-        );
-        println!(
-            "[find_text_matches] Text store has {} elements",
-            self.text_store.text.len()
-        );
-
         // Iterate through the text column only (cache-friendly)
         for (text_store_idx, text_content) in self.text_store.text.iter().enumerate() {
             // Early check: if we can determine this element is before our start position, skip expensive scoring
@@ -656,10 +646,6 @@ impl PdfIndex {
             }
 
             let score = normalized_levenshtein(text, text_content);
-            println!(
-                "[find_text_matches] Text '{}' vs '{}' = score {}",
-                text, text_content, score
-            );
 
             if score >= threshold {
                 // Find the corresponding document index for this text element
@@ -669,32 +655,16 @@ impl PdfIndex {
                         // Check if we've exceeded the max_content_index limit
                         if let Some(max_idx) = max_content_index {
                             if doc_idx >= max_idx {
-                                println!("[find_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
                                 break;
                             }
                         }
 
-                        println!(
-                            "[find_text_matches] Match found: text_idx={}, doc_idx={}, score={}",
-                            text_store_idx, doc_idx, score
-                        );
                         results.push((TextHandle(text_store_idx as u32), score));
-                    } else {
-                        println!(
-                            "[find_text_matches] Match found but doc_idx {} < start {}",
-                            doc_idx, start
-                        );
                     }
-                } else {
-                    println!(
-                        "[find_text_matches] Match found but no doc_idx for text_idx {}",
-                        text_store_idx
-                    );
                 }
             }
         }
 
-        println!("[find_text_matches] Returning {} results", results.len());
         results
     }
 
