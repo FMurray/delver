@@ -12,9 +12,6 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
-#[cfg(feature = "extension-module")]
-use tokio::runtime::Builder;
-
 use crate::fonts::{canonicalize_font_name, FontMetrics, FONT_METRICS};
 
 static IGNORE: &[&[u8]] = &[
@@ -77,15 +74,13 @@ pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
 }
 
 #[cfg(feature = "extension-module")]
-fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
-    Ok(Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(async move {
-            Document::load_filtered(path, filter_func)
-                .await
-                .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
-        })?)
+pub fn load_pdf<P: AsRef<Path>>(path: P) -> Result<Document, Error> {
+    if !cfg!(debug_assertions) {
+        Document::load(path).map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+    } else {
+        Document::load_filtered(path, filter_func)
+            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+    }
 }
 
 /// Struct for how the text is tokenized

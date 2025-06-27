@@ -1,0 +1,14 @@
+# Alternative: Run with command-line cProfile
+python -m cProfile -s cumulative examples/basic.py
+
+# Save profile to file:
+python -m cProfile -o profile.prof examples/basic.py
+
+# Analyze saved profile:
+python -m pstats profile.prof
+
+# Memory profiling with memory_profiler (pip install memory-profiler):
+python -m memory_profiler examples/basic.py
+
+# Line-by-line profiling with line_profiler (pip install line_profiler):
+kernprof -l -v examples/basic.py

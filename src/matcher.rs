@@ -448,12 +448,6 @@ fn match_section<'a, 'map_lt>(
     let match_config = template.attributes.get("match")?.as_match_config()?;
 
     let effective_search_start_index = current_search_start_index;
-    println!(
-        "[match_section] For '{}', using effective_search_start_index: {}. Prev_match_context: {}",
-        template.name,
-        effective_search_start_index,
-        prev_match_for_context.map_or("None", |m| m.template_element.name.as_str())
-    );
 
     // ------------------------------------------------------------------
     // Limit the start‑marker text search to the parent section’s boundary,
@@ -487,8 +481,6 @@ fn match_section<'a, 'map_lt>(
         &match_config, // Pass the match_config for consistent threshold handling
         prev_match_for_context,
     );
-
-    println!("[match_section] End candidates: {:?}", end_candidates_opt);
 
     // Choose end marker:
     //   a) the best explicit/style candidate, OR
@@ -615,11 +607,6 @@ fn match_section<'a, 'map_lt>(
 
     // Handle child elements
     if !template.children.is_empty() {
-        println!(
-            "[match_section] Parent '{}' has {} children in template.",
-            template.name,
-            template.children.len()
-        );
         if let Some(child_matches) = align_template_with_content_with_depth(
             &template.children,
             index,
@@ -627,21 +614,8 @@ fn match_section<'a, 'map_lt>(
             Some(&result),
             recursion_depth + 1, // Increment depth for child processing
         ) {
-            println!("[match_section] Parent '{}' got Some(child_matches) with len: {}. Assigning to result.children.", template.name, child_matches.len());
             result.children = child_matches;
-        } else {
-            println!("[match_section] Parent '{}' got None for child_matches. result.children will be empty.", template.name);
         }
-        println!(
-            "[match_section] After child processing, Parent '{}' result.children.len is now: {}",
-            template.name,
-            result.children.len()
-        );
-    } else {
-        println!(
-            "[match_section] Parent '{}' has no children in template.",
-            template.name
-        );
     }
 
     Some(result)
@@ -658,17 +632,12 @@ fn find_start_boundary_candidates<'a>(
 ) -> Option<Vec<BoundaryCandidate>> {
     let mut candidates = Vec::new();
 
-    println!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
     // 1. Text-based candidates
     let text_matches = index.find_text_matches(
         &match_config.pattern,
         match_config.threshold,
         Some(start_index),
         max_search_index,
-    );
-    println!(
-        "[find_start_boundary_candidates] Text-based candidates found: {}",
-        text_matches.len()
     );
 
     for (text_handle, score) in text_matches {
@@ -687,14 +656,9 @@ fn find_start_boundary_candidates<'a>(
     }
 
     if candidates.is_empty() {
-        println!("[find_start_boundary_candidates] No candidates found. Returning None.");
         None
     } else {
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        println!(
-            "[find_start_boundary_candidates] Returning {} sorted candidates.",
-            candidates.len()
-        );
         Some(candidates)
     }
 }
@@ -709,44 +673,22 @@ fn find_end_boundary_candidates<'a>(
     match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
 ) -> Option<Vec<BoundaryCandidate>> {
-    println!(
-        "[find_end_boundary_candidates] Looking for end for section starting with: {:?}",
-        start_content.text()
-    );
-    println!(
-        "[find_end_boundary_candidates] Template name: '{}', attributes: {:?}",
-        template.name, template.attributes
-    );
     let mut candidates = Vec::new();
 
     // Get the start marker's index so we can search after it
     let start_marker_index = index.element_id_to_index.get(&start_content.id()).copied();
-    println!(
-        "[find_end_boundary_candidates] Start marker index: {:?}",
-        start_marker_index
-    );
 
     // 1. Template-based end markers
     if let Some(end_match_attr) = template.attributes.get("end_match") {
         if let Some(end_str) = end_match_attr.as_string() {
-            println!(
-                "[find_end_boundary_candidates] Using end_match attribute: '{}', threshold: {}",
-                end_str, match_config.threshold
-            );
-
             // Start search after the start marker, not from the beginning of the document
             let search_start_index = start_marker_index.map(|idx| idx + 1);
-            println!("[find_end_boundary_candidates] Searching for end markers starting from index: {:?}", search_start_index);
 
             let end_text_matches = index.find_text_matches(
                 &end_str,
                 match_config.threshold,
                 search_start_index, // Use match_config.threshold instead of hardcoded value
                 None,
-            );
-            println!(
-                "[find_end_boundary_candidates] Found {} text candidates for end_match.",
-                end_text_matches.len()
             );
             for (text_handle, score) in end_text_matches {
                 let txt_ref = index.text(text_handle);
@@ -766,13 +708,8 @@ fn find_end_boundary_candidates<'a>(
 
                 candidates.push(bc);
             }
-        } else {
-            println!(
-                "[find_end_boundary_candidates] end_match attribute found but not a string value."
-            );
         }
     } else {
-        println!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");
         // If no end_match is specified, we might want a default behavior,
         // for example, consider all elements after start_content on the same page,
         // or up to the start of a *next* identifiable section if one exists soon.
@@ -813,21 +750,13 @@ fn find_end_boundary_candidates<'a>(
                 index.doc_len()
             };
 
-            println!(
-                "[find_end_boundary_candidates] Max content boundary: {}",
-                max_content_boundary
-            );
-
             let similar = index.top_k_similar_text(
                 start_text,
                 start_idx + 1,        // search after the start marker
                 max_content_boundary, // bounded by previous section boundaries
                 K_SIMILAR,
             );
-            println!(
-                "[find_end_boundary_candidates] Found {} similar text elements.",
-                similar.len()
-            );
+
             for (text_handle, sim) in similar {
                 let txt_ref = index.text(text_handle);
                 let pc = PageContent::Text(TextElement {
@@ -838,10 +767,6 @@ fn find_end_boundary_candidates<'a>(
                     bbox: txt_ref.bbox,
                     page_number: txt_ref.page_number,
                 });
-                println!(
-                    "[find_end_boundary_candidates] Similar text element: {:?}",
-                    pc
-                );
 
                 // Avoid duplicates – if already present, just update its score
                 if let Some(existing) = candidates.iter_mut().find(|c| c.content.id() == pc.id()) {
@@ -863,7 +788,6 @@ fn find_end_boundary_candidates<'a>(
     }
 
     if candidates.is_empty() {
-        println!("[find_end_boundary_candidates] No end candidates found. Returning None.");
         None
     } else {
         // Order by document position to pick the first valid boundary.
@@ -878,10 +802,6 @@ fn find_end_boundary_candidates<'a>(
                 })
         });
 
-        println!(
-            "[find_end_boundary_candidates] Returning {} sorted end candidates.",
-            candidates.len()
-        );
         Some(candidates)
     }
 }
@@ -1013,7 +933,6 @@ fn match_text_chunk_with_boundaries<'a>(
     }
 
     if !has_text_content {
-        println!("[match_text_chunk_with_boundaries] No text content found");
         return None;
     }
 
