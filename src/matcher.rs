@@ -149,6 +149,11 @@ fn align_template_with_content_with_depth<'a>(
         return None;
     }
 
+    println!(
+        "align_template_with_content_with_depth: {:?}",
+        template_elements
+    );
+
     // Recursion depth guard
     if recursion_depth > MAX_RECURSION_DEPTH {
         warn!(
@@ -210,6 +215,8 @@ fn align_template_with_content_with_depth<'a>(
 
     for template_element in template_elements {
         if template_element.element_type == ElementType::Section {
+            println!("  PASS 1: Processing Section '{:#?}'", template_element);
+
             // Determine which context to pass: previous sibling for most sections,
             // but for the *last* section pass the parent so it can inherit the
             // parent's end boundary when it has none of its own.
@@ -268,7 +275,6 @@ fn align_template_with_content_with_depth<'a>(
                 );
             }
 
-            log_mem("before match_section");
             if let Some(section_match) = match_section(
                 template_element,
                 index,
@@ -445,7 +451,9 @@ fn match_section<'a, 'map_lt>(
     current_search_start_index: usize,
     recursion_depth: usize,
 ) -> Option<TemplateContentMatch<'a>> {
-    let match_config = template.attributes.get("match")?.as_match_config()?;
+    println!("match_section template: {:?}", template);
+    let match_config = template.match_config.as_ref()?;
+    println!("match_section config: {:?}", match_config);
 
     let effective_search_start_index = current_search_start_index;
     println!(
@@ -470,7 +478,7 @@ fn match_section<'a, 'map_lt>(
         template,
         index,
         effective_search_start_index,
-        &match_config,
+        match_config,
         prev_match_for_context,
         max_search_index,
     )?;
@@ -484,7 +492,7 @@ fn match_section<'a, 'map_lt>(
         template,
         index,
         &template.children,
-        &match_config, // Pass the match_config for consistent threshold handling
+        match_config, // Pass the match_config for consistent threshold handling
         prev_match_for_context,
     );
 
@@ -706,7 +714,7 @@ fn find_end_boundary_candidates<'a>(
     template: &Element,
     index: &'a PdfIndex,
     _children: &[Element],
-    match_config: &MatchConfig,
+    _match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
 ) -> Option<Vec<BoundaryCandidate>> {
     println!(
@@ -727,49 +735,46 @@ fn find_end_boundary_candidates<'a>(
     );
 
     // 1. Template-based end markers
-    if let Some(end_match_attr) = template.attributes.get("end_match") {
-        if let Some(end_str) = end_match_attr.as_string() {
-            println!(
-                "[find_end_boundary_candidates] Using end_match attribute: '{}', threshold: {}",
-                end_str, match_config.threshold
-            );
+    if let Some(config) = template.end_match_config.as_ref() {
+        println!(
+            "[find_end_boundary_candidates] Using end_match attribute: '{}', threshold: {}",
+            config.pattern, config.threshold
+        );
 
-            // Start search after the start marker, not from the beginning of the document
-            let search_start_index = start_marker_index.map(|idx| idx + 1);
-            println!("[find_end_boundary_candidates] Searching for end markers starting from index: {:?}", search_start_index);
+        // Start search after the start marker, not from the beginning of the document
+        let search_start_index = start_marker_index.map(|idx| idx + 1);
+        println!(
+            "[find_end_boundary_candidates] Searching for end markers starting from index: {:?}",
+            search_start_index
+        );
 
-            let end_text_matches = index.find_text_matches(
-                &end_str,
-                match_config.threshold,
-                search_start_index, // Use match_config.threshold instead of hardcoded value
-                None,
-            );
-            println!(
-                "[find_end_boundary_candidates] Found {} text candidates for end_match.",
-                end_text_matches.len()
-            );
-            for (text_handle, score) in end_text_matches {
-                let txt_ref = index.text(text_handle);
-                let element = PageContent::Text(TextElement {
-                    id: txt_ref.id,
-                    text: txt_ref.text.to_string(),
-                    font_size: txt_ref.font_size,
-                    font_name: txt_ref.font_name.map(|s| s.to_string()),
-                    bbox: txt_ref.bbox,
-                    page_number: txt_ref.page_number,
-                });
+        let end_text_matches = index.find_text_matches(
+            &config.pattern,
+            config.threshold,
+            search_start_index, // Use match_config.threshold instead of hardcoded value
+            None,
+        );
+        println!(
+            "[find_end_boundary_candidates] Found {} text candidates for end_match.",
+            end_text_matches.len()
+        );
+        for (text_handle, score) in end_text_matches {
+            let txt_ref = index.text(text_handle);
+            let element = PageContent::Text(TextElement {
+                id: txt_ref.id,
+                text: txt_ref.text.to_string(),
+                font_size: txt_ref.font_size,
+                font_name: txt_ref.font_name.map(|s| s.to_string()),
+                bbox: txt_ref.bbox,
+                page_number: txt_ref.page_number,
+            });
 
-                // Boost explicit end markers, but allow high-quality similarity matches to compete
-                let mut bc = score_candidate(&element, index, template, score, prev_match);
-                bc.score += 0.5; // Moderate boost to prioritize explicit markers while allowing high-similarity competition
-                bc.reasons.push("Explicit end marker".to_string());
+            // Boost explicit end markers, but allow high-quality similarity matches to compete
+            let mut bc = score_candidate(&element, index, template, score, prev_match);
+            bc.score += 0.5; // Moderate boost to prioritize explicit markers while allowing high-similarity competition
+            bc.reasons.push("Explicit end marker".to_string());
 
-                candidates.push(bc);
-            }
-        } else {
-            println!(
-                "[find_end_boundary_candidates] end_match attribute found but not a string value."
-            );
+            candidates.push(bc);
         }
     } else {
         println!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");

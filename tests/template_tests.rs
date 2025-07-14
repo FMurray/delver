@@ -369,7 +369,7 @@ fn test_match_config_conversion() {
     }
 
     // Check that FirstMatch() remains as FunctionCall (not a direct match type)
-    if let MatchExpression::FunctionCall(func) = &match_def.clauses[3] {
+    if let MatchExpression::FunctionCall(func) = &match_def.clauses[2] {
         assert_eq!(func.name, "FirstMatch");
         assert_eq!(func.args.len(), 2);
     } else {

@@ -57,6 +57,8 @@ pub struct Element {
     pub parent: Option<Weak<Element>>,
     pub prev_sibling: Option<Weak<Element>>,
     pub next_sibling: Option<Weak<Element>>,
+    pub match_config: Option<MatchConfig>,
+    pub end_match_config: Option<MatchConfig>,
 }
 
 impl Element {
@@ -69,6 +71,8 @@ impl Element {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
+            match_config: None,
+            end_match_config: None,
         }
     }
 
@@ -336,7 +340,9 @@ pub fn parse_template(template_str: &str) -> Result<Root, Error> {
             return Err(Error::new(ErrorKind::InvalidData, e.to_string()));
         }
     };
-    Ok(_parse_template(pairs))
+    let mut root = _parse_template(pairs);
+    resolve_match_configs(&mut root.elements, &root.match_definitions);
+    Ok(root)
 }
 
 fn _parse_template(pair: Pair<Rule>) -> Root {
@@ -426,6 +432,8 @@ fn process_element(pair: Pair<Rule>) -> Element {
         parent: None,
         prev_sibling: None,
         next_sibling: None,
+        match_config: None,
+        end_match_config: None,
     }
 }
 
@@ -514,6 +522,51 @@ fn process_match_definition(pair: Pair<Rule>) -> MatchDefinition {
         name,
         clauses,
     }
+}
+
+fn resolve_match_configs(
+    elements: &mut [Element],
+    match_definitions: &HashMap<String, MatchDefinition>,
+) {
+    for element in elements {
+        // Resolve match_config
+        if let Some(match_value) = element.attributes.get("match") {
+            element.match_config = match match_value {
+                Value::Identifier(id) => resolve_identifier_to_match_config(id, match_definitions),
+                _ => match_value.as_match_config(),
+            };
+        }
+
+        // Resolve end_match_config
+        if let Some(end_match_value) = element.attributes.get("end_match") {
+            element.end_match_config = match end_match_value {
+                Value::Identifier(id) => resolve_identifier_to_match_config(id, match_definitions),
+                _ => end_match_value.as_match_config(),
+            };
+        }
+
+        // Recurse for children
+        if !element.children.is_empty() {
+            resolve_match_configs(&mut element.children, match_definitions);
+        }
+    }
+}
+
+// Helper to resolve an identifier to a MatchConfig from the definitions map
+fn resolve_identifier_to_match_config(
+    id: &str,
+    match_definitions: &HashMap<String, MatchDefinition>,
+) -> Option<MatchConfig> {
+    match_definitions.get(id).and_then(|match_def| {
+        // Find the first clause that can be interpreted as a MatchConfig
+        match_def.clauses.iter().find_map(|clause| {
+            if let MatchExpression::MatchConfig(config) = clause {
+                Some(config.clone())
+            } else {
+                None
+            }
+        })
+    })
 }
 
 fn function_call_to_match_config(function_call: &FunctionCall) -> Option<MatchConfig> {
@@ -786,6 +839,7 @@ pub fn process_matched_content(
         &mut all_outputs,
         &mut global_chunk_counter,
         None, // parent_info: Option<(String, usize)>
+        &HashMap::new(),
     );
 
     all_outputs
@@ -798,8 +852,19 @@ fn process_matched_content_recursive(
     all_outputs: &mut Vec<ProcessedOutput>,
     global_chunk_counter: &mut usize,
     parent_info: Option<(String, usize)>, // (parent_name, parent_output_index)
+    parent_metadata: &HashMap<String, Value>,
 ) {
     for match_item in matched_items {
+        // Combine parent metadata with the current item's metadata.
+        // The current item's metadata will overwrite the parent's if keys conflict.
+        let mut current_metadata = parent_metadata.clone();
+        current_metadata.extend(
+            match_item
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+
         match &match_item.template_element.element_type {
             ElementType::TextChunk | ElementType::Paragraph => {
                 let text_elements_to_chunk: Vec<TextElement> = match_item
@@ -825,7 +890,7 @@ fn process_matched_content_recursive(
                     let chunk_outputs = process_text_chunk_elements_simple(
                         &text_elements_to_chunk,
                         &match_item.template_element,
-                        &match_item.metadata,
+                        &current_metadata,
                         parent_info.clone(),
                         global_chunk_counter,
                     );
@@ -865,7 +930,7 @@ fn process_matched_content_recursive(
                     let chunk_outputs = process_text_chunk_elements_simple(
                         &section_text_elements,
                         &match_item.template_element,
-                        &match_item.metadata,
+                        &current_metadata,
                         parent_info.clone(), // FIXED: Section's own content gets the parent info passed to this section
                         global_chunk_counter,
                     );
@@ -914,6 +979,7 @@ fn process_matched_content_recursive(
                                     all_outputs,
                                     global_chunk_counter,
                                     textchunk_parent_info,
+                                    &current_metadata,
                                 );
                             }
                             ElementType::Section => {
@@ -924,6 +990,7 @@ fn process_matched_content_recursive(
                                     all_outputs,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
+                                    &current_metadata,
                                 );
                             }
                             _ => {
@@ -934,6 +1001,7 @@ fn process_matched_content_recursive(
                                     all_outputs,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
+                                    &current_metadata,
                                 );
                             }
                         }
@@ -950,7 +1018,7 @@ fn process_matched_content_recursive(
                                 all_outputs.push(process_image_element_simple(
                                     &image_elem,
                                     &match_item.template_element,
-                                    &match_item.metadata,
+                                    &current_metadata,
                                     parent_info.clone(),
                                 ));
                                 image_processed = true;
@@ -992,7 +1060,7 @@ fn process_matched_content_recursive(
                     let chunk_outputs = process_text_chunk_elements_simple(
                         &table_text_elements,
                         &match_item.template_element,
-                        &match_item.metadata,
+                        &current_metadata,
                         parent_info.clone(),
                         global_chunk_counter,
                     );
