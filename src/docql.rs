@@ -39,12 +39,13 @@ pub struct LLMConfig {
 }
 
 #[derive(PestParserDerive)]
-#[grammar = "template.pest"]
+#[grammar = "docql.pest"]
 pub struct TemplateParser;
 
 #[derive(Debug)]
 pub struct Root {
     pub elements: Vec<Element>,
+    pub match_definitions: HashMap<String, MatchDefinition>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,8 @@ pub struct Element {
     pub parent: Option<Weak<Element>>,
     pub prev_sibling: Option<Weak<Element>>,
     pub next_sibling: Option<Weak<Element>>,
+    pub match_config: Option<MatchConfig>,
+    pub end_match_config: Option<MatchConfig>,
 }
 
 impl Element {
@@ -68,6 +71,8 @@ impl Element {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
+            match_config: None,
+            end_match_config: None,
         }
     }
 
@@ -182,6 +187,67 @@ impl Default for MatchConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MatchDefinition {
+    pub target_type: String,           // e.g., "Section"
+    pub name: String,                  // e.g., "MDandA"
+    pub clauses: Vec<MatchExpression>, // Ordered list of match expressions
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchExpression {
+    FunctionCall(FunctionCall),
+    MatchConfig(MatchConfig),
+    Value(Value),
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionCall {
+    pub name: String,           // e.g., "FirstMatch", "Text", "Cosine"
+    pub args: Vec<FunctionArg>, // Positional and named arguments
+}
+
+#[derive(Debug, Clone)]
+pub enum FunctionArg {
+    Positional(FunctionArgValue),
+    Named {
+        name: String,
+        value: FunctionArgValue,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum FunctionArgValue {
+    Value(Value),
+    Comparison(ComparisonExpr),
+    FunctionCall(FunctionCall),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum ComparisonOp {
+    GreaterThan,
+    LessThan,
+    GreaterThanOrEqual,
+    LessThanOrEqual,
+    Equal,
+    NotEqual,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum ComparisonValue {
+    String(String),
+    Number(i64),
+    Boolean(bool),
+    Identifier(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ComparisonExpr {
+    pub left: String, // identifier (e.g., "fontSize")
+    pub op: ComparisonOp,
+    pub right: ComparisonValue,
+}
+
 impl Value {
     // Add a helper to extract match config from attributes
     pub fn as_match_config(&self) -> Option<MatchConfig> {
@@ -235,7 +301,6 @@ impl Value {
         }
     }
 
-    // Existing methods...
     pub fn as_string(&self) -> Option<String> {
         match self {
             Value::String(s) => Some(s.clone()),
@@ -275,11 +340,14 @@ pub fn parse_template(template_str: &str) -> Result<Root, Error> {
             return Err(Error::new(ErrorKind::InvalidData, e.to_string()));
         }
     };
-    Ok(_parse_template(pairs))
+    let mut root = _parse_template(pairs);
+    resolve_match_configs(&mut root.elements, &root.match_definitions);
+    Ok(root)
 }
 
 fn _parse_template(pair: Pair<Rule>) -> Root {
     let mut elements = Vec::new();
+    let mut match_definitions = HashMap::new();
 
     match pair.as_rule() {
         Rule::template => {
@@ -288,6 +356,10 @@ fn _parse_template(pair: Pair<Rule>) -> Root {
                     Rule::expression => {
                         let element = process_element(inner_pair);
                         elements.push(element);
+                    }
+                    Rule::match_definition => {
+                        let match_def = process_match_definition(inner_pair);
+                        match_definitions.insert(match_def.name.clone(), match_def);
                     }
                     Rule::EOI => {}
                     rule => {
@@ -301,7 +373,10 @@ fn _parse_template(pair: Pair<Rule>) -> Root {
         }
     }
 
-    Root { elements }
+    Root {
+        elements,
+        match_definitions,
+    }
 }
 
 fn process_element(pair: Pair<Rule>) -> Element {
@@ -357,6 +432,8 @@ fn process_element(pair: Pair<Rule>) -> Element {
         parent: None,
         prev_sibling: None,
         next_sibling: None,
+        match_config: None,
+        end_match_config: None,
     }
 }
 
@@ -414,11 +491,337 @@ fn process_value(pair: Pair<Rule>) -> Value {
                 .collect();
             Value::Array(values)
         }
+
         rule => {
             error!("Unexpected value rule: {:?}", rule);
             Value::String(inner_pair.as_str().to_string())
         }
     }
+}
+
+fn process_match_definition(pair: Pair<Rule>) -> MatchDefinition {
+    let mut inner_rules = pair.into_inner();
+
+    // Skip "Match" keyword, get target type between < >
+    let target_type = inner_rules.next().unwrap().as_str().to_string();
+    let name = inner_rules.next().unwrap().as_str().to_string();
+
+    // Process the match body
+    let body_pair = inner_rules.next().unwrap(); // match_body
+    let mut clauses = Vec::new();
+
+    for expression_pair in body_pair.into_inner() {
+        if expression_pair.as_rule() == Rule::match_expression {
+            let clause = process_match_expression(expression_pair);
+            clauses.push(clause);
+        }
+    }
+
+    MatchDefinition {
+        target_type,
+        name,
+        clauses,
+    }
+}
+
+fn resolve_match_configs(
+    elements: &mut [Element],
+    match_definitions: &HashMap<String, MatchDefinition>,
+) {
+    for element in elements {
+        // Resolve match_config
+        if let Some(match_value) = element.attributes.get("match") {
+            element.match_config = match match_value {
+                Value::Identifier(id) => resolve_identifier_to_match_config(id, match_definitions),
+                _ => match_value.as_match_config(),
+            };
+        }
+
+        // Resolve end_match_config
+        if let Some(end_match_value) = element.attributes.get("end_match") {
+            element.end_match_config = match end_match_value {
+                Value::Identifier(id) => resolve_identifier_to_match_config(id, match_definitions),
+                _ => end_match_value.as_match_config(),
+            };
+        }
+
+        // Recurse for children
+        if !element.children.is_empty() {
+            resolve_match_configs(&mut element.children, match_definitions);
+        }
+    }
+}
+
+// Helper to resolve an identifier to a MatchConfig from the definitions map
+fn resolve_identifier_to_match_config(
+    id: &str,
+    match_definitions: &HashMap<String, MatchDefinition>,
+) -> Option<MatchConfig> {
+    match_definitions.get(id).and_then(|match_def| {
+        // Find the first clause that can be interpreted as a MatchConfig
+        match_def.clauses.iter().find_map(|clause| {
+            if let MatchExpression::MatchConfig(config) = clause {
+                Some(config.clone())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn function_call_to_match_config(function_call: &FunctionCall) -> Option<MatchConfig> {
+    match function_call.name.as_str() {
+        "Text" => {
+            // Text(pattern, threshold=0.8)
+            if function_call.args.is_empty() {
+                return None;
+            }
+
+            let pattern = match &function_call.args[0] {
+                FunctionArg::Positional(FunctionArgValue::Value(Value::String(s))) => s.clone(),
+                _ => return None,
+            };
+
+            let mut threshold = 0.8; // Default threshold for text matching
+            let mut options = HashMap::new();
+
+            // Process additional arguments
+            for arg in &function_call.args[1..] {
+                match arg {
+                    FunctionArg::Named { name, value } => {
+                        match name.as_str() {
+                            "threshold" => {
+                                if let FunctionArgValue::Value(Value::Number(n)) = value {
+                                    threshold = *n as f64 / 1000.0; // Convert from fixed-point
+                                }
+                            }
+                            _ => {
+                                // Store other options as-is
+                                if let FunctionArgValue::Value(v) = value {
+                                    options.insert(name.clone(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    FunctionArg::Positional(FunctionArgValue::Value(Value::Number(n))) => {
+                        // Second positional argument is threshold
+                        threshold = *n as f64 / 1000.0;
+                    }
+                    _ => {}
+                }
+            }
+
+            Some(MatchConfig {
+                match_type: MatchType::Text,
+                pattern,
+                threshold,
+                options,
+            })
+        }
+        "Cosine" | "Semantic" => {
+            // Cosine(pattern, threshold=0.7) or Semantic(pattern, threshold=0.7)
+            if function_call.args.is_empty() {
+                return None;
+            }
+
+            let pattern = match &function_call.args[0] {
+                FunctionArg::Positional(FunctionArgValue::Value(Value::String(s))) => s.clone(),
+                _ => return None,
+            };
+
+            let mut threshold = 0.7; // Default threshold for semantic matching
+            let mut options = HashMap::new();
+
+            // Process additional arguments
+            for arg in &function_call.args[1..] {
+                match arg {
+                    FunctionArg::Named { name, value } => match name.as_str() {
+                        "threshold" => {
+                            if let FunctionArgValue::Value(Value::Number(n)) = value {
+                                threshold = *n as f64 / 1000.0;
+                            }
+                        }
+                        _ => {
+                            if let FunctionArgValue::Value(v) = value {
+                                options.insert(name.clone(), v.clone());
+                            }
+                        }
+                    },
+                    FunctionArg::Positional(FunctionArgValue::Value(Value::Number(n))) => {
+                        threshold = *n as f64 / 1000.0;
+                    }
+                    _ => {}
+                }
+            }
+
+            Some(MatchConfig {
+                match_type: MatchType::Semantic,
+                pattern,
+                threshold,
+                options,
+            })
+        }
+        "Regex" => {
+            // Regex(pattern)
+            if function_call.args.is_empty() {
+                return None;
+            }
+
+            let pattern = match &function_call.args[0] {
+                FunctionArg::Positional(FunctionArgValue::Value(Value::String(s))) => s.clone(),
+                _ => return None,
+            };
+
+            let mut options = HashMap::new();
+
+            // Process additional arguments
+            for arg in &function_call.args[1..] {
+                if let FunctionArg::Named { name, value } = arg {
+                    if let FunctionArgValue::Value(v) = value {
+                        options.insert(name.clone(), v.clone());
+                    }
+                }
+            }
+
+            Some(MatchConfig {
+                match_type: MatchType::Regex,
+                pattern,
+                threshold: 1.0, // Regex is exact match
+                options,
+            })
+        }
+        _ => None, // Unknown function types remain as FunctionCall
+    }
+}
+
+fn process_match_expression(pair: Pair<Rule>) -> MatchExpression {
+    let inner_pair = if pair.as_rule() == Rule::match_expression {
+        pair.into_inner().next().unwrap()
+    } else {
+        pair
+    };
+
+    match inner_pair.as_rule() {
+        Rule::function_call => {
+            let function_call = process_function_call(inner_pair);
+            // Try to convert to MatchConfig if it's a known match type
+            if let Some(match_config) = function_call_to_match_config(&function_call) {
+                MatchExpression::MatchConfig(match_config)
+            } else {
+                MatchExpression::FunctionCall(function_call)
+            }
+        }
+        Rule::value => MatchExpression::Value(process_value(inner_pair)),
+        _ => {
+            // Fallback for other value types
+            MatchExpression::Value(process_value(inner_pair))
+        }
+    }
+}
+
+fn process_function_call(pair: Pair<Rule>) -> FunctionCall {
+    let mut inner_rules = pair.into_inner();
+    let name = inner_rules.next().unwrap().as_str().to_string();
+
+    let mut args = Vec::new();
+
+    // Process function arguments if they exist
+    if let Some(args_pair) = inner_rules.next() {
+        if args_pair.as_rule() == Rule::function_args {
+            for arg_pair in args_pair.into_inner() {
+                if arg_pair.as_rule() == Rule::function_arg {
+                    args.push(process_function_arg(arg_pair));
+                }
+            }
+        }
+    }
+
+    FunctionCall { name, args }
+}
+
+fn process_function_arg(pair: Pair<Rule>) -> FunctionArg {
+    let mut inner_rules = pair.into_inner();
+
+    // Check if this is a named argument (identifier = value) or positional (just value)
+    let first_pair = inner_rules.next().unwrap();
+
+    if let Some(second_pair) = inner_rules.next() {
+        // This is a named argument: identifier = function_arg_value
+        let name = first_pair.as_str().to_string();
+        let value = process_function_arg_value(second_pair);
+        FunctionArg::Named { name, value }
+    } else {
+        // This is a positional argument: just function_arg_value
+        let value = process_function_arg_value(first_pair);
+        FunctionArg::Positional(value)
+    }
+}
+
+fn process_function_arg_value(pair: Pair<Rule>) -> FunctionArgValue {
+    let inner_pair = if pair.as_rule() == Rule::function_arg_value {
+        pair.into_inner().next().unwrap()
+    } else {
+        pair
+    };
+
+    match inner_pair.as_rule() {
+        Rule::comparison_expr => FunctionArgValue::Comparison(process_comparison_expr(inner_pair)),
+        Rule::function_call => FunctionArgValue::FunctionCall(process_function_call(inner_pair)),
+        _ => FunctionArgValue::Value(process_value(inner_pair)),
+    }
+}
+
+fn process_comparison_expr(pair: Pair<Rule>) -> ComparisonExpr {
+    let mut inner_rules = pair.into_inner();
+    let left = inner_rules.next().unwrap().as_str().to_string();
+    let op_pair = inner_rules.next().unwrap();
+    let comparison_value_pair = inner_rules.next().unwrap(); // This should be Rule::comparison_value
+
+    // Process the comparison_value rule which contains the actual value
+    let right_pair = comparison_value_pair.into_inner().next().unwrap();
+
+    // Convert from the restricted comparison value to ComparisonValue
+    let right = match right_pair.as_rule() {
+        Rule::string => {
+            let s = right_pair.as_str();
+            ComparisonValue::String(s[1..s.len() - 1].to_string()) // Remove quotes
+        }
+        Rule::number => {
+            let n = right_pair.as_str().parse::<f64>().unwrap();
+            if n.fract() == 0.0 {
+                ComparisonValue::Number(n as i64)
+            } else {
+                ComparisonValue::Number((n * 1000.0) as i64) // Store as fixed-point
+            }
+        }
+        Rule::boolean => {
+            let b = right_pair.as_str().parse::<bool>().unwrap();
+            ComparisonValue::Boolean(b)
+        }
+        Rule::identifier => ComparisonValue::Identifier(right_pair.as_str().to_string()),
+        _ => {
+            error!(
+                "Unexpected comparison value rule: {:?}",
+                right_pair.as_rule()
+            );
+            ComparisonValue::String(right_pair.as_str().to_string()) // Fallback
+        }
+    };
+
+    let op = match op_pair.as_str() {
+        ">" => ComparisonOp::GreaterThan,
+        "<" => ComparisonOp::LessThan,
+        ">=" => ComparisonOp::GreaterThanOrEqual,
+        "<=" => ComparisonOp::LessThanOrEqual,
+        "==" => ComparisonOp::Equal,
+        "!=" => ComparisonOp::NotEqual,
+        _ => {
+            error!("Unknown comparison operator: {}", op_pair.as_str());
+            ComparisonOp::Equal // Default fallback
+        }
+    };
+
+    ComparisonExpr { left, op, right }
 }
 
 // Process the matched content to generate chunks or image data
@@ -436,6 +839,7 @@ pub fn process_matched_content(
         &mut all_outputs,
         &mut global_chunk_counter,
         None, // parent_info: Option<(String, usize)>
+        &HashMap::new(),
     );
 
     all_outputs
@@ -448,8 +852,19 @@ fn process_matched_content_recursive(
     all_outputs: &mut Vec<ProcessedOutput>,
     global_chunk_counter: &mut usize,
     parent_info: Option<(String, usize)>, // (parent_name, parent_output_index)
+    parent_metadata: &HashMap<String, Value>,
 ) {
     for match_item in matched_items {
+        // Combine parent metadata with the current item's metadata.
+        // The current item's metadata will overwrite the parent's if keys conflict.
+        let mut current_metadata = parent_metadata.clone();
+        current_metadata.extend(
+            match_item
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+
         match &match_item.template_element.element_type {
             ElementType::TextChunk | ElementType::Paragraph => {
                 let text_elements_to_chunk: Vec<TextElement> = match_item
@@ -475,7 +890,7 @@ fn process_matched_content_recursive(
                     let chunk_outputs = process_text_chunk_elements_simple(
                         &text_elements_to_chunk,
                         &match_item.template_element,
-                        &match_item.metadata,
+                        &current_metadata,
                         parent_info.clone(),
                         global_chunk_counter,
                     );
@@ -515,7 +930,7 @@ fn process_matched_content_recursive(
                     let chunk_outputs = process_text_chunk_elements_simple(
                         &section_text_elements,
                         &match_item.template_element,
-                        &match_item.metadata,
+                        &current_metadata,
                         parent_info.clone(), // FIXED: Section's own content gets the parent info passed to this section
                         global_chunk_counter,
                     );
@@ -564,6 +979,7 @@ fn process_matched_content_recursive(
                                     all_outputs,
                                     global_chunk_counter,
                                     textchunk_parent_info,
+                                    &current_metadata,
                                 );
                             }
                             ElementType::Section => {
@@ -574,6 +990,7 @@ fn process_matched_content_recursive(
                                     all_outputs,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
+                                    &current_metadata,
                                 );
                             }
                             _ => {
@@ -584,6 +1001,7 @@ fn process_matched_content_recursive(
                                     all_outputs,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
+                                    &current_metadata,
                                 );
                             }
                         }
@@ -600,7 +1018,7 @@ fn process_matched_content_recursive(
                                 all_outputs.push(process_image_element_simple(
                                     &image_elem,
                                     &match_item.template_element,
-                                    &match_item.metadata,
+                                    &current_metadata,
                                     parent_info.clone(),
                                 ));
                                 image_processed = true;
@@ -642,7 +1060,7 @@ fn process_matched_content_recursive(
                     let chunk_outputs = process_text_chunk_elements_simple(
                         &table_text_elements,
                         &match_item.template_element,
-                        &match_item.metadata,
+                        &current_metadata,
                         parent_info.clone(),
                         global_chunk_counter,
                     );

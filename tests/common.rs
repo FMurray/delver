@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 use uuid::Uuid;
 
-use delver_pdf::dom::{Element, ElementType, Value};
+use delver_pdf::docql::{Element, ElementType, Value};
 use delver_pdf::layout::MatchContext;
 use delver_pdf::matcher::TemplateContentMatch;
 use delver_pdf::parse::{ImageElement, PageContent, PageContents, TextElement};
