@@ -5,14 +5,14 @@ use std::io::{Error, ErrorKind};
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::geo::{multiply_matrices, pre_translate, transform_rect, Matrix, Rect, IDENTITY_MATRIX};
+use crate::geo::{IDENTITY_MATRIX, Matrix, Rect, multiply_matrices, pre_translate, transform_rect};
 use crate::layout::MatchContext;
 use lopdf::{Dictionary, Document, Encoding, Error as LopdfError, Object, Result as LopdfResult};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
-use crate::fonts::{canonicalize_font_name, FontMetrics, FONT_METRICS};
+use crate::fonts::{FONT_METRICS, FontMetrics, canonicalize_font_name};
 
 static IGNORE: &[&[u8]] = &[
     b"Length",
@@ -1283,7 +1283,7 @@ fn get_page_elements(
     for bbox in &mut page_contents.image_store.bbox {
         // Transform image bbox as well
         let transformed_bbox = transform_rect(bbox, &IDENTITY_MATRIX); // Using Identity, assumes bbox is already in page space?
-                                                                       // TODO: Verify CTM usage for image bbox
+        // TODO: Verify CTM usage for image bbox
         let top_left_bbox = Rect {
             x0: transformed_bbox.x0,
             y0: mediabox.y1 - transformed_bbox.y1,
@@ -1298,6 +1298,24 @@ fn get_page_elements(
 
 pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {
     let mut destinations: IndexMap<String, Object> = IndexMap::new();
+
+    // if let Ok(catalog) = doc.catalog()
+    //     && let Ok(dests_ref) = catalog.get(b"Dests")
+    //     && let Ok(dests_dict) = doc.get_object(dests_ref)
+    //     && let Ok(dict) = dests_dict.as_dict()
+    // {
+    //     for (key, value) in dict.iter() {
+    //         let dest_name = String::from_utf8_lossy(key).to_string();
+
+    //         let dest_obj = if let Ok(dest_ref) = value.as_reference() {
+    //             doc.get_object(dest_ref).unwrap_or(value)
+    //         } else {
+    //             value
+    //         };
+
+    //         destinations.insert(dest_name, dest_obj.to_owned());
+    //     }
+    // }
 
     if let Ok(catalog) = doc.catalog() {
         if let Ok(dests_ref) = catalog.get(b"Dests") {

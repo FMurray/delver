@@ -127,6 +127,8 @@ impl TemplateBuilder {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
+            match_config: None,
+            end_match_config: None,
         };
 
         self.elements.push(element);
@@ -140,8 +142,8 @@ impl TemplateBuilder {
 
 pub struct SectionBuilder {
     name: String,
-    match_pattern: Option<String>,
-    end_match_pattern: Option<String>,
+    match_pattern: Option<Value>,
+    end_match_pattern: Option<Value>,
     as_name: Option<String>,
     children: Vec<Element>,
     parent: TemplateBuilder,
@@ -160,22 +162,22 @@ impl SectionBuilder {
     }
 
     pub fn match_pattern(mut self, pattern: &str) -> Self {
-        self.match_pattern = Some(pattern.to_string());
+        self.match_pattern = Some(Value::String(pattern.to_string()));
         self
     }
 
     pub fn match_pattern_with_threshold(mut self, pattern: &str, threshold: f64) -> Self {
         // Store as an array format that as_match_config can parse
-        self.match_pattern = Some(format!(
-            "[{:?}, {}, \"text\"]",
-            pattern,
-            (threshold * 1000.0) as i64
-        ));
+        self.match_pattern = Some(Value::Array(vec![
+            Value::String(pattern.to_string()),
+            Value::Number((threshold * 1000.0) as i64),
+            Value::String("text".to_string()),
+        ]));
         self
     }
 
     pub fn end_match(mut self, pattern: &str) -> Self {
-        self.end_match_pattern = Some(pattern.to_string());
+        self.end_match_pattern = Some(Value::String(pattern.to_string()));
         self
     }
 
@@ -197,6 +199,8 @@ impl SectionBuilder {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
+            match_config: None,
+            end_match_config: None,
         };
 
         self.children.push(child);
@@ -210,12 +214,18 @@ impl SectionBuilder {
     pub fn build(mut self) -> TemplateBuilder {
         let mut attributes = HashMap::new();
 
-        if let Some(pattern) = self.match_pattern {
-            attributes.insert("match".to_string(), Value::String(pattern));
+        let mut match_config = None;
+        if let Some(value) = &self.match_pattern {
+            attributes.insert("match".to_string(), value.clone());
+            match_config = value.as_match_config();
         }
-        if let Some(end_pattern) = self.end_match_pattern {
-            attributes.insert("end_match".to_string(), Value::String(end_pattern));
+
+        let mut end_match_config = None;
+        if let Some(value) = &self.end_match_pattern {
+            attributes.insert("end_match".to_string(), value.clone());
+            end_match_config = value.as_match_config();
         }
+
         if let Some(as_name) = self.as_name {
             attributes.insert("as".to_string(), Value::String(as_name));
         }
@@ -228,6 +238,8 @@ impl SectionBuilder {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
+            match_config,
+            end_match_config,
         };
 
         self.parent.elements.push(element);
@@ -237,8 +249,8 @@ impl SectionBuilder {
 
 pub struct ChildSectionBuilder {
     name: String,
-    match_pattern: Option<String>,
-    end_match_pattern: Option<String>,
+    match_pattern: Option<Value>,
+    end_match_pattern: Option<Value>,
     parent: SectionBuilder,
 }
 
@@ -253,23 +265,28 @@ impl ChildSectionBuilder {
     }
 
     pub fn match_pattern(mut self, pattern: &str) -> Self {
-        self.match_pattern = Some(pattern.to_string());
+        self.match_pattern = Some(Value::String(pattern.to_string()));
         self
     }
 
     pub fn end_match(mut self, pattern: &str) -> Self {
-        self.end_match_pattern = Some(pattern.to_string());
+        self.end_match_pattern = Some(Value::String(pattern.to_string()));
         self
     }
 
     pub fn build(mut self) -> SectionBuilder {
         let mut attributes = HashMap::new();
 
-        if let Some(pattern) = self.match_pattern {
-            attributes.insert("match".to_string(), Value::String(pattern));
+        let mut match_config = None;
+        if let Some(value) = &self.match_pattern {
+            attributes.insert("match".to_string(), value.clone());
+            match_config = value.as_match_config();
         }
-        if let Some(end_pattern) = self.end_match_pattern {
-            attributes.insert("end_match".to_string(), Value::String(end_pattern));
+
+        let mut end_match_config = None;
+        if let Some(value) = &self.end_match_pattern {
+            attributes.insert("end_match".to_string(), value.clone());
+            end_match_config = value.as_match_config();
         }
 
         let child = Element {
@@ -280,6 +297,8 @@ impl ChildSectionBuilder {
             parent: None,
             prev_sibling: None,
             next_sibling: None,
+            match_config,
+            end_match_config,
         };
 
         self.parent.children.push(child);
