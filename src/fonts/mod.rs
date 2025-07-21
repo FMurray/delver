@@ -2,7 +2,6 @@
 #![allow(unused_imports)]
 mod generated;
 
-// use crate::geo::Rect;
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
@@ -10,9 +9,6 @@ use lazy_static::lazy_static;
 pub mod canonicalize;
 pub use canonicalize::canonicalize_font_name;
 pub use generated::*;
-
-// Re-export the generated types
-// pub use super::FontMetrics;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
