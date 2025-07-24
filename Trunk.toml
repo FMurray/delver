@@ -1,1 +1,4 @@
- 
+[build]
+# The public URL from which assets are served.
+public_url = "/"
+target = "crates/viewer/index.html" 

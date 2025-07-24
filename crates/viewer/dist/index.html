@@ -9,7 +9,9 @@
     <!-- change this to your project name -->
     <title>eframe template</title>
 
+    
     <script src="/pdfium-4c54503433dadd32.js" integrity="sha384-s9/o/uIY5y86S3PWku9JD5BMjqI91BJshdMktT0KU9hTaeLGE4Yi8MvBOdEeIeZH"></script>
+
     
 <script type="module">
 async function __trunkInitializer(init, source, sourceSize, initializer, initWithObject) {
@@ -78,7 +80,7 @@ async function __trunkInitializer(init, source, sourceSize, initializer, initWit
 
 
 import init, * as bindings from '/viewer-5f3981d2fd813bc5.js';
-import initializer from '/50e37bd8f5b803ba-initializer.js';
+import initializer from '/e850aef71a10b8b4-initializer.js';
 
 const wasm = await __trunkInitializer(init, '/viewer-5f3981d2fd813bc5_bg.wasm', 26548513, initializer(), true);
 
@@ -185,7 +187,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             }
         }
     </style>
-<link rel="modulepreload" href="/viewer-5f3981d2fd813bc5.js" crossorigin="anonymous" integrity="sha384-FMRdk3mKVQIz4Y0/9AOJL7O0bMCf7X8RKF0eCGbt2NMU1klagg8upNFCKT13ItxA"><link rel="modulepreload" href="/50e37bd8f5b803ba-initializer.js" crossorigin="anonymous" integrity="sha384-cB5nlmM692SqSczXqSYV7QPoOkSF829t6BXNvtezp8Br7GvlscMOMdK9xLC4ZSR2"><link rel="preload" href="/viewer-5f3981d2fd813bc5_bg.wasm" crossorigin="anonymous" integrity="sha384-6DhEQ9ypVQWt34GnTtA2bMqngb7P3dJNd32FckYO9xUBueBWOdU0YVdGnE5H5PgT" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/viewer-5f3981d2fd813bc5.js" crossorigin="anonymous" integrity="sha384-FMRdk3mKVQIz4Y0/9AOJL7O0bMCf7X8RKF0eCGbt2NMU1klagg8upNFCKT13ItxA"><link rel="modulepreload" href="/e850aef71a10b8b4-initializer.js" crossorigin="anonymous" integrity="sha384-ebdRc/kOeMCIjOQEYM3loNSwZW7alzZLzI8C00kR1jcaEB+bVMvWyUFV4e1NtEJV"><link rel="preload" href="/viewer-5f3981d2fd813bc5_bg.wasm" crossorigin="anonymous" integrity="sha384-6DhEQ9ypVQWt34GnTtA2bMqngb7P3dJNd32FckYO9xUBueBWOdU0YVdGnE5H5PgT" as="fetch" type="application/wasm"></head>
 
 <body>
     <!-- The WASM code will resize the canvas dynamically -->
@@ -202,14 +204,14 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
     <!--Register Service Worker. this will cache the wasm / js scripts for offline use (for PWA functionality). -->
     <!-- Force refresh (Ctrl + F5) to load the latest files instead of cached files  -->
-    <script>
+    <!-- <script>
         // We disable caching during development so that we always view the latest version.
         if ('serviceWorker' in navigator && window.location.hash !== "#dev") {
             window.addEventListener('load', function () {
                 navigator.serviceWorker.register('sw.js');
             });
         }
-    </script>
+    </script> -->
 <script>"use strict";
 
 (function () {
