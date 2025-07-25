@@ -5,11 +5,13 @@ use eframe::egui;
 use pdfium_render::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use uuid::Uuid;
 
 #[cfg(target_arch = "wasm32")]
 use {
     futures_channel::oneshot,
+    std::sync::{LazyLock, Mutex},
     wasm_bindgen::{prelude::*, JsCast},
     wasm_bindgen_futures::JsFuture,
     web_sys::{window, File},
@@ -19,6 +21,58 @@ use crate::event_panel;
 use crate::match_panel;
 use crate::rendering;
 use crate::ui_controls;
+use crate::utils;
+
+// With the `sync` feature, Pdfium is thread-safe, so we can use std::sync primitives.
+#[cfg(target_arch = "wasm32")]
+static APP_STATE: LazyLock<Mutex<AppState>> = LazyLock::new(|| Mutex::new(AppState::Uninitialized));
+
+#[cfg(target_arch = "wasm32")]
+enum AppState {
+    Uninitialized,
+    Initialized(Viewer<'static>),
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn init_pdfium(pdfium_module: JsValue, rust_module: JsValue, debug: bool) -> bool {
+    // let bindings = match Pdfium::new(pdfium_module, rust_module, debug) {
+    //     Ok(bindings) => bindings,
+    //     Err(_) => return false,
+    // };
+
+    let pdfium = Pdfium::default();
+
+    let mut app_state = APP_STATE.lock().unwrap();
+
+    if let AppState::Uninitialized = *app_state {
+        *app_state = AppState::Initialized(Viewer::new_wasm(pdfium));
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct AppWrapper;
+
+#[cfg(target_arch = "wasm32")]
+impl AppWrapper {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl eframe::App for AppWrapper {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let mut app_state = APP_STATE.lock().unwrap();
+        if let AppState::Initialized(viewer) = &mut *app_state {
+            viewer.update(ctx, frame);
+        } else {
+            // Render a loading screen?
+        }
+    }
+}
 
 /// Main debug viewer application
 pub struct Viewer<'a> {
@@ -47,19 +101,15 @@ pub struct Viewer<'a> {
     pub show_match_panel: bool,
     pub highlighted_match: Option<(Uuid, Uuid)>,
     pub match_filter_threshold: f32,
-    #[cfg(target_arch = "wasm32")]
-    file_picker_channel: Option<oneshot::Receiver<Vec<u8>>>,
+    pub file_picker_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
 }
 
 impl<'a> Viewer<'a> {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
         let pdfium = Pdfium::new(
             Pdfium::bind_to_system_library().expect("failed to bind to system library"),
         );
-
-        #[cfg(target_arch = "wasm32")]
-        let pdfium = Pdfium::default();
 
         Self {
             pdfium,
@@ -87,8 +137,39 @@ impl<'a> Viewer<'a> {
             show_match_panel: false,
             highlighted_match: None,
             match_filter_threshold: 0.8,
-            #[cfg(target_arch = "wasm32")]
-            file_picker_channel: None,
+            file_picker_channel: channel(),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn new_wasm(pdfium: Pdfium) -> Self {
+        Self {
+            pdfium,
+            pdf_bytes: None,
+            pdf_document: None,
+            pdf_path: None,
+            blocks: Vec::new(),
+            debug_data: DebugDataStore::default(),
+            current_page: 0,
+            textures: Vec::new(),
+            pdf_dimensions: Vec::new(),
+            show_text: true,
+            show_lines: true,
+            show_blocks: true,
+            show_grid: false,
+            grid_spacing: 50.0,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            selected_bbox: None,
+            selected_line: None,
+            selected_fields: HashSet::new(),
+            selected_events: HashSet::new(),
+            show_tree_view: false,
+            show_matches: false,
+            show_match_panel: false,
+            highlighted_match: None,
+            match_filter_threshold: 0.8,
+            file_picker_channel: channel(),
         }
     }
 
@@ -102,6 +183,23 @@ impl<'a> Viewer<'a> {
                 // This is safe because the `pdf_bytes` are owned by the `Viewer`.
                 .map(|doc| std::mem::transmute::<PdfDocument<'_>, PdfDocument<'a>>(doc))
         };
+
+        // Reset state from previous PDF
+        self.blocks.clear();
+        self.debug_data = DebugDataStore::default();
+        self.current_page = 0;
+        self.textures.clear();
+        self.pdf_dimensions.clear();
+        self.zoom = 1.0;
+        self.pan = egui::Vec2::ZERO;
+        self.selected_bbox = None;
+        self.selected_line = None;
+        self.selected_fields.clear();
+        self.selected_events.clear();
+        self.highlighted_match = None;
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&"loaded pdf".into());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -113,34 +211,37 @@ impl<'a> Viewer<'a> {
 
     #[cfg(target_arch = "wasm32")]
     fn open_file_dialog(&mut self) {
-        let (sender, receiver) = oneshot::channel();
-        self.file_picker_channel = Some(receiver);
+        let task = rfd::AsyncFileDialog::new().pick_file();
+        let channel = self.file_picker_channel.0.clone();
 
-        let file_picker_task = async {
-            let file_handle = rfd::AsyncFileDialog::new().pick_file().await;
-            if let Some(file_handle) = file_handle {
-                let bytes = file_handle.read().await;
-                let _ = sender.send(bytes);
+        utils::exec_future(async move {
+            let file = task.await;
+            if let Some(file) = file {
+                let bytes = file.read().await;
+                web_sys::console::log_1(&bytes.len().into());
+                let _ = channel.send(bytes);
             }
-        };
-        wasm_bindgen_futures::spawn_local(file_picker_task);
+        });
     }
 
-    fn poll_for_file(&mut self) {
-        #[cfg(target_arch = "wasm32")]
-        if let Some(mut channel) = self.file_picker_channel.take() {
-            if let Ok(Some(bytes)) = channel.try_recv() {
-                self.load_pdf(bytes);
-            } else {
-                self.file_picker_channel = Some(channel);
-            }
-        }
-    }
-}
+    // fn poll_for_file(&mut self) {
+    //     #[cfg(target_arch = "wasm32")]
+    //     if let Some(mut channel) = self.file_picker_channel.take() {
+    //         if let Ok(Some(bytes)) = channel.try_recv() {
+    //             self.load_pdf(bytes);
+    //         } else {
+    //             self.file_picker_channel = Some(channel);
+    //         }
+    //     }
+    // }
 
-impl<'a> eframe::App for Viewer<'a> {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_for_file();
+        // self.poll_for_file();
+
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(bytes) = self.file_picker_channel.1.try_recv() {
+            self.load_pdf(bytes);
+        }
 
         if self.show_match_panel {
             match_panel::show_match_panel(self, ctx);
@@ -161,6 +262,7 @@ impl<'a> eframe::App for Viewer<'a> {
 
                 if ui.button("Open PDF").clicked() {
                     self.open_file_dialog();
+                    ui.ctx().request_repaint();
                 }
 
                 #[cfg(not(target_arch = "wasm32"))]
@@ -180,5 +282,11 @@ impl<'a> eframe::App for Viewer<'a> {
             // Render the PDF with all visualizations
             rendering::render_pdf_view(self, ui);
         });
+    }
+}
+
+impl<'a> eframe::App for Viewer<'a> {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update(ctx, _frame);
     }
 }

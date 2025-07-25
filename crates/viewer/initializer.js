@@ -1,19 +1,22 @@
-export default function() {
+export default function init_pdfium()  {
     return {
-        onStart: () => {
-            console.log("onStart");
-
-        },
         onSuccess: (wasm) => {
-            console.log("onSuccess");
-            console.log(wasm);
             PDFiumModule().then(async pdfiumModule => {
-                console.log("pdfiumModule", pdfiumModule);
-                wasm.initialize_pdfium_render(pdfiumModule, wasm);
+                wasm.initialize_pdfium_render(
+                    pdfiumModule, // Emscripten-wrapped Pdfium WASM module
+                    wasm, // wasm_bindgen-wrapped WASM module built from our Rust application
+                    false, // Debugging flag; set this to true to get tracing information logged to the Javascript console
+                )
+                console.assert(
+                    wasm.init_pdfium(
+                        pdfiumModule,
+                        wasm,
+                        false,
+                    ),
+                    "Initialization of pdfium-render failed!"
+                );
             })
-            //     console.log("pdfiumModule", pdfiumModule);
-            //     wasm.initialize_pdfium_render(pdfiumModule, wasm);
-            // })
         },
     }
-} 
+
+}

@@ -40,7 +40,7 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(viewer::app::Viewer::new(cc)))),
+                Box::new(|_cc| Ok(Box::new(viewer::app::AppWrapper::new()))),
             )
             .await;
 

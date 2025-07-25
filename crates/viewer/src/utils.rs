@@ -1,6 +1,7 @@
 use crate::app::Viewer;
 use delver_core::layout::{TextBlock, TextLine};
 use eframe::egui;
+use std::future::Future;
 use uuid::Uuid;
 
 /// Represents a transformation from PDF coordinates to screen coordinates
@@ -182,4 +183,9 @@ pub fn draw_bboxes(ui: &mut egui::Ui, blocks: &[TextBlock], transform: &ViewTran
             }
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn exec_future<F: Future<Output = ()> + 'static>(f: F) {
+    wasm_bindgen_futures::spawn_local(f);
 }

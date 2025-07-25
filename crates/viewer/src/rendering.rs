@@ -6,9 +6,19 @@ use pdfium_render::prelude::*;
 /// Render the PDF view with all visualizations
 pub fn render_pdf_view(viewer: &mut Viewer, ui: &mut egui::Ui) {
     if let Some(doc) = &viewer.pdf_document {
+        if viewer.pdf_dimensions.len() != doc.pages().len() as usize {
+            viewer.pdf_dimensions = doc
+                .pages()
+                .iter()
+                .map(|page| (page.width().value, page.height().value))
+                .collect();
+        }
+
         if let Some(page) = doc.pages().get(viewer.current_page as u16).ok() {
             let texture =
                 render_page_to_texture(&page, 1.0, ui.ctx(), egui::TextureOptions::LINEAR);
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::log_1(&"rendered page".into());
             let (rect, _transform) = utils::calculate_pdf_view_rect(viewer, ui, &texture);
             utils::draw_pdf_page(ui, &texture, rect);
         }
