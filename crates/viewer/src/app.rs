@@ -1,6 +1,7 @@
 use crate::stubs::DebugDataStore;
 use anyhow::Result;
 use delver_core::layout::TextBlock;
+use delver_core::process_pdf;
 use eframe::egui;
 use pdfium_render::prelude::*;
 use std::collections::HashSet;
@@ -36,11 +37,6 @@ enum AppState {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn init_pdfium(pdfium_module: JsValue, rust_module: JsValue, debug: bool) -> bool {
-    // let bindings = match Pdfium::new(pdfium_module, rust_module, debug) {
-    //     Ok(bindings) => bindings,
-    //     Err(_) => return false,
-    // };
-
     let pdfium = Pdfium::default();
 
     let mut app_state = APP_STATE.lock().unwrap();
@@ -224,23 +220,14 @@ impl<'a> Viewer<'a> {
         });
     }
 
-    // fn poll_for_file(&mut self) {
-    //     #[cfg(target_arch = "wasm32")]
-    //     if let Some(mut channel) = self.file_picker_channel.take() {
-    //         if let Ok(Some(bytes)) = channel.try_recv() {
-    //             self.load_pdf(bytes);
-    //         } else {
-    //             self.file_picker_channel = Some(channel);
-    //         }
-    //     }
-    // }
-
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // self.poll_for_file();
-
         #[cfg(target_arch = "wasm32")]
         if let Ok(bytes) = self.file_picker_channel.1.try_recv() {
-            self.load_pdf(bytes);
+            self.load_pdf(bytes.clone());
+            let template_str = "TextChunk(chunkSize=500, chunkOverlap=150)";
+            let (json, blocks, _doc) = process_pdf(&bytes, template_str, None).unwrap();
+            web_sys::console::log_1(&json.into());
+            self.blocks = blocks;
         }
 
         if self.show_match_panel {

@@ -25,6 +25,16 @@ pub struct FontMetrics {
     pub glyph_widths: HashMap<u32, f32>,
 }
 
+impl Default for &FontMetrics {
+    fn default() -> Self {
+        &FONT_METRICS.get("DejaVuSans").unwrap()
+    }
+}
+
+// lazy_static! {
+//     pub static ref FALLBACK_FONT_METRICS: FontMetrics = FontMetrics::default();
+// }
+
 // static UNIVERSAL_FALLBACK_FONT_METRICS: Lazy<FontMetrics> = Lazy::new(|| {
 //     // Replace with metrics that closely resemble your universal fallback font,
 //     // for instance, a metrics set matching DejaVuSans-Bold.

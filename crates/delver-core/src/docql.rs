@@ -828,7 +828,7 @@ fn process_comparison_expr(pair: Pair<Rule>) -> ComparisonExpr {
 pub fn process_matched_content(
     matched_items: &Vec<TemplateContentMatch>,
     index: &crate::search_index::PdfIndex, // Add index parameter to resolve handles
-    tokenizer: &Tokenizer,
+    tokenizer: Option<&Tokenizer>,
 ) -> Vec<ProcessedOutput> {
     let mut global_chunk_counter = 0;
     let mut all_outputs = Vec::new();
@@ -851,7 +851,7 @@ pub fn process_matched_content(
 fn process_matched_content_recursive(
     matched_items: &Vec<TemplateContentMatch>,
     index: &crate::search_index::PdfIndex,
-    tokenizer: &Tokenizer,
+    tokenizer: Option<&Tokenizer>,
     all_outputs: &mut Vec<ProcessedOutput>,
     global_chunk_counter: &mut usize,
     parent_info: Option<(String, usize)>, // (parent_name, parent_output_index)
@@ -1279,7 +1279,7 @@ fn process_text_chunk_elements_simple(
     metadata: &HashMap<String, Value>,
     parent_info: Option<(String, usize)>,
     global_chunk_counter: &mut usize,
-    tokenizer: &Tokenizer,
+    tokenizer: Option<&Tokenizer>,
 ) -> Vec<ChunkOutput> {
     // -------- 1. resolve parameters once --------
     let chunk_size = template_element
@@ -1324,16 +1324,19 @@ fn process_text_chunk_elements_simple(
         std::sync::Arc::new(out)
     };
 
-    let strategy = ChunkingStrategy::Tokens {
-        max_tokens: chunk_size,
-        chunk_overlap,
-        tokenizer: tokenizer.clone(),
+    let strategy = if let Some(tokenizer) = tokenizer {
+        ChunkingStrategy::Tokens {
+            max_tokens: chunk_size,
+            chunk_overlap,
+            tokenizer: tokenizer.clone(),
+        }
+    } else {
+        ChunkingStrategy::Characters {
+            max_chars: chunk_size,
+        }
     };
 
     // -------- 3. chunk the elements --------
-    // let strategy = ChunkingStrategy::Characters {
-    //     max_chars: chunk_size,
-    // };
     let chunks = chunk_text_elements(elements, &strategy, chunk_overlap);
 
     // -------- 4. Extract parent information --------

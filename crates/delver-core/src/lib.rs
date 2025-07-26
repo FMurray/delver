@@ -30,7 +30,7 @@ use tokenizers::Tokenizer;
 pub fn process_pdf(
     pdf_bytes: &[u8],
     template_str: &str,
-    tokenizer: &Tokenizer,
+    tokenizer: Option<&Tokenizer>,
 ) -> Result<(String, Vec<TextBlock>, Document)> {
     let dom = parse_template(template_str)?;
 

@@ -67,10 +67,8 @@ fn main() -> Result<()> {
     // Process PDF and launch viewer as before
     let pdf_bytes = fs::read(&args.pdf_path)?;
     let template_str = fs::read_to_string(&args.template)?;
-    let tokenizer = Tokenizer::from_pretrained(&args.tokenizer_model, None).unwrap_or_else(|e| {
-        panic!("Failed to load tokenizer: {}", e);
-    });
-    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, &tokenizer)?;
+    let tokenizer = Tokenizer::from_pretrained(&args.tokenizer_model, None).ok();
+    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref())?;
 
     match args.output {
         Some(path) => fs::write(&path, json)?,

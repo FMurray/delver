@@ -470,7 +470,7 @@ fn process_glyph(
             for ch in decoded_text.chars() {
                 let cid = ch as u32;
 
-                let metrics = ts.font.unwrap();
+                let metrics = ts.font.unwrap_or_default();
 
                 let tsm = Matrix {
                     a: ts.size * ts.scale / 1000.0,
