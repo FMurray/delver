@@ -185,6 +185,41 @@ pub fn draw_bboxes(ui: &mut egui::Ui, blocks: &[TextBlock], transform: &ViewTran
     }
 }
 
+fn select_element_at_position(viewer: &mut Viewer, pos: egui::Pos2, transform: ViewTransform) {
+    // Convert screen position to PDF coordinates
+    let pdf_x = (pos.x - transform.x_offset) / transform.scale;
+    let pdf_y = (pos.y - transform.y_offset) / transform.scale;
+
+    // Check if any line contains this point
+    for block in &viewer.blocks {
+        if block.page_number as usize == viewer.current_page + 1 {
+            for line in &block.lines {
+                if pdf_x >= line.bbox.0
+                    && pdf_x <= line.bbox.2
+                    && pdf_y >= line.bbox.1
+                    && pdf_y <= line.bbox.3
+                {
+                    // Set as selected line
+                    viewer.selected_line = Some(line.id);
+                    viewer.selected_bbox = Some(line.bbox);
+
+                    // If this line has a match, highlight it
+                    // if let Some((template_id, _)) = viewer.debug_data.get_matching_template(line.id)
+                    // {
+                    //     viewer.highlighted_match = Some((template_id, line.id));
+                    // }
+
+                    return;
+                }
+            }
+        }
+    }
+
+    // If no line was found, clear selection
+    viewer.selected_line = None;
+    viewer.selected_bbox = None;
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn exec_future<F: Future<Output = ()> + 'static>(f: F) {
     wasm_bindgen_futures::spawn_local(f);

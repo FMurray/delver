@@ -114,34 +114,60 @@ pub fn calculate_pdf_view_rect(
 
 /// Render the PDF view with all visualizations
 pub fn render_pdf_view(viewer: &mut Viewer, ui: &mut egui::Ui) {
-    if let Some(doc) = &viewer.pdf_document {
-        if viewer.pdf_dimensions.len() != doc.pages().len() as usize {
-            viewer.pdf_dimensions = doc
-                .pages()
-                .iter()
-                .map(|page| (page.width().value, page.height().value))
-                .collect();
+    if let (Some(doc), Some(texture)) = (
+        &viewer.pdf_document,
+        &viewer.textures.get(viewer.current_page),
+    ) {
+        let (rect, transform) = calculate_pdf_view_rect(viewer, ui, &texture);
+
+        // Create a response for interactions
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+        // Handle panning
+        if response.dragged() {
+            viewer.pan += response.drag_delta();
         }
 
-        if let Some(page) = doc.pages().get(viewer.current_page as u16).ok() {
-            let texture =
-                render_page_to_texture(&page, 1.0, ui.ctx(), egui::TextureOptions::LINEAR);
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::log_1(&"rendered page".into());
-            let (rect, transform) = calculate_pdf_view_rect(viewer, ui, &texture);
-            utils::draw_pdf_page(ui, &texture, rect);
+        // Handle zooming with scroll
+        if response.hovered() {
+            let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll_delta != 0.0 {
+                // Get mouse position relative to the image for zoom centering
+                let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+                if let Some(mouse_pos) = mouse_pos {
+                    // Adjust zoom
+                    let old_zoom = viewer.zoom;
+                    viewer.zoom *= 1.0 + (scroll_delta * 0.001).clamp(-0.1, 0.1);
+                    viewer.zoom = viewer.zoom.max(0.1).min(10.0);
 
-            let painter = ui.painter_at(rect);
-
-            // Draw blocks if enabled
-            if viewer.show_blocks {
-                draw_blocks(viewer, &painter, &transform);
+                    // Adjust pan to zoom toward cursor
+                    if old_zoom != viewer.zoom {
+                        let zoom_factor = viewer.zoom / old_zoom;
+                        let mouse_rel_x = mouse_pos.x - rect.min.x - viewer.pan.x;
+                        let mouse_rel_y = mouse_pos.y - rect.min.y - viewer.pan.y;
+                        viewer.pan.x -= mouse_rel_x * (zoom_factor - 1.0);
+                        viewer.pan.y -= mouse_rel_y * (zoom_factor - 1.0);
+                    }
+                }
             }
+        }
 
-            // Draw lines if enabled
-            if viewer.show_lines {
-                draw_lines(viewer, &painter, &transform);
-            }
+        let painter = ui.painter_at(rect);
+        painter.image(
+            texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+
+        // Draw blocks if enabled
+        if viewer.show_blocks {
+            draw_blocks(viewer, &painter, &transform);
+        }
+
+        // Draw lines if enabled
+        if viewer.show_lines {
+            draw_lines(viewer, &painter, &transform);
         }
     }
 }

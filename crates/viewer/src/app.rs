@@ -169,7 +169,7 @@ impl<'a> Viewer<'a> {
         }
     }
 
-    fn load_pdf(&mut self, bytes: Vec<u8>) {
+    fn load_pdf(&mut self, bytes: Vec<u8>, ctx: &egui::Context) {
         self.pdf_bytes = Some(bytes);
         self.pdf_document = unsafe {
             self.pdfium
@@ -180,19 +180,67 @@ impl<'a> Viewer<'a> {
                 .map(|doc| std::mem::transmute::<PdfDocument<'_>, PdfDocument<'a>>(doc))
         };
 
-        // Reset state from previous PDF
-        self.blocks.clear();
-        self.debug_data = DebugDataStore::default();
-        self.current_page = 0;
-        self.textures.clear();
-        self.pdf_dimensions.clear();
-        self.zoom = 1.0;
-        self.pan = egui::Vec2::ZERO;
-        self.selected_bbox = None;
-        self.selected_line = None;
-        self.selected_fields.clear();
-        self.selected_events.clear();
-        self.highlighted_match = None;
+        let pd = self.pdf_document.as_ref().unwrap();
+
+        // Initialize textures for each page
+        let mut textures = Vec::new();
+        let mut page_dimensions = Vec::new();
+
+        for page_index in 0..pd.pages().len() {
+            let page: PdfPage = pd
+                .pages()
+                .get(page_index)
+                .map_err(|e| anyhow::anyhow!("Failed to get page {}: {}", page_index, e))
+                .unwrap();
+
+            let width = page.width().value as i32;
+            let height = page.height().value as i32;
+            page_dimensions.push((width as f32, height as f32));
+
+            let render_config = PdfRenderConfig::new()
+                .set_target_width(width)
+                .set_target_height(height)
+                .use_lcd_text_rendering(true)
+                .render_annotations(true)
+                .render_form_data(false);
+
+            let bitmap: PdfBitmap = page
+                .render_with_config(&render_config)
+                .map_err(|e| anyhow::anyhow!("Failed to render page {}: {}", page_index, e))
+                .unwrap();
+
+            // Convert to RGBA - use as_rgba_bytes() which handles format conversion
+            let pixels = bitmap.as_rgba_bytes();
+
+            // Create egui texture
+            let texture = ctx.load_texture(
+                format!("page_{}", page_index),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &pixels,
+                ),
+                egui::TextureOptions::NEAREST,
+            );
+
+            textures.push(texture);
+        }
+
+        self.textures = textures;
+        self.pdf_dimensions = page_dimensions;
+
+        // // Reset state from previous PDF
+        // self.blocks.clear();
+        // self.debug_data = DebugDataStore::default();
+        // self.current_page = 0;
+        // self.textures.clear();
+        // self.pdf_dimensions.clear();
+        // self.zoom = 1.0;
+        // self.pan = egui::Vec2::ZERO;
+        // self.selected_bbox = None;
+        // self.selected_line = None;
+        // self.selected_fields.clear();
+        // self.selected_events.clear();
+        // self.highlighted_match = None;
 
         #[cfg(target_arch = "wasm32")]
         web_sys::console::log_1(&"loaded pdf".into());
@@ -223,7 +271,7 @@ impl<'a> Viewer<'a> {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_arch = "wasm32")]
         if let Ok(bytes) = self.file_picker_channel.1.try_recv() {
-            self.load_pdf(bytes.clone());
+            self.load_pdf(bytes.clone(), ctx);
             let template_str = "TextChunk(chunkSize=500, chunkOverlap=150)";
             let (json, blocks, _doc) = process_pdf(&bytes, template_str, None).unwrap();
             web_sys::console::log_1(&json.into());
@@ -256,7 +304,7 @@ impl<'a> Viewer<'a> {
                 if let Some(pdf_path) = &self.pdf_path {
                     if self.pdf_document.is_none() {
                         if let Ok(bytes) = std::fs::read(pdf_path) {
-                            self.load_pdf(bytes);
+                            self.load_pdf(bytes, ctx);
                         }
                     }
                 }
