@@ -6052,6 +6052,7 @@ dependencies = [
  "rfd",
  "rstar",
  "serde",
+ "serde_json",
  "tracing-wasm",
  "uuid",
  "wasm-bindgen",

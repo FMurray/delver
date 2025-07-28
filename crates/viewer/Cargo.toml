@@ -15,6 +15,7 @@ log = "0.4"
 lopdf = { workspace = true, features = ["nom_parser", "serde"] }
 rstar = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 geo = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
@@ -33,5 +34,5 @@ pdfium-render = { version = "0.8.34", features = ["sync"]}
 tracing-wasm = "0.2.1"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "console"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "console", "Storage"] }
 js-sys = "0.3"

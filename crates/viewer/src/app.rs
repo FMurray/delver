@@ -4,6 +4,7 @@ use delver_core::layout::TextBlock;
 use delver_core::process_pdf;
 use eframe::egui;
 use pdfium_render::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -21,6 +22,7 @@ use {
 use crate::event_panel;
 use crate::match_panel;
 use crate::rendering;
+use crate::store::{DocumentState, Store};
 use crate::ui_controls;
 use crate::utils;
 
@@ -76,6 +78,7 @@ pub struct Viewer<'a> {
     pdf_bytes: Option<Vec<u8>>,
     pub pdf_document: Option<PdfDocument<'a>>,
     pdf_path: Option<PathBuf>,
+    pub pdf_name: Option<String>,
     pub blocks: Vec<TextBlock>,
     pub debug_data: DebugDataStore,
     pub current_page: usize,
@@ -85,6 +88,8 @@ pub struct Viewer<'a> {
     pub show_lines: bool,
     pub show_blocks: bool,
     pub show_grid: bool,
+    pub store: Store,
+    pub current_document_id: Option<Uuid>,
     pub grid_spacing: f32,
     pub zoom: f32,
     pub pan: egui::Vec2,
@@ -100,6 +105,18 @@ pub struct Viewer<'a> {
     pub file_picker_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
 }
 
+#[derive(Serialize, Deserialize)]
+struct SerializableAppState {
+    // pdf_bytes: Option<Vec<u8>>,
+    pdf_name: Option<String>,
+    blocks: Vec<TextBlock>,
+    current_page: usize,
+    pdf_dimensions: Vec<(f32, f32)>,
+    show_text: bool,
+    show_lines: bool,
+    show_blocks: bool,
+}
+
 impl<'a> Viewer<'a> {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
@@ -112,6 +129,7 @@ impl<'a> Viewer<'a> {
             pdf_bytes: None,
             pdf_document: None,
             pdf_path: None,
+            pdf_name: None,
             blocks: Vec::new(),
             debug_data: DebugDataStore::default(),
             current_page: 0,
@@ -128,6 +146,8 @@ impl<'a> Viewer<'a> {
             selected_line: None,
             selected_fields: HashSet::new(),
             selected_events: HashSet::new(),
+            store: Store::new("delver_viewer"),
+            current_document_id: None,
             show_tree_view: false,
             show_matches: false,
             show_match_panel: false,
@@ -139,11 +159,15 @@ impl<'a> Viewer<'a> {
 
     #[cfg(target_arch = "wasm32")]
     pub fn new_wasm(pdfium: Pdfium) -> Self {
+        let mut store = Store::new("delver_viewer");
+        let current_document_id = store.documents.first().map(|d| d.id);
+
         Self {
             pdfium,
             pdf_bytes: None,
             pdf_document: None,
             pdf_path: None,
+            pdf_name: None,
             blocks: Vec::new(),
             debug_data: DebugDataStore::default(),
             current_page: 0,
@@ -163,13 +187,46 @@ impl<'a> Viewer<'a> {
             show_tree_view: false,
             show_matches: false,
             show_match_panel: false,
+            store,
+            current_document_id,
             highlighted_match: None,
             match_filter_threshold: 0.8,
             file_picker_channel: channel(),
         }
     }
 
-    fn load_pdf(&mut self, bytes: Vec<u8>, ctx: &egui::Context) {
+    fn save_state_to_current_document(&mut self) {
+        if let Some(id) = self.current_document_id {
+            if let Some(doc) = self.store.documents.iter_mut().find(|d| d.id == id) {
+                doc.pdf_name = self.pdf_name.clone();
+                doc.blocks = self.blocks.clone();
+                doc.current_page = self.current_page;
+                doc.pdf_dimensions = self.pdf_dimensions.clone();
+                doc.show_text = self.show_text;
+                doc.show_lines = self.show_lines;
+                doc.show_blocks = self.show_blocks;
+            }
+        }
+    }
+
+    fn load_state_from_document(&mut self, id: Uuid, ctx: &egui::Context) {
+        self.save_state_to_current_document();
+
+        if let Some(doc) = self.store.documents.iter().find(|d| d.id == id).cloned() {
+            if let Some(bytes) = doc.pdf_bytes {
+                self.load_pdf(bytes, doc.pdf_name, ctx);
+                self.blocks = doc.blocks;
+                self.current_page = doc.current_page;
+                self.show_text = doc.show_text;
+                self.show_lines = doc.show_lines;
+                self.show_blocks = doc.show_blocks;
+                self.current_document_id = Some(id);
+            }
+        }
+    }
+
+    fn load_pdf(&mut self, bytes: Vec<u8>, name: Option<String>, ctx: &egui::Context) {
+        self.pdf_name = name;
         self.pdf_bytes = Some(bytes);
         self.pdf_document = unsafe {
             self.pdfium
@@ -269,13 +326,36 @@ impl<'a> Viewer<'a> {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.current_document_id.is_none() {
+            if let Some(doc) = self.store.documents.first() {
+                let id = doc.id;
+                self.load_state_from_document(id, ctx);
+            }
+        }
+
         #[cfg(target_arch = "wasm32")]
         if let Ok(bytes) = self.file_picker_channel.1.try_recv() {
-            self.load_pdf(bytes.clone(), ctx);
+            self.save_state_to_current_document();
+
             let template_str = "TextChunk(chunkSize=500, chunkOverlap=150)";
             let (json, blocks, _doc) = process_pdf(&bytes, template_str, None).unwrap();
             web_sys::console::log_1(&json.into());
-            self.blocks = blocks;
+
+            let new_doc = DocumentState {
+                id: Uuid::new_v4(),
+                pdf_bytes: Some(bytes.clone()),
+                pdf_name: Some("Untitled".to_string()),
+                blocks,
+                current_page: 0,
+                pdf_dimensions: Vec::new(),
+                show_text: true,
+                show_lines: true,
+                show_blocks: true,
+            };
+            let new_id = new_doc.id;
+            self.store.documents.push(new_doc);
+            self.load_state_from_document(new_id, ctx);
+            self.store.save();
         }
 
         if self.show_match_panel {
@@ -291,20 +371,56 @@ impl<'a> Viewer<'a> {
             .show(ctx, |ui| {
                 ui.heading("File");
 
-                if let Some(path) = self.pdf_path.as_ref() {
-                    ui.label(format!("PDF: {}", path.display()));
-                }
-
                 if ui.button("Open PDF").clicked() {
                     self.open_file_dialog();
                     ui.ctx().request_repaint();
+                }
+
+                if ui.button("Save Documents").clicked() {
+                    self.save_state_to_current_document();
+                    self.store.save();
+                }
+
+                ui.separator();
+                ui.heading("Documents");
+
+                let mut new_doc_id = None;
+                let mut deleted_doc_id = None;
+
+                for doc in &self.store.documents {
+                    ui.horizontal(|ui| {
+                        let name = doc.pdf_name.as_deref().unwrap_or("Untitled");
+                        if ui
+                            .selectable_label(self.current_document_id == Some(doc.id), name)
+                            .clicked()
+                        {
+                            new_doc_id = Some(doc.id);
+                        }
+                        if ui.button("X").clicked() {
+                            deleted_doc_id = Some(doc.id);
+                        }
+                    });
+                }
+
+                if let Some(id) = new_doc_id {
+                    self.load_state_from_document(id, ui.ctx());
+                }
+
+                if let Some(id) = deleted_doc_id {
+                    self.store.documents.retain(|d| d.id != id);
+                    if self.current_document_id == Some(id) {
+                        self.current_document_id = None;
+                        self.pdf_document = None;
+                        self.pdf_bytes = None;
+                        self.blocks.clear();
+                    }
                 }
 
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(pdf_path) = &self.pdf_path {
                     if self.pdf_document.is_none() {
                         if let Ok(bytes) = std::fs::read(pdf_path) {
-                            self.load_pdf(bytes, ctx);
+                            self.load_pdf(bytes, self.pdf_name.clone(), ctx);
                         }
                     }
                 }
@@ -323,5 +439,24 @@ impl<'a> Viewer<'a> {
 impl<'a> eframe::App for Viewer<'a> {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update(ctx, _frame);
+    }
+}
+
+impl<'a> Serialize for Viewer<'a> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let state = SerializableAppState {
+            // pdf_bytes: self.pdf_bytes.clone(),
+            pdf_name: self.pdf_name.clone(),
+            blocks: self.blocks.clone(),
+            current_page: self.current_page,
+            pdf_dimensions: self.pdf_dimensions.clone(),
+            show_text: self.show_text,
+            show_lines: self.show_lines,
+            show_blocks: self.show_blocks,
+        };
+        state.serialize(serializer)
     }
 }

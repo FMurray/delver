@@ -9,13 +9,15 @@ mod match_panel;
 #[cfg(feature = "viewer")]
 mod rendering;
 #[cfg(feature = "viewer")]
+mod store;
+#[cfg(feature = "viewer")]
 mod ui_controls;
 #[cfg(feature = "viewer")]
 mod utils;
 
 // Re-export the main types and functions
 #[cfg(feature = "viewer")]
-pub use app::{Viewer, launch_viewer};
+pub use app::{launch_viewer, Viewer};
 
 // Re-export panel functions needed for integration
 #[cfg(feature = "viewer")]

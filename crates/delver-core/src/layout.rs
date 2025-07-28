@@ -2,6 +2,7 @@ use crate::parse::{PageContent, TextElement};
 use indexmap::IndexMap;
 use lopdf::Object;
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use uuid::Uuid;
@@ -13,7 +14,7 @@ pub struct MatchContext {
 }
 
 /// Represents a single line of text on the page after grouping TextElements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextLine {
     pub id: Uuid,
     pub text: String,
@@ -115,7 +116,7 @@ pub fn elements_from_lines<'a>(lines: &[&'a TextLine]) -> Vec<&'a TextElement> {
 }
 
 /// Represents a "block" of consecutive lines that are close in vertical spacing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextBlock {
     pub id: Uuid,
     pub page_number: u32,

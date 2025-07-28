@@ -186,7 +186,7 @@ struct PositionedGlyph {
     _advance: f32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextElement {
     pub id: Uuid,
     pub text: String,
