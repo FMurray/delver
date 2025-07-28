@@ -15,9 +15,8 @@ fn main() {
     if !out_dir.exists() {
         std::fs::create_dir_all(&out_dir).expect("Failed to create output directory");
     }
-
     let url = format!(
-        "https://github.com/paulocoutinhox/pdfium-lib/releases/download/{}/pdfium-wasm-esm.zip",
+        "https://github.com/paulocoutinhox/pdfium-lib/releases/download/{}/wasm.tgz",
         PDFIUM_VERSION
     );
 
