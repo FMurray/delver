@@ -17,4 +17,4 @@ target = "index.html"
 [[hooks]]
 stage = "pre_build"
 command = "cp"
-command_arguments = ["-R", "../../deps/pdfium-wasm32/node", "node"] 
+command_arguments = ["-R", "./node", "node"] 
