@@ -668,34 +668,51 @@ fn operand_as_u8(obj: &Object) -> u8 {
 }
 
 // New helper struct to avoid passing the entire document
-struct PageObjects {
+struct PageObjects<'a> {
     font_objects: BTreeMap<Vec<u8>, Object>,
+    encodings: BTreeMap<Vec<u8>, Encoding<'a>>,
     xobject_streams: BTreeMap<Vec<u8>, Object>,
 }
 
-impl PageObjects {
+impl<'a> PageObjects<'a> {
     // Create a new PageObjects by preloading objects from the document
-    fn new(doc: &Document, resources: &Dictionary) -> Result<Self, LopdfError> {
+    fn new(doc: &'a Document, resources: &'a Dictionary) -> Result<Self, LopdfError> {
         let mut font_objects = BTreeMap::new();
         let mut xobject_streams = BTreeMap::new();
+        let mut encodings = BTreeMap::new();
 
         // Preload font objects
-        if let Ok(fonts_dict) = resources.get(b"Font").and_then(Object::as_dict) {
-            for (name, obj) in fonts_dict.iter() {
-                if let Ok(ref_id) = obj.as_reference() {
-                    if let Ok(font_obj) = doc.get_object(ref_id) {
+        if let Ok(font_resources) = doc.get_dict_in_dict(resources, b"Font") {
+            for (name, obj) in font_resources.iter() {
+                let font_obj = if let Ok(ref_id) = obj.as_reference() {
+                    doc.get_object(ref_id).ok()
+                } else {
+                    Some(obj)
+                };
+
+                if let Some(font_obj) = font_obj {
+                    if let Some(font_dict) = font_obj.as_dict().ok() {
                         font_objects.insert(name.clone(), font_obj.clone());
+                        if let Ok(encoding) = font_dict.get_font_encoding(doc) {
+                            encodings.insert(name.clone(), encoding);
+                        }
                     }
                 }
             }
         }
 
         // Preload XObject streams
-        if let Ok(xobjects_dict) = resources.get(b"XObject").and_then(Object::as_dict) {
-            for (name, obj) in xobjects_dict.iter() {
-                if let Ok(ref_id) = obj.as_reference() {
-                    if let Ok(xobject) = doc.get_object(ref_id) {
-                        xobject_streams.insert(name.clone(), xobject.clone());
+        if let Ok(xobject_resources) = doc.get_dict_in_dict(resources, b"XObject") {
+            for (name, obj) in xobject_resources.iter() {
+                let stream_obj = if let Ok(ref_id) = obj.as_reference() {
+                    doc.get_object(ref_id).ok()
+                } else {
+                    Some(obj)
+                };
+
+                if let Some(stream_obj) = stream_obj {
+                    if stream_obj.as_stream().is_ok() {
+                        xobject_streams.insert(name.clone(), stream_obj.clone());
                     }
                 }
             }
@@ -704,6 +721,7 @@ impl PageObjects {
         Ok(Self {
             font_objects,
             xobject_streams,
+            encodings,
         })
     }
 
@@ -732,8 +750,7 @@ fn handle_operator<'a>(
     text_object_state: &mut TextObjectState,
     page_contents: &mut PageContents,
     page_number: u32,
-    page_objects: &PageObjects, // Replace doc with preloaded objects
-    encodings: &'a BTreeMap<Vec<u8>, Encoding<'a>>,
+    page_objects: &'a PageObjects<'a>,
 ) -> Result<(), LopdfError> {
     let current_gs = gs_stack.last_mut().unwrap();
     let in_text_object =
@@ -799,7 +816,8 @@ fn handle_operator<'a>(
                         current_gs.text_state.size = font_size;
                         current_gs.text_state.font_dict = Some(font_obj.clone());
                         current_gs.text_state.font = FONT_METRICS.get(base_font.as_str()).copied();
-                        current_gs.text_state.encoding = encodings.get(font_name_bytes);
+                        current_gs.text_state.encoding =
+                            page_objects.encodings.get(font_name_bytes);
                         text_object_state.font_name = Some(current_gs.text_state.fontname.clone());
                         text_object_state.font_metrics = current_gs.text_state.font;
                     } else {
@@ -1156,10 +1174,14 @@ fn get_page_elements(
         }
     };
     let page_dict = doc.get_dictionary(page_id)?;
-    let resources = page_dict
-        .get(b"Resources")
-        .and_then(|o| doc.get_object(o.as_reference()?))
-        .and_then(|o| o.as_dict())?;
+    let resources = match doc.get_dict_in_dict(page_dict, b"Resources") {
+        Ok(resources) => resources,
+        Err(_) => {
+            warn!(page=%page_number, "No Resources dictionary found for page");
+            // Return a default or empty PageContents if there are no resources
+            return Ok(PageContents::new());
+        }
+    };
 
     // Calculate page transform and mediabox
     let (mediabox, page_ctm) = pdf_page_transform(page_dict);
@@ -1177,15 +1199,17 @@ fn get_page_elements(
     let mut encodings: BTreeMap<Vec<u8>, Encoding> = BTreeMap::new();
 
     // Process fonts to extract encodings
-    if let Ok(fonts_dict) = resources.get(b"Font").and_then(Object::as_dict) {
-        for (name, obj) in fonts_dict.iter() {
-            if let Ok(ref_id) = obj.as_reference() {
-                if let Ok(font_obj) = doc.get_object(ref_id) {
-                    if let Ok(font_dict) = font_obj.as_dict() {
-                        if let Ok(encoding) = font_dict.get_font_encoding(doc) {
-                            encodings.insert(name.clone(), encoding);
-                        }
-                    }
+    if let Ok(font_resources) = doc.get_dict_in_dict(resources, b"Font") {
+        for (name, obj) in font_resources.iter() {
+            let font_dict = if let Ok(ref_id) = obj.as_reference() {
+                doc.get_dictionary(ref_id).ok()
+            } else {
+                obj.as_dict().ok()
+            };
+
+            if let Some(font_dict) = font_dict {
+                if let Ok(encoding) = font_dict.get_font_encoding(doc) {
+                    encodings.insert(name.clone(), encoding);
                 }
             }
         }
@@ -1223,7 +1247,6 @@ fn get_page_elements(
                 &mut page_contents,
                 page_number,
                 &page_objects,
-                &encodings,
             ) {
                 error!(page=%page_number, operator=%op.operator, error=?e, "Error handling operator");
                 // Decide whether to continue or return error
