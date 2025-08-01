@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "delver_pdf"
 version = "0.1.0"
 description = "Delver is a tool for declarative PDF extraction"
-readme = "README.md"
+readme = "../../README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cffi>=1.17.1",

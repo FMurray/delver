@@ -8,13 +8,11 @@ use tokenizers::Tokenizer;
 fn process_pdf_file(pdf_path: String, template_path: String) -> PyResult<String> {
     let pdf_bytes = std::fs::read(pdf_path)?;
     let template_str = std::fs::read_to_string(template_path)?;
-    let tokenizer =
-        Tokenizer::from_pretrained("Qwen/Qwen2-7B-Instruct", None).unwrap_or_else(|e| {
-            panic!("Failed to load tokenizer: {}", e);
-        });
+    let tokenizer = Tokenizer::from_pretrained("Qwen/Qwen2-7B-Instruct", None).unwrap();
 
-    let (json, _blocks, _doc) = delver_core::process_pdf(&pdf_bytes, &template_str, &tokenizer)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    let (json, _blocks, _doc) =
+        delver_core::process_pdf(&pdf_bytes, &template_str, Some(&tokenizer))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     Ok(json)
 }
