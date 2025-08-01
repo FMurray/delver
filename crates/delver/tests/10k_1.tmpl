@@ -1,0 +1,41 @@
+TextChunk(
+    chunkSize=500,
+    chunkOverlap=150,
+)
+
+Match<Section> MDA {
+  Text("Management’s Discussion and Analysis of Financial Condition and Results of Operations", threshold=0.6)
+}
+Match<Section> QuantAndQualitativeDisclosures {
+  Text("Quantitative and Qualitative Disclosures About Market Risk", threshold=0.6)
+}
+
+Match<Section> PerformanceByBusinessSegment {
+  Text("PERFORMANCE BY BUSINESS SEGMENT", threshold=0.6)
+}
+
+Match<Section> PerformanceByGeographicArea {
+  Text("PERFORMANCE BY GEOGRAPHIC AREA", threshold=0.6)
+}
+
+
+Section(
+  match=MDA,
+  end_match=QuantAndQualitativeDisclosures,
+  as="MD&A"
+) {
+  TextChunk(
+    chunkSize=500,
+    chunkOverlap=150,
+  )
+
+  Section(
+    match=PerformanceByBusinessSegment,
+    as="Performance by Business Segment"
+  ) {
+    TextChunk(
+      chunkSize=250,
+      chunkOverlap=100,
+    )
+  }
+}

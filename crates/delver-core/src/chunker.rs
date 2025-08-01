@@ -48,15 +48,15 @@ fn chunk_by_characters<'a>(
         let mut current_length = 0;
         let mut end_idx = start_idx;
 
-        // Find how many elements we can include within char_limit
-        while end_idx < text_elements.len() && current_length < char_limit {
-            current_length += text_elements[end_idx].text.len();
-            if current_length <= char_limit {
-                end_idx += 1;
+        while end_idx < text_elements.len() {
+            let element_len = text_elements[end_idx].text.len();
+            if current_length > 0 && current_length + element_len > char_limit {
+                break;
             }
+            current_length += element_len;
+            end_idx += 1;
         }
 
-        // Always include at least one element even if it exceeds char_limit
         if end_idx == start_idx && start_idx < text_elements.len() {
             end_idx = start_idx + 1;
         }
@@ -67,7 +67,6 @@ fn chunk_by_characters<'a>(
             break;
         }
 
-        // Calculate overlap based on characters
         let mut new_start_idx = end_idx;
         let mut overlap_chars = 0;
         while new_start_idx > start_idx && overlap_chars < chunk_overlap {
@@ -75,7 +74,11 @@ fn chunk_by_characters<'a>(
             overlap_chars += text_elements[new_start_idx].text.len();
         }
 
-        start_idx = new_start_idx;
+        if new_start_idx > start_idx {
+            start_idx = new_start_idx;
+        } else {
+            start_idx = end_idx;
+        }
     }
 
     chunks
@@ -88,7 +91,7 @@ fn chunk_by_tokens<'a>(
     tokenizer: &Tokenizer,
 ) -> Vec<&'a [TextElement]> {
     let mut chunks = Vec::new();
-    
+
     if text_elements.is_empty() {
         return chunks;
     }
@@ -144,7 +147,11 @@ fn chunk_by_tokens<'a>(
             overlap_tokens += token_counts[new_start_idx];
         }
 
-        start_idx = new_start_idx;
+        if new_start_idx > start_idx {
+            start_idx = new_start_idx;
+        } else {
+            start_idx = end_idx;
+        }
     }
 
     chunks

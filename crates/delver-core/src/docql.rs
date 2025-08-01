@@ -898,6 +898,7 @@ fn process_matched_content_recursive(
                         global_chunk_counter,
                         tokenizer,
                     );
+                    println!("chunk outputs: {:?}", chunk_outputs);
                     for chunk_output in chunk_outputs {
                         all_outputs.push(ProcessedOutput::Text(chunk_output));
                     }
@@ -1335,7 +1336,6 @@ fn process_text_chunk_elements_simple(
             max_chars: chunk_size,
         }
     };
-
     // -------- 3. chunk the elements --------
     let chunks = chunk_text_elements(elements, &strategy, chunk_overlap);
 

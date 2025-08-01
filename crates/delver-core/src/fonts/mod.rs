@@ -27,7 +27,7 @@ pub struct FontMetrics {
 
 impl Default for &FontMetrics {
     fn default() -> Self {
-        &FONT_METRICS.get("DejaVuSans").unwrap()
+        &FONT_METRICS.get("DroidSansFallback").unwrap()
     }
 }
 
