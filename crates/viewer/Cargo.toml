@@ -1,0 +1,48 @@
+[package]
+name = "viewer"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+
+[dependencies]
+delver-core = { path = "../delver-core" }
+anyhow = "1.0"
+eframe = { version = "0.32", features = ["persistence"] }
+egui = "0.32"
+egui_extras = { version = "0.32", features = ["image"] }
+pdfium-render = { version = "0.8.34"}
+log = "0.4"
+lopdf = { workspace = true, features = ["nom_parser", "serde"] }
+rstar = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+geo = { workspace = true }
+image = { workspace = true }
+base64 = { workspace = true }
+uuid = { version = "1.8.0", features = ["v4", "serde", "js"] }
+futures-channel = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd = "0.14"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+rfd = { version = "0.14", features = ["file-handle-inner"] }
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+pdfium-render = { version = "0.8.34", features = ["sync"]}
+tracing-wasm = "0.2.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "console", "Storage"] }
+js-sys = "0.3"
+
+[build-dependencies]
+reqwest = { version = "0.12.5", features = ["blocking"] }
+zip = "4.3.0"
+bytes = "1.6.1"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3.30"
+tar = "0.4.40"
+flate2 = "1.0.30"

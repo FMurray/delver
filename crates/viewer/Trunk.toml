@@ -1,0 +1,20 @@
+[watch]
+# Paths to watch for changes.
+watch = ["src", "index.html"]
+
+[serve]
+# The address to serve on.
+address = "127.0.0.1"
+port = 8080
+open = false
+no_autoreload = false
+
+[build]
+# The public URL from which assets are served.
+public_url = "/"
+target = "index.html"
+
+[[hooks]]
+stage = "pre_build"
+command = "cp"
+command_arguments = ["-R", "./node", "node"] 
