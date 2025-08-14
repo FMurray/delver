@@ -38,3 +38,4 @@ tokenizers = { version = "0.21.2", default-features = false, features = ["fancy-
 serde.workspace = true
 rusttype.workspace = true
 lazy_static.workspace = true
+

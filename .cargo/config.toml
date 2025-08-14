@@ -1,5 +1,5 @@
-[build]
-rustflags = ["--cfg", "tracing_unstable"]
+# [build]
+# rustflags = ["--cfg", "tracing_unstable"]
 
 # for wasm 
 [target.wasm32-unknown-unknown]
