@@ -30,7 +30,8 @@ axum = { version = "0.8.4", optional = true }
 leptos_axum = { version = "0.8.5", optional = true }
 leptos_meta = { version = "0.8.0" }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
-wasm-bindgen = { version = "=0.2.100", optional = true}
+wasm-bindgen = { version = "=0.2.100"}
+web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "ImageData"] }
 server_fn = { version = "0.8.5", features = ["serde-lite", "rkyv", "multipart", "postcard"] }
 bytes = "1.6.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,7 +40,6 @@ chrono = { version = "0.4", features = ["serde"] }
 hydrate = [
     "leptos/hydrate",
     # "dep:console_error_panic_hook",
-    "dep:wasm-bindgen",
 ]
 ssr = [
     "dep:axum",
@@ -72,7 +72,7 @@ getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] 
 # tracing-wasm = "0.2.1"
 # wasm-bindgen = "0.2"
 # wasm-bindgen-futures = "0.4"
-# web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "console", "Storage"] }
+# web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData", "console", "Storage"] }
 # js-sys = "0.3"
 
 [build-dependencies]

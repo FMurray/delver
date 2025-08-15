@@ -3,58 +3,36 @@ use leptos::logging::log;
 use leptos::prelude::*;
 use leptos::svg::*;
 
-use leptos::wasm_bindgen::JsCast;
-use leptos::web_sys::{FormData, HtmlFormElement};
 use leptos_router::hooks::use_navigate;
 use pdfium_render::prelude::*;
+use serde::{Deserialize, Serialize};
 use server_fn::codec::{MultipartData, MultipartFormData};
 
 use crate::store::{DocumentStore, PdfDocument};
 
-// Function to render PDF pages to images - will be used later
-#[allow(dead_code)]
-fn get_document_images(pdf_document: pdfium_render::prelude::PdfDocument) -> Vec<Vec<u8>> {
-    let mut textures = Vec::new();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentMetadata {
+    pub id: String,
+    pub filename: String,
+    pub page_count: usize,
+    pub page_dimensions: Vec<(f32, f32)>,
+}
 
-    for page_index in 0..pdf_document.pages().len() {
-        let page: PdfPage = pdf_document
-            .pages()
-            .get(page_index)
-            .map_err(|e| anyhow::anyhow!("Failed to get page {}: {}", page_index, e))
-            .unwrap();
-
-        let width = page.width().value as i32;
-        let height = page.height().value as i32;
-
-        let render_config = PdfRenderConfig::new()
-            .set_target_width(width)
-            .set_target_height(height)
-            .use_lcd_text_rendering(true)
-            .render_annotations(true)
-            .render_form_data(false);
-
-        let bitmap: PdfBitmap = page
-            .render_with_config(&render_config)
-            .map_err(|e| anyhow::anyhow!("Failed to render page {}: {}", page_index, e))
-            .unwrap();
-
-        // Convert to RGBA - use as_rgba_bytes() which handles format conversion
-        let pixels = bitmap.as_rgba_bytes();
-        textures.push(pixels);
-    }
-
-    textures
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageImageData {
+    pub page_index: usize,
+    pub image_data: Vec<u8>, // RGBA bytes
+    pub width: f32,
+    pub height: f32,
 }
 
 #[component]
 pub fn FileUpload() -> impl IntoView {
-    /// Upload and process PDF file, returning document data for client navigation
+    /// Upload and process PDF file, returning document metadata only
     #[server(
         input = MultipartFormData,
     )]
-    pub async fn file_upload(
-        data: MultipartData,
-    ) -> Result<(String, String, usize), ServerFnError> {
+    pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerFnError> {
         // `.into_inner()` returns the inner `multer` stream
         // it is `None` if we call this on the client, but always `Some(_)` on the server, so is safe to
         // unwrap
@@ -63,6 +41,7 @@ pub fn FileUpload() -> impl IntoView {
         let mut buf = bytes::BytesMut::new();
         let mut filename = "Unknown".to_string();
 
+        log!("Starting file upload processing...");
         while let Ok(Some(mut field)) = data.next_field().await {
             log!("\n[NEXT FIELD]\n");
             let name = field.name().unwrap_or_default().to_string();
@@ -70,6 +49,7 @@ pub fn FileUpload() -> impl IntoView {
 
             if let Some(field_filename) = field.file_name() {
                 filename = field_filename.to_string();
+                log!("  [FILENAME] {}", filename);
             }
 
             while let Ok(Some(chunk)) = field.chunk().await {
@@ -77,12 +57,24 @@ pub fn FileUpload() -> impl IntoView {
             }
         }
 
+        log!(
+            "File upload data received: {} bytes for {}",
+            buf.len(),
+            filename
+        );
+
+        if buf.is_empty() {
+            return Err(ServerFnError::new(anyhow::anyhow!("No file uploaded")));
+        }
+
+        log!("Initializing PDF library...");
         // Try multiple library locations for cargo-leptos compatibility
         // Prefer runtime env var; fall back to compile-time value from build.rs via option_env!
         let runtime_or_compile_time_path = std::env::var("PDFIUM_LIBRARY_PATH")
             .ok()
             .or_else(|| option_env!("PDFIUM_LIBRARY_PATH").map(|s| s.to_string()));
 
+        log!("PDF library path: {:?}", runtime_or_compile_time_path);
         let pdfium = if let Some(custom_path) = runtime_or_compile_time_path {
             Pdfium::new(
                 Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&custom_path))
@@ -97,42 +89,100 @@ pub fn FileUpload() -> impl IntoView {
             Pdfium::default()
         };
 
+        log!("Loading PDF document from {} bytes...", buf.len());
         let pdf_document = pdfium.load_pdf_from_byte_slice(&buf, None).unwrap();
         let pages = pdf_document.pages();
         let page_count = pages.len() as usize;
+        log!("PDF loaded successfully with {} pages", page_count);
 
         // Generate a document ID for this upload
         let doc_id = uuid::Uuid::new_v4().to_string();
+        log!("Generated document ID: {}", doc_id);
 
-        // Note: In a real implementation, you would store the rendered images here
-        // For now, we'll just return the basic info and handle image rendering on the client
-        Ok((doc_id, filename, page_count))
+        // Only extract page dimensions for metadata - don't render images yet
+        let mut page_dimensions = Vec::new();
+        log!("Extracting page dimensions for {} pages...", page_count);
+
+        for page_index in 0..page_count {
+            let page: PdfPage = pdf_document.pages().get(page_index as u16).map_err(|e| {
+                ServerFnError::new(anyhow::anyhow!("Failed to get page {}: {}", page_index, e))
+            })?;
+
+            // Use a reasonable DPI for web viewing (150 DPI is a good balance)
+            let scale_factor = 150.0 / 72.0; // 72 DPI is PDF default
+            let width = (page.width().value * scale_factor) as f32;
+            let height = (page.height().value * scale_factor) as f32;
+
+            page_dimensions.push((width, height));
+        }
+
+        // Store the PDF data for later page rendering
+        // TODO: Consider using a proper storage system (Redis, file system, etc.)
+        // For now, we'll implement lazy loading on the client side
+
+        log!("PDF metadata extraction complete");
+        Ok(DocumentMetadata {
+            id: doc_id,
+            filename,
+            page_count,
+            page_dimensions,
+        })
+    }
+
+    /// Render a specific page of a PDF document on demand
+    #[server]
+    pub async fn render_pdf_page(
+        doc_id: String,
+        page_index: usize,
+    ) -> Result<PageImageData, ServerFnError> {
+        log!("Rendering page {} for document {}", page_index, doc_id);
+
+        // TODO: In a real application, you'd retrieve the PDF from storage
+        // For now, this is a placeholder that shows the structure
+        // You'll need to implement proper PDF storage and retrieval
+
+        Err(ServerFnError::new(anyhow::anyhow!(
+            "PDF storage not implemented yet - page {} for doc {}",
+            page_index,
+            doc_id
+        )))
     }
 
     let store = expect_context::<DocumentStore>();
     let navigate = use_navigate();
 
-    let upload_action = Action::new_local(|data: &FormData| {
-        // `MultipartData` implements `From<FormData>`
-        file_upload(data.clone().into())
-    });
+    // Create a server action for uploading PDFs  
+    let upload_action = ServerAction::<UploadPdf>::new();
 
-    // Handle successful upload and navigation
+    // Handle successful upload and navigation with an effect
     Effect::new(move |_| {
-        if let Some(Ok((doc_id_str, filename, page_count))) = upload_action.value().get() {
-            if let Ok(doc_id) = uuid::Uuid::parse_str(&doc_id_str) {
-                // Create a new document in the store
-                let mut document = PdfDocument::new(filename.clone());
-                document.id = doc_id;
-                document.total_pages = page_count;
+        if let Some(Ok(metadata)) = upload_action.value().get() {
+            log!(
+                "Processing upload result for: {} ({} pages)",
+                metadata.filename,
+                metadata.page_count
+            );
 
-                // Add to store
+            if let Ok(doc_id) = uuid::Uuid::parse_str(&metadata.id) {
+                log!("Creating document with ID: {}", doc_id);
+
+                // Create a new document in the store with metadata only
+                let mut document = PdfDocument::new(metadata.filename.clone());
+                document.id = doc_id;
+                document.total_pages = metadata.page_count;
+                // Don't add pages yet - they'll be loaded on demand
+
+                log!("Adding document metadata to store...");
                 store.add_document(document);
 
-                // Navigate to the viewer
-                navigate(&format!("/viewer/{}/0", doc_id_str), Default::default());
+                log!("Navigating to viewer...");
+                navigate(&format!("/viewer/{}/0", metadata.id), Default::default());
 
-                log!("Document uploaded: {} with {} pages", filename, page_count);
+                log!(
+                    "Document upload complete: {} with {} pages",
+                    metadata.filename,
+                    metadata.page_count
+                );
             }
         }
     });
@@ -144,60 +194,41 @@ pub fn FileUpload() -> impl IntoView {
                 h3()
                     .class("text-lg font-medium text-gray-900 mb-4")
                     .child("Upload PDF Document"),
-                form()
-                    .class("space-y-4")
-                    .on(leptos::ev::submit, move |ev: leptos::ev::SubmitEvent| {
-                        ev.prevent_default();
-                        let target = ev.target().unwrap().unchecked_into::<HtmlFormElement>();
-                        let form_data = FormData::new_with_form(&target).unwrap();
-                        upload_action.dispatch_local(form_data);
-                    })
-                    .child((
-                        div()
-                            .class("border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-gray-400 transition-colors duration-200")
-                            .child(
-                                div()
-                                    .class("space-y-4")
-                                    .child((
-                                        div()
-                                            .class("flex justify-center")
-                                            .child(
-                                                svg()
-                                                    .class("h-12 w-12 text-gray-400")
-                                                    .attr("fill", "none")
-                                                    .attr("viewBox", "0 0 24 24")
-                                                    .attr("stroke", "currentColor")
-                                                    .child(
-                                                        path()
-                                                            .attr("stroke-linecap", "round")
-                                                            .attr("stroke-linejoin", "round")
-                                                            .attr("stroke-width", "2")
-                                                            .attr("d", "M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12")
-                                                    )
-                                            ),
-                                        div().child((
-                                            label()
-                                                .class("block text-sm font-medium text-gray-700 mb-2")
-                                                .attr("for", "file_input")
-                                                .child("Choose PDF file to upload"),
-                                            input()
-                                                .class("block w-full text-sm text-gray-900 border border-gray-300 rounded-md cursor-pointer bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 file:mr-4 file:py-2 file:px-4 file:rounded-l-md file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100")
-                                                .id("file_input")
-                                                .attr("type", "file")
-                                                .attr("name", "file_to_upload")
-                                                .attr("accept", ".pdf")
-                                        )),
-                                        p()
-                                            .class("text-xs text-gray-500")
-                                            .child("PDF files only, up to 50MB")
-                                    ))
-                            ),
-                        button()
-                            .attr("type", "submit")
-                            .class("w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors duration-200 font-medium")
-                            .prop("disabled", move || upload_action.pending().get())
-                            .child(move || if upload_action.pending().get() { "Processing..." } else { "Upload & Analyze" })
-                    ))
+                view! {
+                    <ActionForm action=upload_action class="space-y-4" enctype="multipart/form-data">
+                        <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-gray-400 transition-colors duration-200">
+                            <div class="space-y-4">
+                                <div class="flex justify-center">
+                                    <svg class="h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-2" for="file_input">
+                                        "Choose PDF file to upload"
+                                    </label>
+                                    <input 
+                                        class="block w-full text-sm text-gray-900 border border-gray-300 rounded-md cursor-pointer bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 file:mr-4 file:py-2 file:px-4 file:rounded-l-md file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                                        id="file_input"
+                                        type="file"
+                                        name="data"
+                                        accept=".pdf"
+                                    />
+                                </div>
+                                <p class="text-xs text-gray-500">
+                                    "PDF files only, up to 50MB"
+                                </p>
+                            </div>
+                        </div>
+                        <button
+                            type="submit"
+                            class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors duration-200 font-medium"
+                            disabled=move || upload_action.pending().get()
+                        >
+                            {move || if upload_action.pending().get() { "Processing..." } else { "Upload & Analyze" }}
+                        </button>
+                    </ActionForm>
+                }
             )),
             // Status and Results Section
             div()
@@ -250,7 +281,7 @@ pub fn FileUpload() -> impl IntoView {
                                             )),
                                         "Processing PDF document..."
                                     )).into_any()
-                            } else if let Some(Ok((_doc_id, filename, page_count))) = upload_action.value().get() {
+                            } else if let Some(Ok(metadata)) = upload_action.value().get() {
                                 div()
                                     .class("space-y-2")
                                     .child((
@@ -273,7 +304,7 @@ pub fn FileUpload() -> impl IntoView {
                                             )),
                                         div()
                                             .class("text-xs text-gray-600")
-                                            .child(format!("Document: {} ({} pages)", filename, page_count))
+                                            .child(format!("Document: {} ({} pages)", metadata.filename, metadata.page_count))
                                     )).into_any()
                             } else {
                                 div()
