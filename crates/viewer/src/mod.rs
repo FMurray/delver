@@ -24,3 +24,5 @@
 // pub use event_panel::show_event_panel;
 // #[cfg(feature = "viewer")]
 // pub use match_panel::show_match_panel;
+pub mod app;
+pub mod components;

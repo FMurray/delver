@@ -1,4 +1,5 @@
 pub mod app;
+pub mod components;
 // pub mod event_panel;
 // pub mod match_panel;
 // pub mod rendering;

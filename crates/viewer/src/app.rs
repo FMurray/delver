@@ -1,9 +1,5 @@
 use pdfium_render::prelude::*;
 
-use leptos::wasm_bindgen::JsCast;
-use leptos::web_sys::{FormData, HtmlFormElement, SubmitEvent};
-use server_fn::codec::{MultipartData, MultipartFormData};
-
 // #[cfg(target_arch = "wasm32")]
 // use {
 //     futures_channel::oneshot,
@@ -18,7 +14,9 @@ use server_fn::codec::{MultipartData, MultipartFormData};
 // use crate::rendering;
 // use crate::ui_controls;
 // use crate::utils;
+use crate::components::file_upload::FileUpload;
 
+use leptos::html::*;
 use leptos::logging::log;
 use leptos::prelude::*;
 use leptos_meta::*;
@@ -53,32 +51,83 @@ pub fn App() -> impl IntoView {
     let _ctx = provide_context::<(ReadSignal<bool>, WriteSignal<bool>)>((show, set_show));
     view! {
         <Router>
-            <main class="flex">
-                <Show when=move || show.get()>
-                    <SidePanel />
-                </Show>
-                <Routes fallback=|| "Page not found.".into_view()>
-                    <Route path=StaticSegment("") view=Home/>
-                </Routes>
-            </main>
+            <div class="h-screen flex flex-col bg-gray-50">
+                <MainNav />
+                <div class="flex flex-1 overflow-hidden">
+                    <Show when=move || show.get()>
+                        <SidePanel />
+                    </Show>
+                    <Routes fallback=|| "Page not found.".into_view()>
+                        <Route path=StaticSegment("") view=Home/>
+                    </Routes>
+                </div>
+            </div>
         </Router>
     }
 }
 
 #[component]
-fn Home() -> impl IntoView {
+pub fn MainNav() -> impl IntoView {
     let (show, set_show) =
-        use_context::<(ReadSignal<bool>, WriteSignal<bool>)>().expect("setter context in home");
+        use_context::<(ReadSignal<bool>, WriteSignal<bool>)>().expect("setter context in nav");
+
     view! {
-        <main class="flex-1 p-4">
-            <button id="toggleSidebar" class="bg-blue-500 text-white p-2 rounded" on:click=move |_| {
-                log!("toggleSidebar");
-                set_show.set(!show.get());
-            }>
-            Toggle Sidebar
-            </button>
-            <h1 class="text-2xl font-bold mt-4">Welcome to the Main Content</h1>
-            <p>This is the main content area. Click the button to toggle the sidebar.</p>
+        <nav class="bg-white shadow-sm border-b border-gray-200 px-4 py-3">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-4">
+                    <button
+                        class="inline-flex items-center justify-center p-2 rounded-md text-gray-400 hover:text-gray-500 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500 transition-colors duration-200"
+                        on:click=move |_| {
+                            log!("toggleSidebar");
+                            set_show.set(!show.get());
+                        }
+                        aria-label="Toggle sidebar"
+                    >
+                        <Show
+                            when=move || show.get()
+                            fallback=|| view! {
+                                // Menu icon (hamburger)
+                                <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+                                </svg>
+                            }
+                        >
+                            // X icon (close)
+                            <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </Show>
+                    </button>
+                    <h1 class="text-xl font-semibold text-gray-900">Delver PDF Viewer</h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <span class="text-sm text-gray-500">Ready</span>
+                </div>
+            </div>
+        </nav>
+    }
+}
+
+#[component]
+fn Home() -> impl IntoView {
+    view! {
+        <main class="flex-1 p-8 overflow-auto">
+            <div class="max-w-4xl mx-auto">
+                <div class="mb-8">
+                    <h1 class="text-3xl font-bold text-gray-900 mb-2">Welcome to Delver</h1>
+                    <p class="text-lg text-gray-600">Upload and analyze PDF documents with advanced text extraction and visualization.</p>
+                </div>
+
+                <div class="bg-white rounded-lg shadow-sm p-6">
+                    <h2 class="text-xl font-semibold text-gray-800 mb-4">Get Started</h2>
+                    <p class="text-gray-600 mb-4">Use the sidebar to upload PDF documents and explore their content.</p>
+                    <div class="text-sm text-gray-500">
+                        <p>"• Upload PDF files for analysis"</p>
+                        <p>"• View extracted text and layout information"</p>
+                        <p>"• Explore document structure and content"</p>
+                    </div>
+                </div>
+            </div>
         </main>
     }
 }
@@ -86,101 +135,17 @@ fn Home() -> impl IntoView {
 #[component]
 pub fn SidePanel() -> impl IntoView {
     view! {
-        <aside id="sidebar" class="w-64 bg-gray-800 text-white transition-all duration-300 ease-in-out transform">
-          <div class="p-4">
-              <h2 class="text-2xl font-bold">Menu</h2>
-              <nav class="mt-4">
-              <ul>
-                  <FileUpload />
-              </ul>
-              </nav>
-          </div>
+        <aside id="sidebar" class="w-80 bg-white border-r border-gray-200 shadow-lg transition-all duration-300 ease-in-out">
+            <div class="h-full flex flex-col">
+                <div class="p-6 border-b border-gray-200">
+                    <h2 class="text-xl font-semibold text-gray-900">Document Tools</h2>
+                    <p class="text-sm text-gray-600 mt-1">Upload and manage your PDF documents</p>
+                </div>
+                <div class="flex-1 p-6 overflow-y-auto">
+                    <FileUpload />
+                </div>
+            </div>
         </aside>
-    }
-}
-
-#[component]
-pub fn FileUpload() -> impl IntoView {
-    /// A simple file upload function, which does just returns the length of the file.
-    ///
-    /// On the server, this uses the `multer` crate, which provides a streaming API.
-    #[server(
-        input = MultipartFormData,
-    )]
-    pub async fn file_length(data: MultipartData) -> Result<usize, ServerFnError> {
-        // `.into_inner()` returns the inner `multer` stream
-        // it is `None` if we call this on the client, but always `Some(_)` on the server, so is safe to
-        // unwrap
-        let mut data = data.into_inner().unwrap();
-
-        let mut buf = bytes::BytesMut::new();
-        while let Ok(Some(mut field)) = data.next_field().await {
-            log!("\n[NEXT FIELD]\n");
-            let name = field.name().unwrap_or_default().to_string();
-            log!("  [NAME] {name}");
-            while let Ok(Some(chunk)) = field.chunk().await {
-                buf.extend_from_slice(chunk.as_ref());
-            }
-        }
-
-        // Try multiple library locations for cargo-leptos compatibility
-        // Prefer runtime env var; fall back to compile-time value from build.rs via option_env!
-        let runtime_or_compile_time_path = std::env::var("PDFIUM_LIBRARY_PATH")
-            .ok()
-            .or_else(|| option_env!("PDFIUM_LIBRARY_PATH").map(|s| s.to_string()));
-
-        let pdfium = if let Some(custom_path) = runtime_or_compile_time_path {
-            Pdfium::new(
-                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&custom_path))
-                    .or_else(|_| {
-                        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
-                    })
-                    .or_else(|_| Pdfium::bind_to_system_library())
-                    .unwrap(),
-            )
-        } else {
-            // Fallback to default pattern when no custom path is set
-            Pdfium::default()
-        };
-
-        let pdf_document = pdfium.load_pdf_from_byte_slice(&buf, None).unwrap();
-        let pages = pdf_document.pages();
-
-        Ok(buf.len())
-    }
-
-    let upload_action = Action::new_local(|data: &FormData| {
-        // `MultipartData` implements `From<FormData>`
-        file_length(data.clone().into())
-    });
-
-    view! {
-        <h3>File Upload</h3>
-        <form on:submit=move |ev: SubmitEvent| {
-            ev.prevent_default();
-            let target = ev.target().unwrap().unchecked_into::<HtmlFormElement>();
-            let form_data = FormData::new_with_form(&target).unwrap();
-            upload_action.dispatch_local(form_data);
-        }>
-            <label class="block mb-2 text-sm font-medium text-gray-900 dark:text-white" for="file_input">Upload file</label>
-            <input class="block w-full text-sm text-gray-900 border border-gray-300 rounded-lg cursor-pointer bg-gray-50 dark:text-gray-400 focus:outline-none dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400" id="file_input" type="file" name="file_to_upload" />
-            <input type="submit" />
-        </form>
-        <p>
-            {move || {
-                if upload_action.input().read().is_none() && upload_action.value().read().is_none()
-                {
-                    "Upload a file.".to_string()
-                } else if upload_action.pending().get() {
-                    "Uploading...".to_string()
-                } else if let Some(Ok(value)) = upload_action.value().get() {
-                    value.to_string()
-                } else {
-                    format!("{:?}", upload_action.value().get())
-                }
-            }}
-
-        </p>
     }
 }
 
