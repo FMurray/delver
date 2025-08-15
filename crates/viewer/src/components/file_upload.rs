@@ -205,6 +205,19 @@ pub async fn get_documents() -> Result<Vec<PdfDocument>, ServerFnError> {
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to get documents: {}", e)))
 }
 
+/// Get a single document by ID (fallback for newly uploaded documents)
+#[server]
+pub async fn get_document_by_id(doc_id: String) -> Result<Option<PdfDocument>, ServerFnError> {
+    let pool = crate::store::get_database_pool().await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database connection failed: {}", e)))?;
+
+    let doc_uuid = uuid::Uuid::parse_str(&doc_id)
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Invalid document ID: {}", e)))?;
+
+    crate::store::PdfDocument::get_by_id(&pool, doc_uuid).await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to get document: {}", e)))
+}
+
 /// Delete a document and all its pages
 #[server]
 pub async fn delete_document(doc_id: String) -> Result<bool, ServerFnError> {

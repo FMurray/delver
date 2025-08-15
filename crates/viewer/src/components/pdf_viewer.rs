@@ -6,8 +6,7 @@ use uuid::Uuid;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
-use crate::store::DocumentPage;
-use crate::components::file_upload::{get_pdf_page, get_documents};
+use crate::components::file_upload::{get_pdf_page, get_documents, get_document_by_id};
 
 // Helper function to render RGBA data to a canvas
 fn render_rgba_to_canvas(canvas: &HtmlCanvasElement, rgba_data: &[u8], width: u32, height: u32) {
@@ -61,23 +60,27 @@ pub fn PdfViewer() -> impl IntoView {
         result
     });
 
-    // Resource to load the document metadata
+    // Resource to load the document metadata - refresh when doc_id changes
     let documents = Resource::new(
-        move || (),
-        |_| async move {
+        move || doc_id.get(),
+        move |_| async move {
+            log!("Fetching documents list...");
             get_documents().await.unwrap_or_default()
         }
     );
 
-    let document = Memo::new(move |_| {
-        if let Some(id) = doc_id.get() {
-            documents.get().and_then(|docs| {
-                docs.into_iter().find(|doc| doc.id == id)
-            })
-        } else {
-            None
+    // Fallback resource to get individual document if not found in main list
+    let fallback_document = Resource::new(
+        move || doc_id.get().map(|id| id.to_string()),
+        move |doc_id_opt| async move {
+            if let Some(doc_id) = doc_id_opt {
+                log!("Fetching individual document {}", doc_id);
+                get_document_by_id(doc_id).await.unwrap_or(None)
+            } else {
+                None
+            }
         }
-    });
+    );
 
     // Resource for loading page images on demand
     let page_resource = Resource::new(
@@ -93,50 +96,9 @@ pub fn PdfViewer() -> impl IntoView {
     );
     
     // Current page data from server action result
-    let current_page = Memo::new(move |_| {
-        page_resource.get().and_then(|result| {
-            result.ok().map(|page_data| DocumentPage {
-                page_index: page_data.page_index,
-                image_data: page_data.image_data,
-                width: page_data.width,
-                height: page_data.height,
-            })
-        })
-    });
 
-    // Use a simple effect that runs when current_page changes
+    // Canvas ref for rendering
     let canvas_ref = NodeRef::<Canvas>::new();
-    
-    // Single effect that handles canvas rendering when page data is available
-    Effect::new(move |_| {
-        log!("Canvas effect triggered - checking if page and canvas are ready");
-        
-        // This effect will re-run whenever current_page changes
-        if let Some(page) = current_page.get() {
-            // Try to get the canvas element
-            if let Some(canvas_element) = canvas_ref.get() {
-                if let Ok(canvas) = canvas_element.dyn_into::<HtmlCanvasElement>() {
-                    log!("Rendering page {} to canvas ({}x{}, {} bytes)", 
-                        page.page_index, page.width as u32, page.height as u32, page.image_data.len());
-                    
-                    render_rgba_to_canvas(
-                        &canvas,
-                        &page.image_data,
-                        page.width as u32,
-                        page.height as u32,
-                    );
-                    
-                    log!("Canvas render complete for page {}", page.page_index);
-                } else {
-                    log!("Canvas element not ready for casting");
-                }
-            } else {
-                log!("Canvas element not mounted yet");
-            }
-        } else {
-            log!("No page data available for canvas");
-        }
-    });
 
     log!("PdfViewer component rendering");
     div()
@@ -155,7 +117,19 @@ pub fn PdfViewer() -> impl IntoView {
                     </div>
                 }>
                     {move || {
-                if let Some(doc) = document.get() {
+                // Find the document within the Suspense boundary
+                if let Some(id) = doc_id.get() {
+                    // First try to find in the main documents list
+                    let doc = if let Some(docs) = documents.get() {
+                        docs.into_iter().find(|doc| doc.id == id)
+                    } else {
+                        None
+                    };
+                    
+                    // If not found in main list, try the fallback individual document resource
+                    let doc = doc.or_else(|| fallback_document.get().flatten());
+                    
+                    if let Some(doc) = doc {
                     log!("Document available for rendering: {} ({} pages)", doc.name, doc.total_pages);
                     div()
                         .class("h-full flex flex-col")
@@ -168,7 +142,7 @@ pub fn PdfViewer() -> impl IntoView {
                                         div().child((
                                             h1().class("text-xl font-semibold text-gray-900")
                                                 .child(doc.name.clone()),
-                                            p().class("text-sm text-gray-600").child(format!(
+                                            p().class("text-sm text-gray-600").child(move || format!(
                                                 "Page {} of {}",
                                                 page_id.get() + 1,
                                                 doc.total_pages
@@ -189,8 +163,9 @@ pub fn PdfViewer() -> impl IntoView {
                                                     }
                                                 })
                                                 .child("← Previous"),
-                                            span().class("text-sm text-gray-500").child(move || {
-                                                format!("{} / {}", page_id.get() + 1, doc.total_pages)
+                                            span().class("text-sm text-gray-500").child({
+                                                let total_pages = doc.total_pages;
+                                                move || format!("{} / {}", page_id.get() + 1, total_pages)
                                             }),
                                             button()
                                                 .class("px-3 py-1 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 disabled:opacity-50")
@@ -219,7 +194,7 @@ pub fn PdfViewer() -> impl IntoView {
                                                 <Suspense fallback=move || view! {
                                                     <div class="text-center">
                                                         <h3 class="text-lg font-medium text-gray-900 mb-4">
-                                                            {format!("Page {}", page_id.get() + 1)}
+                                                            {move || format!("Page {}", page_id.get() + 1)}
                                                         </h3>
                                                         <div class="flex items-center justify-center space-x-2 mb-4">
                                                             <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
@@ -228,16 +203,42 @@ pub fn PdfViewer() -> impl IntoView {
                                                     </div>
                                                 }>
                                                     {move || {
-                                                if let Some(page) = current_page.get() {
-                                                    log!("Page data available for page {}", page.page_index);
+                                                // Access page_resource within Suspense boundary  
+                                                if let Some(Ok(page_data)) = page_resource.get() {
+                                                    log!("Page data available for page {}", page_data.page_index);
                                                     // Use the actual rendered dimensions
-                                                    let display_width = page.width as u32;
-                                                    let display_height = page.height as u32;
+                                                    let display_width = page_data.width as u32;
+                                                    let display_height = page_data.height as u32;
                                                     log!("Page display dimensions: {}x{}", display_width, display_height);
+                                                    
+                                                    // Effect to render to canvas when page data changes
+                                                    Effect::new({
+                                                        let canvas_ref = canvas_ref.clone();
+                                                        let image_data = page_data.image_data.clone();
+                                                        let page_index = page_data.page_index;
+                                                        move |_| {
+                                                            log!("Canvas effect triggered for page {}", page_index);
+                                                            if let Some(canvas_element) = canvas_ref.get() {
+                                                                if let Ok(canvas) = canvas_element.dyn_into::<HtmlCanvasElement>() {
+                                                                    log!("Rendering page {} to canvas ({}x{}, {} bytes)", 
+                                                                        page_index, display_width, display_height, image_data.len());
+                                                                    
+                                                                    render_rgba_to_canvas(
+                                                                        &canvas,
+                                                                        &image_data,
+                                                                        display_width,
+                                                                        display_height,
+                                                                    );
+                                                                    
+                                                                    log!("Canvas render complete for page {}", page_index);
+                                                                }
+                                                            }
+                                                        }
+                                                    });
                                                     
                                                     div().class("text-center").child((
                                                         h3().class("text-lg font-medium text-gray-900 mb-4")
-                                                            .child(format!("Page {}", page_id.get() + 1)),
+                                                            .child(move || format!("Page {}", page_id.get() + 1)),
                                                         div().class("flex justify-center mb-2").child(
                                                             canvas()
                                                                 .attr("width", display_width.to_string())
@@ -252,7 +253,7 @@ pub fn PdfViewer() -> impl IntoView {
                                                     log!("No page data available for page {}", page_id.get());
                                                     div().class("text-center").child((
                                                         h3().class("text-lg font-medium text-gray-900 mb-2")
-                                                            .child(format!("Page {}", page_id.get() + 1)),
+                                                            .child(move || format!("Page {}", page_id.get() + 1)),
                                                         p().class("text-gray-600")
                                                             .child("Failed to load page. Please try again."),
                                                         p().class("text-sm text-gray-500 mt-2")
@@ -268,16 +269,30 @@ pub fn PdfViewer() -> impl IntoView {
                             ),
                         ))
                         .into_any()
+                    } else {
+                        log!("Document not found for ID: {:?}", id);
+                        div()
+                            .class("flex-1 flex items-center justify-center")
+                            .child(
+                                div().class("text-center").child((
+                                    h2().class("text-xl font-semibold text-gray-900 mb-2")
+                                        .child("Document Not Found"),
+                                    p().class("text-gray-600")
+                                        .child("The requested document could not be found."),
+                                )),
+                            )
+                            .into_any()
+                    }
                 } else {
-                    log!("No document available");
+                    log!("No document ID or documents not loaded");
                     div()
                         .class("flex-1 flex items-center justify-center")
                         .child(
                             div().class("text-center").child((
                                 h2().class("text-xl font-semibold text-gray-900 mb-2")
-                                    .child("Document Not Found"),
+                                    .child("Loading..."),
                                 p().class("text-gray-600")
-                                    .child("The requested document could not be found."),
+                                    .child("Please wait while the document loads."),
                             )),
                         )
                         .into_any()
