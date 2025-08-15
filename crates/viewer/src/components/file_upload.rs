@@ -2,13 +2,15 @@ use leptos::html::*;
 use leptos::logging::log;
 use leptos::prelude::*;
 use leptos::svg::*;
-
 use leptos_router::hooks::use_navigate;
-use pdfium_render::prelude::*;
 use serde::{Deserialize, Serialize};
 use server_fn::codec::{MultipartData, MultipartFormData};
+use leptos::ev;
+use wasm_bindgen_futures::spawn_local;
+use web_sys::FormData;
+use wasm_bindgen::JsCast;
 
-use crate::store::{DocumentStore, PdfDocument};
+use crate::store::PdfDocument;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentMetadata {
@@ -26,47 +28,54 @@ pub struct PageImageData {
     pub height: f32,
 }
 
-#[component]
-pub fn FileUpload() -> impl IntoView {
-    /// Upload and process PDF file, returning document metadata only
-    #[server(
-        input = MultipartFormData,
-    )]
-    pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerFnError> {
-        // `.into_inner()` returns the inner `multer` stream
-        // it is `None` if we call this on the client, but always `Some(_)` on the server, so is safe to
-        // unwrap
-        let mut data = data.into_inner().unwrap();
+/// Upload and process PDF file, storing it in SQLite
+#[server(
+    input = MultipartFormData,
+)]
+pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerFnError> {
+    // Get database pool
+    let pool = crate::store::get_database_pool().await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database connection failed: {}", e)))?;
 
-        let mut buf = bytes::BytesMut::new();
-        let mut filename = "Unknown".to_string();
+    // `.into_inner()` returns the inner `multer` stream
+    // it is `None` if we call this on the client, but always `Some(_)` on the server, so is safe to
+    // unwrap
+    let mut data = data.into_inner().unwrap();
 
-        log!("Starting file upload processing...");
-        while let Ok(Some(mut field)) = data.next_field().await {
-            log!("\n[NEXT FIELD]\n");
-            let name = field.name().unwrap_or_default().to_string();
-            log!("  [NAME] {name}");
+    let mut buf = bytes::BytesMut::new();
+    let mut filename = "Unknown".to_string();
 
-            if let Some(field_filename) = field.file_name() {
-                filename = field_filename.to_string();
-                log!("  [FILENAME] {}", filename);
-            }
+    log!("Starting file upload processing...");
+    while let Ok(Some(mut field)) = data.next_field().await {
+        log!("\n[NEXT FIELD]\n");
+        let name = field.name().unwrap_or_default().to_string();
+        log!("  [NAME] {name}");
 
-            while let Ok(Some(chunk)) = field.chunk().await {
-                buf.extend_from_slice(chunk.as_ref());
-            }
+        if let Some(field_filename) = field.file_name() {
+            filename = field_filename.to_string();
+            log!("  [FILENAME] {}", filename);
         }
 
-        log!(
-            "File upload data received: {} bytes for {}",
-            buf.len(),
-            filename
-        );
-
-        if buf.is_empty() {
-            return Err(ServerFnError::new(anyhow::anyhow!("No file uploaded")));
+        while let Ok(Some(chunk)) = field.chunk().await {
+            buf.extend_from_slice(chunk.as_ref());
         }
+    }
 
+    log!(
+        "File upload data received: {} bytes for {}",
+        buf.len(),
+        filename
+    );
+
+    if buf.is_empty() {
+        return Err(ServerFnError::new(anyhow::anyhow!("No file uploaded")));
+    }
+
+    // Process PDF and render all pages in a blocking thread
+    let buf_clone = buf.clone();
+    let (page_count, page_dimensions, rendered_pages) = tokio::task::spawn_blocking(move || {
+        use pdfium_render::prelude::*;
+        
         log!("Initializing PDF library...");
         // Try multiple library locations for cargo-leptos compatibility
         // Prefer runtime env var; fall back to compile-time value from build.rs via option_env!
@@ -89,24 +98,21 @@ pub fn FileUpload() -> impl IntoView {
             Pdfium::default()
         };
 
-        log!("Loading PDF document from {} bytes...", buf.len());
-        let pdf_document = pdfium.load_pdf_from_byte_slice(&buf, None).unwrap();
+        log!("Loading PDF document from {} bytes...", buf_clone.len());
+        let pdf_document = pdfium.load_pdf_from_byte_slice(&buf_clone, None)
+            .map_err(|e| anyhow::anyhow!("Failed to load PDF: {}", e))?;
         let pages = pdf_document.pages();
         let page_count = pages.len() as usize;
         log!("PDF loaded successfully with {} pages", page_count);
 
-        // Generate a document ID for this upload
-        let doc_id = uuid::Uuid::new_v4().to_string();
-        log!("Generated document ID: {}", doc_id);
-
-        // Only extract page dimensions for metadata - don't render images yet
+        // Extract page dimensions and render all pages
         let mut page_dimensions = Vec::new();
-        log!("Extracting page dimensions for {} pages...", page_count);
+        let mut rendered_pages = Vec::new();
+        log!("Rendering all {} pages...", page_count);
 
         for page_index in 0..page_count {
-            let page: PdfPage = pdf_document.pages().get(page_index as u16).map_err(|e| {
-                ServerFnError::new(anyhow::anyhow!("Failed to get page {}: {}", page_index, e))
-            })?;
+            let page: PdfPage = pdf_document.pages().get(page_index as u16)
+                .map_err(|e| anyhow::anyhow!("Failed to get page {}: {}", page_index, e))?;
 
             // Use a reasonable DPI for web viewing (150 DPI is a good balance)
             let scale_factor = 150.0 / 72.0; // 72 DPI is PDF default
@@ -114,77 +120,136 @@ pub fn FileUpload() -> impl IntoView {
             let height = (page.height().value * scale_factor) as f32;
 
             page_dimensions.push((width, height));
+
+            // Render the page to RGBA image data
+            let render_config = PdfRenderConfig::new()
+                .set_target_width(width as i32)
+                .set_target_height(height as i32)
+                .use_lcd_text_rendering(true)
+                .render_annotations(true)
+                .render_form_data(false);
+
+            let bitmap: PdfBitmap = page
+                .render_with_config(&render_config)
+                .map_err(|e| anyhow::anyhow!("Failed to render page {}: {}", page_index, e))?;
+
+            // Convert to RGBA bytes
+            let image_data = bitmap.as_rgba_bytes();
+            
+            rendered_pages.push((page_index, image_data, width, height));
+            log!("Rendered page {} ({}x{})", page_index + 1, width as i32, height as i32);
         }
+        
+        Ok::<(usize, Vec<(f32, f32)>, Vec<(usize, Vec<u8>, f32, f32)>), anyhow::Error>((page_count, page_dimensions, rendered_pages))
+    }).await
+    .map_err(|e| ServerFnError::new(anyhow::anyhow!("PDF processing task failed: {}", e)))?
+    .map_err(|e| ServerFnError::new(e))?;
 
-        // Store the PDF data for later page rendering
-        // TODO: Consider using a proper storage system (Redis, file system, etc.)
-        // For now, we'll implement lazy loading on the client side
+    // Store the PDF document in SQLite
+    log!("Storing document in database...");
+    let document = crate::store::PdfDocument::create(&pool, filename.clone(), buf.to_vec(), page_count).await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to store document: {}", e)))?;
 
-        log!("PDF metadata extraction complete");
-        Ok(DocumentMetadata {
-            id: doc_id,
-            filename,
-            page_count,
-            page_dimensions,
-        })
+    // Store all rendered pages in the database
+    log!("Storing {} rendered pages in database...", rendered_pages.len());
+    for (page_index, image_data, width, height) in rendered_pages {
+        crate::store::DocumentPage::create(&pool, document.id, page_index, image_data, width, height).await
+            .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to store page {}: {}", page_index, e)))?;
     }
 
-    /// Render a specific page of a PDF document on demand
-    #[server]
-    pub async fn render_pdf_page(
-        doc_id: String,
-        page_index: usize,
-    ) -> Result<PageImageData, ServerFnError> {
-        log!("Rendering page {} for document {}", page_index, doc_id);
+    log!("PDF upload and storage complete with all pages rendered");
+    Ok(DocumentMetadata {
+        id: document.id.to_string(),
+        filename,
+        page_count,
+        page_dimensions,
+    })
+}
 
-        // TODO: In a real application, you'd retrieve the PDF from storage
-        // For now, this is a placeholder that shows the structure
-        // You'll need to implement proper PDF storage and retrieval
+/// Get a specific page of a PDF document from cache
+#[server]
+pub async fn get_pdf_page(
+    doc_id: String,
+    page_index: usize,
+) -> Result<PageImageData, ServerFnError> {
+    log!("Getting page {} for document {}", page_index, doc_id);
 
-        Err(ServerFnError::new(anyhow::anyhow!(
-            "PDF storage not implemented yet - page {} for doc {}",
-            page_index,
-            doc_id
-        )))
-    }
+    // Get database pool
+    let pool = crate::store::get_database_pool().await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database connection failed: {}", e)))?;
 
-    let store = expect_context::<DocumentStore>();
+    // Get the page from cache (should always be there since we render all pages during upload)
+    let doc_uuid = uuid::Uuid::parse_str(&doc_id)
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Invalid document ID: {}", e)))?;
+    
+    let cached_page = crate::store::DocumentPage::get_by_document_and_page(&pool, doc_uuid, page_index).await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database error: {}", e)))?
+        .ok_or_else(|| ServerFnError::new(anyhow::anyhow!("Page {} not found for document {}", page_index, doc_id)))?;
+
+    log!("Returning page {} for document {}", page_index, doc_id);
+    Ok(PageImageData {
+        page_index: cached_page.page_index,
+        image_data: cached_page.image_data,
+        width: cached_page.width,
+        height: cached_page.height,
+    })
+}
+
+/// Get all documents for the documents list
+#[server]
+pub async fn get_documents() -> Result<Vec<PdfDocument>, ServerFnError> {
+    let pool = crate::store::get_database_pool().await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database connection failed: {}", e)))?;
+
+    crate::store::PdfDocument::get_all(&pool).await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to get documents: {}", e)))
+}
+
+/// Delete a document and all its pages
+#[server]
+pub async fn delete_document(doc_id: String) -> Result<bool, ServerFnError> {
+    let pool = crate::store::get_database_pool().await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database connection failed: {}", e)))?;
+
+    let doc_uuid = uuid::Uuid::parse_str(&doc_id)
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Invalid document ID: {}", e)))?;
+
+    crate::store::PdfDocument::delete(&pool, doc_uuid).await
+        .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to delete document: {}", e)))
+}
+
+#[component]
+pub fn FileUpload() -> impl IntoView {
     let navigate = use_navigate();
+    let navigate_clone = navigate.clone();
 
-    // Create a server action for uploading PDFs  
-    let upload_action = ServerAction::<UploadPdf>::new();
+    // Create signals for upload state
+    let (upload_pending, set_upload_pending) = signal(false);
+    let (upload_result, set_upload_result) = signal::<Option<Result<DocumentMetadata, String>>>(None);
 
     // Handle successful upload and navigation with an effect
     Effect::new(move |_| {
-        if let Some(Ok(metadata)) = upload_action.value().get() {
+        if let Some(Ok(metadata)) = upload_result.get() {
             log!(
                 "Processing upload result for: {} ({} pages)",
                 metadata.filename,
                 metadata.page_count
             );
 
-            if let Ok(doc_id) = uuid::Uuid::parse_str(&metadata.id) {
-                log!("Creating document with ID: {}", doc_id);
+            log!("Navigating to viewer...");
+            navigate_clone(&format!("/viewer/{}/0", metadata.id), Default::default());
 
-                // Create a new document in the store with metadata only
-                let mut document = PdfDocument::new(metadata.filename.clone());
-                document.id = doc_id;
-                document.total_pages = metadata.page_count;
-                // Don't add pages yet - they'll be loaded on demand
-
-                log!("Adding document metadata to store...");
-                store.add_document(document);
-
-                log!("Navigating to viewer...");
-                navigate(&format!("/viewer/{}/0", metadata.id), Default::default());
-
-                log!(
-                    "Document upload complete: {} with {} pages",
-                    metadata.filename,
-                    metadata.page_count
-                );
-            }
+            log!(
+                "Document upload complete: {} with {} pages",
+                metadata.filename,
+                metadata.page_count
+            );
         }
+    });
+
+    // Resource to load documents list
+    let documents = Resource::new(|| (), |_| async move { 
+        get_documents().await.unwrap_or_default()
     });
 
     div()
@@ -195,7 +260,31 @@ pub fn FileUpload() -> impl IntoView {
                     .class("text-lg font-medium text-gray-900 mb-4")
                     .child("Upload PDF Document"),
                 view! {
-                    <ActionForm action=upload_action class="space-y-4" enctype="multipart/form-data">
+                    <form 
+                        on:submit=move |ev| {
+                            ev.prevent_default();
+                            if let Some(form) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlFormElement>().ok()) {
+                                let form_data = FormData::new_with_form(&form).unwrap();
+                                let multipart_data: MultipartData = form_data.into();
+                                
+                                set_upload_pending.set(true);
+                                set_upload_result.set(None);
+                                
+                                spawn_local(async move {
+                                    match upload_pdf(multipart_data).await {
+                                        Ok(metadata) => {
+                                            set_upload_result.set(Some(Ok(metadata)));
+                                        }
+                                        Err(e) => {
+                                            set_upload_result.set(Some(Err(e.to_string())));
+                                        }
+                                    }
+                                    set_upload_pending.set(false);
+                                });
+                            }
+                        }
+                        enctype="multipart/form-data"
+                    >
                         <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-gray-400 transition-colors duration-200">
                             <div class="space-y-4">
                                 <div class="flex justify-center">
@@ -223,11 +312,11 @@ pub fn FileUpload() -> impl IntoView {
                         <button
                             type="submit"
                             class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors duration-200 font-medium"
-                            disabled=move || upload_action.pending().get()
+                            disabled=move || upload_pending.get()
                         >
-                            {move || if upload_action.pending().get() { "Processing..." } else { "Upload & Analyze" }}
+                            {move || if upload_pending.get() { "Processing..." } else { "Upload & Analyze" }}
                         </button>
-                    </ActionForm>
+                    </form>
                 }
             )),
             // Status and Results Section
@@ -240,7 +329,7 @@ pub fn FileUpload() -> impl IntoView {
                     div()
                         .class("bg-gray-50 rounded-md p-4")
                         .child(move || {
-                            if upload_action.input().read().is_none() && upload_action.value().read().is_none() {
+                            if upload_result.get().is_none() && !upload_pending.get() {
                                 div()
                                     .class("flex items-center text-sm text-gray-600")
                                     .child((
@@ -258,7 +347,7 @@ pub fn FileUpload() -> impl IntoView {
                                             ),
                                         "Ready to upload a PDF document"
                                     )).into_any()
-                            } else if upload_action.pending().get() {
+                            } else if upload_pending.get() {
                                 div()
                                     .class("flex items-center text-sm text-blue-600")
                                     .child((
@@ -281,7 +370,7 @@ pub fn FileUpload() -> impl IntoView {
                                             )),
                                         "Processing PDF document..."
                                     )).into_any()
-                            } else if let Some(Ok(metadata)) = upload_action.value().get() {
+                            } else if let Some(Ok(metadata)) = upload_result.get() {
                                 div()
                                     .class("space-y-2")
                                     .child((
@@ -306,7 +395,7 @@ pub fn FileUpload() -> impl IntoView {
                                             .class("text-xs text-gray-600")
                                             .child(format!("Document: {} ({} pages)", metadata.filename, metadata.page_count))
                                     )).into_any()
-                            } else {
+                            } else if let Some(Err(error)) = upload_result.get() {
                                 div()
                                     .class("flex items-center text-sm text-red-600")
                                     .child((
@@ -322,10 +411,111 @@ pub fn FileUpload() -> impl IntoView {
                                                     .attr("stroke-width", "2")
                                                     .attr("d", "M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z")
                                             ),
-                                        "Upload failed. Please try again."
+                                        format!("Upload failed: {}", error)
+                                    )).into_any()
+                            } else {
+                                div()
+                                    .class("flex items-center text-sm text-gray-600")
+                                    .child((
+                                        svg()
+                                            .class("h-4 w-4 mr-2 text-gray-400")
+                                            .attr("fill", "none")
+                                            .attr("viewBox", "0 0 24 24")
+                                            .attr("stroke", "currentColor")
+                                            .child(
+                                                path()
+                                                    .attr("stroke-linecap", "round")
+                                                    .attr("stroke-linejoin", "round")
+                                                    .attr("stroke-width", "2")
+                                                    .attr("d", "M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z")
+                                            ),
+                                        "Ready to upload a PDF document"
                                     )).into_any()
                             }
                         })
+                )),
+            // Documents List Section
+            div()
+                .class("border-t border-gray-200 pt-6")
+                .child((
+                    h4()
+                        .class("text-sm font-medium text-gray-900 mb-3")
+                        .child("Your Documents"),
+                    div()
+                        .class("space-y-2")
+                        .child(
+                            view! {
+                                <Suspense fallback=move || view! {
+                                    <div class="flex items-center text-sm text-gray-600">
+                                        <svg class="animate-spin h-4 w-4 mr-2" fill="none" viewBox="0 0 24 24">
+                                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                        </svg>
+                                        "Loading documents..."
+                                    </div>
+                                }>
+                                    {move || {
+                                documents.get().map(|docs| {
+                                    if docs.is_empty() {
+                                        div()
+                                            .class("text-sm text-gray-500 italic")
+                                            .child("No documents uploaded yet")
+                                            .into_any()
+                                    } else {
+                                        div()
+                                            .class("space-y-2")
+                                            .child(docs.into_iter().map(|doc| {
+                                                div()
+                                                    .class("flex items-center justify-between p-3 bg-white border border-gray-200 rounded-lg hover:bg-gray-50")
+                                                    .child((
+                                                        div()
+                                                            .class("flex-1")
+                                                            .child((
+                                                                div()
+                                                                    .class("text-sm font-medium text-gray-900")
+                                                                    .child(doc.name.clone()),
+                                                                div()
+                                                                    .class("text-xs text-gray-500")
+                                                                    .child(format!("{} pages • {}", doc.total_pages, doc.created_at.format("%Y-%m-%d %H:%M")))
+                                                            )),
+                                                        div()
+                                                            .class("flex items-center space-x-2")
+                                                            .child((
+                                                                button()
+                                                                    .class("text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200")
+                                                                    .on(ev::click, {
+                                                                        let doc_id = doc.id.to_string();
+                                                                        let navigate_copy = navigate.clone();
+                                                                        move |_| {
+                                                                            navigate_copy(&format!("/viewer/{}/0", doc_id), Default::default());
+                                                                        }
+                                                                    })
+                                                                    .child("View"),
+                                                                button()
+                                                                    .class("text-xs px-2 py-1 bg-red-100 text-red-700 rounded hover:bg-red-200")
+                                                                    .on(ev::click, {
+                                                                        let doc_id = doc.id.to_string();
+                                                                        let documents_copy = documents.clone();
+                                                                        move |_| {
+                                                                            let doc_id_clone = doc_id.clone();
+                                                                            spawn_local(async move {
+                                                                                if let Ok(_) = delete_document(doc_id_clone).await {
+                                                                                    documents_copy.refetch();
+                                                                                }
+                                                                            });
+                                                                        }
+                                                                    })
+                                                                    .child("Delete")
+                                                            ))
+                                                    ))
+                                            }).collect::<Vec<_>>())
+                                            .into_any()
+                                    }
+                                })
+                                    }}
+                                </Suspense>
+                            }
+                        )
                 ))
         ))
 }

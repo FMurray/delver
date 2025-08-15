@@ -31,10 +31,12 @@ leptos_axum = { version = "0.8.5", optional = true }
 leptos_meta = { version = "0.8.0" }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 wasm-bindgen = { version = "=0.2.100"}
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "ImageData"] }
 server_fn = { version = "0.8.5", features = ["serde-lite", "rkyv", "multipart", "postcard"] }
 bytes = "1.6.1"
 chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"], optional = true }
 
 [features]
 hydrate = [
@@ -45,6 +47,7 @@ ssr = [
     "dep:axum",
     "dep:tokio",
     "dep:leptos_axum",
+    "dep:sqlx",
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",
