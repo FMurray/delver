@@ -5,6 +5,7 @@ use leptos::svg::*;
 
 use leptos::wasm_bindgen::JsCast;
 use leptos::web_sys::{FormData, HtmlFormElement};
+use leptos_router::hooks::use_navigate;
 use pdfium_render::prelude::*;
 use server_fn::codec::{MultipartData, MultipartFormData};
 
@@ -47,7 +48,7 @@ fn get_document_images(pdf_document: pdfium_render::prelude::PdfDocument) -> Vec
 
 #[component]
 pub fn FileUpload() -> impl IntoView {
-    /// Upload and process PDF file, returning document ID and basic info
+    /// Upload and process PDF file, returning document data for client navigation
     #[server(
         input = MultipartFormData,
     )]
@@ -109,14 +110,14 @@ pub fn FileUpload() -> impl IntoView {
     }
 
     let store = expect_context::<DocumentStore>();
-    // let navigate = leptos_router::use_navigate();
+    let navigate = use_navigate();
 
-    let upload_action = Action::new_local(move |data: &FormData| {
+    let upload_action = Action::new_local(|data: &FormData| {
         // `MultipartData` implements `From<FormData>`
         file_upload(data.clone().into())
     });
 
-    // Handle successful upload
+    // Handle successful upload and navigation
     Effect::new(move |_| {
         if let Some(Ok((doc_id_str, filename, page_count))) = upload_action.value().get() {
             if let Ok(doc_id) = uuid::Uuid::parse_str(&doc_id_str) {
@@ -128,7 +129,9 @@ pub fn FileUpload() -> impl IntoView {
                 // Add to store
                 store.add_document(document);
 
-                // For now, just log successful upload
+                // Navigate to the viewer
+                navigate(&format!("/viewer/{}/0", doc_id_str), Default::default());
+
                 log!("Document uploaded: {} with {} pages", filename, page_count);
             }
         }

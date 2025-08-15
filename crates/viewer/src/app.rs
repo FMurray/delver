@@ -22,7 +22,7 @@ use leptos::prelude::*;
 use leptos_meta::*;
 use leptos_router::{
     components::{Route, Router, Routes},
-    StaticSegment,
+    path, StaticSegment,
 };
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -64,6 +64,8 @@ pub fn App() -> impl IntoView {
                     </Show>
                     <Routes fallback=|| "Page not found.".into_view()>
                         <Route path=StaticSegment("") view=Home/>
+                        <Route path=path!("/viewer/:doc_id/:page_id") view=PdfViewer/>
+                        <Route path=path!("/viewer/:doc_id") view=PdfViewer/>
                     </Routes>
                 </div>
             </div>
