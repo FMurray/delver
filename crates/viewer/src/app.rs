@@ -1,5 +1,3 @@
-use pdfium_render::prelude::*;
-
 // #[cfg(target_arch = "wasm32")]
 // use {
 //     futures_channel::oneshot,
@@ -15,6 +13,8 @@ use pdfium_render::prelude::*;
 // use crate::ui_controls;
 // use crate::utils;
 use crate::components::file_upload::FileUpload;
+use crate::components::pdf_viewer::PdfViewer;
+use crate::store::DocumentStore;
 
 use leptos::html::*;
 use leptos::logging::log;
@@ -47,6 +47,11 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+
+    // Provide the document store context
+    let store = DocumentStore::new();
+    provide_context(store);
+
     let (show, set_show) = signal(false);
     let _ctx = provide_context::<(ReadSignal<bool>, WriteSignal<bool>)>((show, set_show));
     view! {

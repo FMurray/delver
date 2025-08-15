@@ -8,25 +8,69 @@ use leptos::web_sys::{FormData, HtmlFormElement};
 use pdfium_render::prelude::*;
 use server_fn::codec::{MultipartData, MultipartFormData};
 
+use crate::store::{DocumentStore, PdfDocument};
+
+// Function to render PDF pages to images - will be used later
+#[allow(dead_code)]
+fn get_document_images(pdf_document: pdfium_render::prelude::PdfDocument) -> Vec<Vec<u8>> {
+    let mut textures = Vec::new();
+
+    for page_index in 0..pdf_document.pages().len() {
+        let page: PdfPage = pdf_document
+            .pages()
+            .get(page_index)
+            .map_err(|e| anyhow::anyhow!("Failed to get page {}: {}", page_index, e))
+            .unwrap();
+
+        let width = page.width().value as i32;
+        let height = page.height().value as i32;
+
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(width)
+            .set_target_height(height)
+            .use_lcd_text_rendering(true)
+            .render_annotations(true)
+            .render_form_data(false);
+
+        let bitmap: PdfBitmap = page
+            .render_with_config(&render_config)
+            .map_err(|e| anyhow::anyhow!("Failed to render page {}: {}", page_index, e))
+            .unwrap();
+
+        // Convert to RGBA - use as_rgba_bytes() which handles format conversion
+        let pixels = bitmap.as_rgba_bytes();
+        textures.push(pixels);
+    }
+
+    textures
+}
+
 #[component]
 pub fn FileUpload() -> impl IntoView {
-    /// A simple file upload function, which does just returns the length of the file.
-    ///
-    /// On the server, this uses the `multer` crate, which provides a streaming API.
+    /// Upload and process PDF file, returning document ID and basic info
     #[server(
         input = MultipartFormData,
     )]
-    pub async fn file_length(data: MultipartData) -> Result<usize, ServerFnError> {
+    pub async fn file_upload(
+        data: MultipartData,
+    ) -> Result<(String, String, usize), ServerFnError> {
         // `.into_inner()` returns the inner `multer` stream
         // it is `None` if we call this on the client, but always `Some(_)` on the server, so is safe to
         // unwrap
         let mut data = data.into_inner().unwrap();
 
         let mut buf = bytes::BytesMut::new();
+        let mut filename = "Unknown".to_string();
+
         while let Ok(Some(mut field)) = data.next_field().await {
             log!("\n[NEXT FIELD]\n");
             let name = field.name().unwrap_or_default().to_string();
             log!("  [NAME] {name}");
+
+            if let Some(field_filename) = field.file_name() {
+                filename = field_filename.to_string();
+            }
+
             while let Ok(Some(chunk)) = field.chunk().await {
                 buf.extend_from_slice(chunk.as_ref());
             }
@@ -53,14 +97,41 @@ pub fn FileUpload() -> impl IntoView {
         };
 
         let pdf_document = pdfium.load_pdf_from_byte_slice(&buf, None).unwrap();
-        let _pages = pdf_document.pages();
+        let pages = pdf_document.pages();
+        let page_count = pages.len() as usize;
 
-        Ok(buf.len())
+        // Generate a document ID for this upload
+        let doc_id = uuid::Uuid::new_v4().to_string();
+
+        // Note: In a real implementation, you would store the rendered images here
+        // For now, we'll just return the basic info and handle image rendering on the client
+        Ok((doc_id, filename, page_count))
     }
 
-    let upload_action = Action::new_local(|data: &FormData| {
+    let store = expect_context::<DocumentStore>();
+    // let navigate = leptos_router::use_navigate();
+
+    let upload_action = Action::new_local(move |data: &FormData| {
         // `MultipartData` implements `From<FormData>`
-        file_length(data.clone().into())
+        file_upload(data.clone().into())
+    });
+
+    // Handle successful upload
+    Effect::new(move |_| {
+        if let Some(Ok((doc_id_str, filename, page_count))) = upload_action.value().get() {
+            if let Ok(doc_id) = uuid::Uuid::parse_str(&doc_id_str) {
+                // Create a new document in the store
+                let mut document = PdfDocument::new(filename.clone());
+                document.id = doc_id;
+                document.total_pages = page_count;
+
+                // Add to store
+                store.add_document(document);
+
+                // For now, just log successful upload
+                log!("Document uploaded: {} with {} pages", filename, page_count);
+            }
+        }
     });
 
     div()
@@ -176,7 +247,7 @@ pub fn FileUpload() -> impl IntoView {
                                             )),
                                         "Processing PDF document..."
                                     )).into_any()
-                            } else if let Some(Ok(value)) = upload_action.value().get() {
+                            } else if let Some(Ok((_doc_id, filename, page_count))) = upload_action.value().get() {
                                 div()
                                     .class("space-y-2")
                                     .child((
@@ -199,7 +270,7 @@ pub fn FileUpload() -> impl IntoView {
                                             )),
                                         div()
                                             .class("text-xs text-gray-600")
-                                            .child(format!("File size: {:.1} KB", value as f64 / 1024.0))
+                                            .child(format!("Document: {} ({} pages)", filename, page_count))
                                     )).into_any()
                             } else {
                                 div()

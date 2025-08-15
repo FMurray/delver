@@ -1108,6 +1108,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -7749,6 +7750,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "console_error_panic_hook",
  "delver-core",
  "eframe",
