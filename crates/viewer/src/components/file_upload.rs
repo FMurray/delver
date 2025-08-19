@@ -45,27 +45,16 @@ pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerF
     let mut buf = bytes::BytesMut::new();
     let mut filename = "Unknown".to_string();
 
-    log!("Starting file upload processing...");
     while let Ok(Some(mut field)) = data.next_field().await {
-        log!("\n[NEXT FIELD]\n");
         let name = field.name().unwrap_or_default().to_string();
-        log!("  [NAME] {name}");
-
         if let Some(field_filename) = field.file_name() {
             filename = field_filename.to_string();
-            log!("  [FILENAME] {}", filename);
         }
 
         while let Ok(Some(chunk)) = field.chunk().await {
             buf.extend_from_slice(chunk.as_ref());
         }
     }
-
-    log!(
-        "File upload data received: {} bytes for {}",
-        buf.len(),
-        filename
-    );
 
     if buf.is_empty() {
         return Err(ServerFnError::new(anyhow::anyhow!("No file uploaded")));
@@ -76,14 +65,12 @@ pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerF
     let (page_count, page_dimensions, rendered_pages) = tokio::task::spawn_blocking(move || {
         use pdfium_render::prelude::*;
         
-        log!("Initializing PDF library...");
         // Try multiple library locations for cargo-leptos compatibility
         // Prefer runtime env var; fall back to compile-time value from build.rs via option_env!
         let runtime_or_compile_time_path = std::env::var("PDFIUM_LIBRARY_PATH")
             .ok()
             .or_else(|| option_env!("PDFIUM_LIBRARY_PATH").map(|s| s.to_string()));
 
-        log!("PDF library path: {:?}", runtime_or_compile_time_path);
         let pdfium = if let Some(custom_path) = runtime_or_compile_time_path {
             Pdfium::new(
                 Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&custom_path))
@@ -98,17 +85,14 @@ pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerF
             Pdfium::default()
         };
 
-        log!("Loading PDF document from {} bytes...", buf_clone.len());
         let pdf_document = pdfium.load_pdf_from_byte_slice(&buf_clone, None)
             .map_err(|e| anyhow::anyhow!("Failed to load PDF: {}", e))?;
         let pages = pdf_document.pages();
         let page_count = pages.len() as usize;
-        log!("PDF loaded successfully with {} pages", page_count);
 
         // Extract page dimensions and render all pages
         let mut page_dimensions = Vec::new();
         let mut rendered_pages = Vec::new();
-        log!("Rendering all {} pages...", page_count);
 
         for page_index in 0..page_count {
             let page: PdfPage = pdf_document.pages().get(page_index as u16)
@@ -136,8 +120,7 @@ pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerF
             // Convert to RGBA bytes
             let image_data = bitmap.as_rgba_bytes();
             
-            rendered_pages.push((page_index, image_data, width, height));
-            log!("Rendered page {} ({}x{})", page_index + 1, width as i32, height as i32);
+            rendered_pages.push((page_index, image_data, width, height));   
         }
         
         Ok::<(usize, Vec<(f32, f32)>, Vec<(usize, Vec<u8>, f32, f32)>), anyhow::Error>((page_count, page_dimensions, rendered_pages))
@@ -146,18 +129,15 @@ pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerF
     .map_err(|e| ServerFnError::new(e))?;
 
     // Store the PDF document in SQLite
-    log!("Storing document in database...");
     let document = crate::store::PdfDocument::create(&pool, filename.clone(), buf.to_vec(), page_count).await
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to store document: {}", e)))?;
 
     // Store all rendered pages in the database
-    log!("Storing {} rendered pages in database...", rendered_pages.len());
     for (page_index, image_data, width, height) in rendered_pages {
         crate::store::DocumentPage::create(&pool, document.id, page_index, image_data, width, height).await
             .map_err(|e| ServerFnError::new(anyhow::anyhow!("Failed to store page {}: {}", page_index, e)))?;
     }
 
-    log!("PDF upload and storage complete with all pages rendered");
     Ok(DocumentMetadata {
         id: document.id.to_string(),
         filename,
@@ -166,47 +146,33 @@ pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerF
     })
 }
 
-/// Get a specific page of a PDF document from cache as raw PNG bytes
+/// Get a specific page of a PDF document from cache as raw WebP bytes
 #[server]
 pub async fn get_pdf_page(
     doc_id: String,
     page_index: usize,
 ) -> Result<Vec<u8>, ServerFnError> {
-    let start_time = std::time::Instant::now();
-    log!("[TIMING] get_pdf_page START: Getting page {} for document {}", page_index, doc_id);
-
     // Get database pool
-    let pool_start = std::time::Instant::now();
     let pool = crate::store::get_database_pool().await
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database connection failed: {}", e)))?;
-    let pool_elapsed = pool_start.elapsed();
-    log!("[TIMING] Database pool acquisition took: {:?}", pool_elapsed);
 
     // Parse UUID
-    let uuid_start = std::time::Instant::now();
     let doc_uuid = uuid::Uuid::parse_str(&doc_id)
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Invalid document ID: {}", e)))?;
-    let uuid_elapsed = uuid_start.elapsed();
-    log!("[TIMING] UUID parsing took: {:?}", uuid_elapsed);
     
     // Get the page from cache (should always be there since we render all pages during upload)
-    let query_start = std::time::Instant::now();
     let cached_page = crate::store::DocumentPage::get_by_document_and_page(&pool, doc_uuid, page_index).await
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database error: {}", e)))?
         .ok_or_else(|| ServerFnError::new(anyhow::anyhow!("Page {} not found for document {}", page_index, doc_id)))?;
-    let query_elapsed = query_start.elapsed();
-    log!("[TIMING] Database query took: {:?}", query_elapsed);
 
-    // Convert RGBA data to PNG for efficient transfer
-    let data_start = std::time::Instant::now();
+    // Convert RGBA data to WebP for efficient transfer
     let rgba_data_size = cached_page.image_data.len();
-    log!("[TIMING] Converting RGBA data ({} bytes) to PNG...", rgba_data_size);
     
-    // Convert RGBA to PNG using image crate
+    // Convert RGBA to WebP using image crate
     let width = cached_page.width as u32;
     let height = cached_page.height as u32;
     
-    let png_bytes = tokio::task::spawn_blocking(move || {
+    let webp_bytes = tokio::task::spawn_blocking(move || {
         use image::{ImageBuffer, RgbaImage, ImageFormat};
         use std::io::Cursor;
         
@@ -214,35 +180,20 @@ pub async fn get_pdf_page(
         let img: RgbaImage = ImageBuffer::from_raw(width, height, cached_page.image_data)
             .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from RGBA data"))?;
         
-        // Encode as PNG
-        let mut png_data = Vec::new();
+        // Encode as WebP with high quality (85% is a good balance of size vs quality)
+        let mut webp_data = Vec::new();
         {
-            let mut cursor = Cursor::new(&mut png_data);
-            img.write_to(&mut cursor, ImageFormat::Png)
-                .map_err(|e| anyhow::anyhow!("Failed to encode PNG: {}", e))?;
+            let mut cursor = Cursor::new(&mut webp_data);
+            img.write_to(&mut cursor, ImageFormat::WebP)
+                .map_err(|e| anyhow::anyhow!("Failed to encode WebP: {}", e))?;
         }
         
-        Ok::<Vec<u8>, anyhow::Error>(png_data)
+        Ok::<Vec<u8>, anyhow::Error>(webp_data)
     }).await
-    .map_err(|e| ServerFnError::new(anyhow::anyhow!("PNG encoding task failed: {}", e)))?
+    .map_err(|e| ServerFnError::new(anyhow::anyhow!("WebP encoding task failed: {}", e)))?
     .map_err(|e| ServerFnError::new(e))?;
     
-    let png_size = png_bytes.len();
-    let compression_ratio = rgba_data_size as f64 / png_size as f64;
-    log!("[TIMING] PNG conversion complete: {} bytes -> {} bytes ({}x compression)", 
-        rgba_data_size, png_size, compression_ratio);
-    
-    let data_elapsed = data_start.elapsed();
-    log!("[TIMING] Data preparation and PNG encoding took: {:?}", data_elapsed);
-
-    // Log just before we return (this is where streaming happens)
-    let total_elapsed = start_time.elapsed();
-    log!(
-        "[TIMING] get_pdf_page SERVER COMPLETE: Total server time {:?} (pool: {:?}, uuid: {:?}, query: {:?}, data: {:?}) for page {} of document {} - streaming {} PNG bytes",
-        total_elapsed, pool_elapsed, uuid_elapsed, query_elapsed, data_elapsed, page_index, doc_id, png_size
-    );
-
-    Ok(png_bytes)
+    Ok(webp_bytes)
 }
 
 /// Get all documents for the documents list
@@ -293,20 +244,7 @@ pub fn FileUpload() -> impl IntoView {
     // Handle successful upload and navigation with an effect
     Effect::new(move |_| {
         if let Some(Ok(metadata)) = upload_result.get() {
-            log!(
-                "Processing upload result for: {} ({} pages)",
-                metadata.filename,
-                metadata.page_count
-            );
-
-            log!("Navigating to viewer...");
             navigate_clone(&format!("/viewer/{}/0", metadata.id), Default::default());
-
-            log!(
-                "Document upload complete: {} with {} pages",
-                metadata.filename,
-                metadata.page_count
-            );
         }
     });
 

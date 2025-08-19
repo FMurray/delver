@@ -3,7 +3,6 @@ use uuid::Uuid;
 
 #[cfg(feature = "ssr")]
 use {
-    leptos::logging::log,
     sqlx::{Row, SqlitePool},
     std::collections::HashMap,
 };
@@ -163,14 +162,6 @@ impl DocumentPage {
         document_id: Uuid,
         page_index: usize,
     ) -> Result<Option<DocumentPage>, sqlx::Error> {
-        let start_time = std::time::Instant::now();
-        log!(
-            "[TIMING] DB get_by_document_and_page START: doc_id={}, page_index={}",
-            document_id,
-            page_index
-        );
-
-        let query_start = std::time::Instant::now();
         let result = sqlx::query(
             "SELECT page_index, image_data, width, height FROM document_pages WHERE document_id = ? AND page_index = ?"
         )
@@ -178,17 +169,8 @@ impl DocumentPage {
         .bind(page_index as i32)
         .fetch_optional(pool)
         .await?;
-        let query_elapsed = query_start.elapsed();
-        log!("[TIMING] DB SQL query execution took: {:?}", query_elapsed);
 
-        let parse_start = std::time::Instant::now();
         let parsed_result = if let Some(row) = result {
-            let image_data_size = row.get::<Vec<u8>, _>("image_data").len();
-            log!(
-                "[TIMING] DB Retrieved image data size: {} bytes",
-                image_data_size
-            );
-
             Some(DocumentPage {
                 page_index: row.get::<i32, _>("page_index") as usize,
                 image_data: row.get("image_data"),
@@ -198,15 +180,6 @@ impl DocumentPage {
         } else {
             None
         };
-        let parse_elapsed = parse_start.elapsed();
-        log!("[TIMING] DB Row parsing took: {:?}", parse_elapsed);
-
-        let total_elapsed = start_time.elapsed();
-        log!(
-            "[TIMING] DB get_by_document_and_page COMPLETE: Total time {:?} (query: {:?}, parse: {:?}) for doc_id={}, page_index={}",
-            total_elapsed, query_elapsed, parse_elapsed, document_id, page_index
-        );
-
         Ok(parsed_result)
     }
 
@@ -276,43 +249,17 @@ pub async fn create_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 // Connection pool utilities
 #[cfg(feature = "ssr")]
 pub async fn get_database_pool() -> Result<SqlitePool, sqlx::Error> {
-    let start_time = std::time::Instant::now();
-    log!("[TIMING] DB get_database_pool START");
-
     use sqlx::sqlite::SqliteConnectOptions;
     use std::str::FromStr;
 
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:delver.db".to_string());
-    log!("[TIMING] DB Using database URL: {}", database_url);
 
     // Parse the database URL and ensure the file is created if it doesn't exist
-    let options_start = std::time::Instant::now();
     let connect_options = SqliteConnectOptions::from_str(&database_url)?.create_if_missing(true);
-    let options_elapsed = options_start.elapsed();
-    log!(
-        "[TIMING] DB Connection options creation took: {:?}",
-        options_elapsed
-    );
 
-    let connect_start = std::time::Instant::now();
     let pool = SqlitePool::connect_with(connect_options).await?;
-    let connect_elapsed = connect_start.elapsed();
-    log!("[TIMING] DB Pool connection took: {:?}", connect_elapsed);
-
-    let tables_start = std::time::Instant::now();
     create_tables(&pool).await?;
-    let tables_elapsed = tables_start.elapsed();
-    log!(
-        "[TIMING] DB Table creation/verification took: {:?}",
-        tables_elapsed
-    );
-
-    let total_elapsed = start_time.elapsed();
-    log!(
-        "[TIMING] DB get_database_pool COMPLETE: Total time {:?} (options: {:?}, connect: {:?}, tables: {:?})",
-        total_elapsed, options_elapsed, connect_elapsed, tables_elapsed
-    );
 
     Ok(pool)
 }

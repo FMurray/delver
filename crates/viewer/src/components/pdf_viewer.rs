@@ -2,36 +2,33 @@ use leptos::html::*;
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 use leptos::ev;
-use leptos::logging::log;
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, Blob, BlobPropertyBag};
 
 use crate::components::file_upload::{get_pdf_page, get_documents, get_document_by_id};
 
-// Helper function to render PNG data to a canvas using an HTML Image element
-fn render_png_to_canvas(canvas: &HtmlCanvasElement, png_data: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
-    log!("[TIMING] CANVAS render_png_to_canvas START: {} PNG bytes", png_data.len());
-    
+// Helper function to render WebP data to a canvas using an HTML Image element
+fn render_webp_to_canvas(canvas: &HtmlCanvasElement, webp_data: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
     let context = canvas
         .get_context("2d")?
         .unwrap()
         .dyn_into::<CanvasRenderingContext2d>()?;
 
-    // Create a blob from PNG data
-    let uint8_array = js_sys::Uint8Array::new_with_length(png_data.len() as u32);
-    uint8_array.copy_from(png_data);
+    // Create a blob from WebP data
+    let uint8_array = js_sys::Uint8Array::new_with_length(webp_data.len() as u32);
+    uint8_array.copy_from(webp_data);
     
     let blob_parts = js_sys::Array::new();
     blob_parts.push(&uint8_array);
     
     let blob_property_bag = BlobPropertyBag::new();
-    blob_property_bag.set_type("image/png");
+    blob_property_bag.set_type("image/webp");
     
     let blob = Blob::new_with_u8_array_sequence_and_options(&blob_parts, &blob_property_bag)?;
     let url = web_sys::Url::create_object_url_with_blob(&blob)?;
     
-    // Create an Image element and load the PNG
+    // Create an Image element and load the WebP
     let img = HtmlImageElement::new()?;
     let img_clone = img.clone();
     let canvas_clone = canvas.clone();
@@ -39,8 +36,6 @@ fn render_png_to_canvas(canvas: &HtmlCanvasElement, png_data: &[u8]) -> Result<(
     let url_clone = url.clone();
     
     let onload = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-        log!("[TIMING] CANVAS PNG image loaded, drawing to canvas");
-        
         // Set canvas size to match image
         canvas_clone.set_width(img_clone.natural_width());
         canvas_clone.set_height(img_clone.natural_height());
@@ -50,8 +45,6 @@ fn render_png_to_canvas(canvas: &HtmlCanvasElement, png_data: &[u8]) -> Result<(
         
         // Clean up the object URL
         let _ = web_sys::Url::revoke_object_url(&url_clone);
-        
-        log!("[TIMING] CANVAS PNG rendering complete: {}x{}", img_clone.natural_width(), img_clone.natural_height());
     }) as Box<dyn FnMut()>);
     
     img.set_onload(Some(onload.as_ref().unchecked_ref()));
@@ -66,9 +59,6 @@ fn render_png_to_canvas(canvas: &HtmlCanvasElement, png_data: &[u8]) -> Result<(
 
 #[component]
 pub fn PdfViewer() -> impl IntoView {
-    use leptos::logging::log;
-    
-    log!("PdfViewer component initializing...");
     let params = use_params_map();
 
     let doc_id = Memo::new(move |_| {
@@ -77,7 +67,6 @@ pub fn PdfViewer() -> impl IntoView {
                 .get("doc_id")
                 .and_then(|id| Uuid::parse_str(&id).ok())
         });
-        log!("Doc ID memo updated: {:?}", result);
         result
     });
 
@@ -88,7 +77,6 @@ pub fn PdfViewer() -> impl IntoView {
                 .and_then(|p| p.parse::<usize>().ok())
                 .unwrap_or(0)
         });
-        log!("Page ID memo updated: {}", result);
         result
     });
 
@@ -96,7 +84,6 @@ pub fn PdfViewer() -> impl IntoView {
     let documents = Resource::new(
         move || doc_id.get(),
         move |_| async move {
-            log!("Fetching documents list...");
             get_documents().await.unwrap_or_default()
         }
     );
@@ -106,7 +93,6 @@ pub fn PdfViewer() -> impl IntoView {
         move || doc_id.get().map(|id| id.to_string()),
         move |doc_id_opt| async move {
             if let Some(doc_id) = doc_id_opt {
-                log!("Fetching individual document {}", doc_id);
                 get_document_by_id(doc_id).await.unwrap_or(None)
             } else {
                 None
@@ -120,20 +106,8 @@ pub fn PdfViewer() -> impl IntoView {
         move |(doc_id_opt, page_idx)| {
             async move {
                 if let Some(doc_id) = doc_id_opt {
-                    log!("[TIMING] CLIENT get_pdf_page START: Loading page {} for document {}", page_idx, doc_id);
-                    
                     let result = get_pdf_page(doc_id.clone(), page_idx).await;
-                    
-                    match result {
-                        Ok(png_bytes) => {
-                            log!("[TIMING] CLIENT get_pdf_page SUCCESS: Received {} PNG bytes for page {}", png_bytes.len(), page_idx);
-                            Ok(png_bytes)
-                        }
-                        Err(e) => {
-                            log!("[TIMING] CLIENT get_pdf_page ERROR: {}", e);
-                            Err(e)
-                        }
-                    }
+                    result
                 } else {
                     Err(server_fn::ServerFnError::new(anyhow::anyhow!("No document ID")))
                 }
@@ -146,11 +120,9 @@ pub fn PdfViewer() -> impl IntoView {
     // Canvas ref for rendering
     let canvas_ref = NodeRef::<Canvas>::new();
 
-    log!("PdfViewer component rendering");
     div()
         .class("h-full flex flex-col bg-gray-50")
         .child(move || {
-            log!("PdfViewer child function called");
             
             // Show loading state while documents are loading
             view! {
@@ -176,7 +148,6 @@ pub fn PdfViewer() -> impl IntoView {
                     let doc = doc.or_else(|| fallback_document.get().flatten());
                     
                     if let Some(doc) = doc {
-                    log!("Document available for rendering: {} ({} pages)", doc.name, doc.total_pages);
                     div()
                         .class("h-full flex flex-col")
                         .child((
@@ -233,9 +204,7 @@ pub fn PdfViewer() -> impl IntoView {
                             main().class("flex-1 p-6 overflow-auto").child(
                                 div().class("flex justify-center").child(
                                     div().class("bg-white rounded-lg shadow-lg p-4").child(
-                                        move || {
-                                            log!("PDF page content render function called");
-                                            
+                                        move || {                                            
                                             view! {
                                                 <Suspense fallback=move || view! {
                                                     <div class="text-center">
@@ -250,26 +219,14 @@ pub fn PdfViewer() -> impl IntoView {
                                                 }>
                                                     {move || {
                                                 // Access page_resource within Suspense boundary  
-                                                if let Some(Ok(png_bytes)) = page_resource.get() {
-                                                    log!("PNG data available for page {}: {} bytes", page_id.get(), png_bytes.len());
+                                                if let Some(Ok(webp_bytes)) = page_resource.get() {
                                                     
-                                                    // Effect to render to canvas when PNG data changes
+                                                    // Effect to render to canvas when WebP data changes
                                                     Effect::new({
-                                                        let canvas_ref = canvas_ref.clone();
-                                                        let png_data = png_bytes.clone();
-                                                        let current_page = page_id.get();
-                                                        move |_| { 
-                                                            log!("[TIMING] CANVAS effect START: triggered for page {} with {} PNG bytes", current_page, png_data.len());
+                                                        move |_| {
                                                             if let Some(canvas_element) = canvas_ref.get() {
                                                                 if let Ok(canvas) = canvas_element.dyn_into::<HtmlCanvasElement>() {
-                                                                    match render_png_to_canvas(&canvas, &png_data) {
-                                                                        Ok(_) => {
-                                                                            log!("[TIMING] CANVAS effect COMPLETE: page {} PNG rendered successfully", current_page);
-                                                                        }
-                                                                        Err(e) => {
-                                                                            log!("[ERROR] CANVAS rendering failed for page {}: {:?}", current_page, e);
-                                                                        }
-                                                                    }
+                                                                   let _ = render_webp_to_canvas(&canvas, &webp_bytes);
                                                                 }
                                                             }
                                                         }
@@ -282,12 +239,9 @@ pub fn PdfViewer() -> impl IntoView {
                                                             canvas()
                                                                 .class("border border-gray-200 max-w-full h-auto")
                                                                 .node_ref(canvas_ref)
-                                                        ),
-                                                        p().class("text-sm text-gray-500")
-                                                            .child(format!("{} bytes PNG", png_bytes.len())),
+                                                        )
                                                     )).into_any()
                                                 } else {
-                                                    log!("No PNG data available for page {}", page_id.get());
                                                     div().class("text-center").child((
                                                         h3().class("text-lg font-medium text-gray-900 mb-2")
                                                             .child(move || format!("Page {}", page_id.get() + 1)),
@@ -307,7 +261,6 @@ pub fn PdfViewer() -> impl IntoView {
                         ))
                         .into_any()
                     } else {
-                        log!("Document not found for ID: {:?}", id);
                         div()
                             .class("flex-1 flex items-center justify-center")
                             .child(
@@ -321,7 +274,6 @@ pub fn PdfViewer() -> impl IntoView {
                             .into_any()
                     }
                 } else {
-                    log!("No document ID or documents not loaded");
                     div()
                         .class("flex-1 flex items-center justify-center")
                         .child(

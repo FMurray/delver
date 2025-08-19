@@ -20,7 +20,7 @@ rstar = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 geo = { workspace = true }
-image = { workspace = true }
+image = { workspace = true, features = ["webp"] }
 base64 = { workspace = true }
 uuid = { version = "1.8.0", features = ["v4", "serde", "js"] }
 futures-channel = "0.3"

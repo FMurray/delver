@@ -36,7 +36,7 @@ multi_index_map = "0.11.0"
 geo = "0.29.3"
 anyhow = "1.0.98"
 base64 = "0.22.1"
-image = "0.25.6"
+image = { version = "0.25.6", features = ["webp"] }
 dashmap = "6.1.0"
 smallvec = "1.15.1"
 flamegraph = "0.6.7"

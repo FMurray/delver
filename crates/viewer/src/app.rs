@@ -16,7 +16,6 @@ use crate::components::file_upload::FileUpload;
 use crate::components::pdf_viewer::PdfViewer;
 
 use leptos::html::*;
-use leptos::logging::log;
 use leptos::prelude::*;
 use leptos_meta::*;
 use leptos_router::{
@@ -80,7 +79,6 @@ pub fn MainNav() -> impl IntoView {
                     <button
                         class="inline-flex items-center justify-center p-2 rounded-md text-gray-400 hover:text-gray-500 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500 transition-colors duration-200"
                         on:click=move |_| {
-                            log!("toggleSidebar");
                             set_show.set(!show.get());
                         }
                         aria-label="Toggle sidebar"
