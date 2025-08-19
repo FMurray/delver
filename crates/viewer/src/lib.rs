@@ -8,6 +8,9 @@ pub mod store;
 // pub mod ui_controls;
 // pub mod utils;
 
+#[cfg(feature = "ssr")]
+pub mod language_server;
+
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {

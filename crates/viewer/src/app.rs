@@ -14,6 +14,8 @@
 // use crate::utils;
 use crate::components::file_upload::FileUpload;
 use crate::components::pdf_viewer::PdfViewer;
+use crate::components::query_panel::QueryPanel;
+use crate::components::ui::Toggle;
 
 use leptos::html::*;
 use leptos::prelude::*;
@@ -22,6 +24,13 @@ use leptos_router::{
     components::{Route, Router, Routes},
     path, StaticSegment,
 };
+
+// Context types to differentiate between sidebar and query contexts
+#[derive(Clone, Copy)]
+pub struct SidebarContext(pub ReadSignal<bool>, pub WriteSignal<bool>);
+
+#[derive(Clone, Copy)]
+pub struct QueryContext(pub ReadSignal<bool>, pub WriteSignal<bool>);
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -46,14 +55,18 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 pub fn App() -> impl IntoView {
     provide_meta_context();
 
-    let (show, set_show) = signal(false);
-    let _ctx = provide_context::<(ReadSignal<bool>, WriteSignal<bool>)>((show, set_show));
+    let (show_sidebar, set_show_sidebar) = signal(false);
+    let (show_query, set_show_query) = signal(false);
+
+    provide_context(SidebarContext(show_sidebar, set_show_sidebar));
+    provide_context(QueryContext(show_query, set_show_query));
+
     view! {
         <Router>
             <div class="h-screen flex flex-col bg-gray-50">
                 <MainNav />
                 <div class="flex flex-1 overflow-hidden">
-                    <Show when=move || show.get()>
+                    <Show when=move || show_sidebar.get()>
                         <SidePanel />
                     </Show>
                     <Routes fallback=|| "Page not found.".into_view()>
@@ -62,6 +75,9 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/viewer/:doc_id") view=PdfViewer/>
                     </Routes>
                 </div>
+                <Show when=move || show_query.get()>
+                    <QueryPanel />
+                </Show>
             </div>
         </Router>
     }
@@ -69,38 +85,28 @@ pub fn App() -> impl IntoView {
 
 #[component]
 pub fn MainNav() -> impl IntoView {
-    let (show, set_show) =
-        use_context::<(ReadSignal<bool>, WriteSignal<bool>)>().expect("setter context in nav");
+    let SidebarContext(show_sidebar, set_show_sidebar) =
+        use_context::<SidebarContext>().expect("sidebar context in nav");
+    let QueryContext(show_query, set_show_query) =
+        use_context::<QueryContext>().expect("query context in nav");
 
     view! {
         <nav class="bg-white shadow-sm border-b border-gray-200 px-4 py-3">
             <div class="flex items-center justify-between">
                 <div class="flex items-center space-x-4">
-                    <button
-                        class="inline-flex items-center justify-center p-2 rounded-md text-gray-400 hover:text-gray-500 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500 transition-colors duration-200"
-                        on:click=move |_| {
-                            set_show.set(!show.get());
-                        }
-                        aria-label="Toggle sidebar"
-                    >
-                        <Show
-                            when=move || show.get()
-                            fallback=|| view! {
-                                // Menu icon (hamburger)
-                                <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
-                                </svg>
-                            }
-                        >
-                            // X icon (close)
-                            <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                            </svg>
-                        </Show>
-                    </button>
+                    <Toggle
+                        show=show_sidebar
+                        set_show=set_show_sidebar
+                        aria_label="Toggle sidebar".to_string()
+                    />
                     <h1 class="text-xl font-semibold text-gray-900">Delver PDF Viewer</h1>
                 </div>
                 <div class="flex items-center space-x-4">
+                    <Toggle
+                        show=show_query
+                        set_show=set_show_query
+                        aria_label="Toggle query panel".to_string()
+                    />
                     <span class="text-sm text-gray-500">Ready</span>
                 </div>
             </div>

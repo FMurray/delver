@@ -7,6 +7,8 @@ build = "build.rs"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+
+
 [dependencies]
 delver-core = { path = "../delver-core" }
 anyhow = "1.0"
@@ -39,6 +41,10 @@ server_fn = { version = "0.8.5", features = ["serde-lite", "rkyv", "multipart", 
 bytes = "1.6.1"
 chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"], optional = true }
+tower-lsp = "0.20.0"
+futures = "0.3"
+serde_derive = "1.0"
+pest = { workspace = true }
 
 [features]
 hydrate = [
