@@ -6,3 +6,4 @@
 
 */generated.rs
 /crates/viewer/node
+*.db
