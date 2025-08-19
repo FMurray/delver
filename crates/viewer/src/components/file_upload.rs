@@ -166,33 +166,83 @@ pub async fn upload_pdf(data: MultipartData) -> Result<DocumentMetadata, ServerF
     })
 }
 
-/// Get a specific page of a PDF document from cache
+/// Get a specific page of a PDF document from cache as raw PNG bytes
 #[server]
 pub async fn get_pdf_page(
     doc_id: String,
     page_index: usize,
-) -> Result<PageImageData, ServerFnError> {
-    log!("Getting page {} for document {}", page_index, doc_id);
+) -> Result<Vec<u8>, ServerFnError> {
+    let start_time = std::time::Instant::now();
+    log!("[TIMING] get_pdf_page START: Getting page {} for document {}", page_index, doc_id);
 
     // Get database pool
+    let pool_start = std::time::Instant::now();
     let pool = crate::store::get_database_pool().await
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database connection failed: {}", e)))?;
+    let pool_elapsed = pool_start.elapsed();
+    log!("[TIMING] Database pool acquisition took: {:?}", pool_elapsed);
 
-    // Get the page from cache (should always be there since we render all pages during upload)
+    // Parse UUID
+    let uuid_start = std::time::Instant::now();
     let doc_uuid = uuid::Uuid::parse_str(&doc_id)
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Invalid document ID: {}", e)))?;
+    let uuid_elapsed = uuid_start.elapsed();
+    log!("[TIMING] UUID parsing took: {:?}", uuid_elapsed);
     
+    // Get the page from cache (should always be there since we render all pages during upload)
+    let query_start = std::time::Instant::now();
     let cached_page = crate::store::DocumentPage::get_by_document_and_page(&pool, doc_uuid, page_index).await
         .map_err(|e| ServerFnError::new(anyhow::anyhow!("Database error: {}", e)))?
         .ok_or_else(|| ServerFnError::new(anyhow::anyhow!("Page {} not found for document {}", page_index, doc_id)))?;
+    let query_elapsed = query_start.elapsed();
+    log!("[TIMING] Database query took: {:?}", query_elapsed);
 
-    log!("Returning page {} for document {}", page_index, doc_id);
-    Ok(PageImageData {
-        page_index: cached_page.page_index,
-        image_data: cached_page.image_data,
-        width: cached_page.width,
-        height: cached_page.height,
-    })
+    // Convert RGBA data to PNG for efficient transfer
+    let data_start = std::time::Instant::now();
+    let rgba_data_size = cached_page.image_data.len();
+    log!("[TIMING] Converting RGBA data ({} bytes) to PNG...", rgba_data_size);
+    
+    // Convert RGBA to PNG using image crate
+    let width = cached_page.width as u32;
+    let height = cached_page.height as u32;
+    
+    let png_bytes = tokio::task::spawn_blocking(move || {
+        use image::{ImageBuffer, RgbaImage, ImageFormat};
+        use std::io::Cursor;
+        
+        // Create image buffer from RGBA data
+        let img: RgbaImage = ImageBuffer::from_raw(width, height, cached_page.image_data)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer from RGBA data"))?;
+        
+        // Encode as PNG
+        let mut png_data = Vec::new();
+        {
+            let mut cursor = Cursor::new(&mut png_data);
+            img.write_to(&mut cursor, ImageFormat::Png)
+                .map_err(|e| anyhow::anyhow!("Failed to encode PNG: {}", e))?;
+        }
+        
+        Ok::<Vec<u8>, anyhow::Error>(png_data)
+    }).await
+    .map_err(|e| ServerFnError::new(anyhow::anyhow!("PNG encoding task failed: {}", e)))?
+    .map_err(|e| ServerFnError::new(e))?;
+    
+    let png_size = png_bytes.len();
+    let compression_ratio = rgba_data_size as f64 / png_size as f64;
+    log!("[TIMING] PNG conversion complete: {} bytes -> {} bytes ({}x compression)", 
+        rgba_data_size, png_size, compression_ratio);
+    
+    let data_elapsed = data_start.elapsed();
+    log!("[TIMING] Data preparation and PNG encoding took: {:?}", data_elapsed);
+
+    // Log just before we return (this is where streaming happens)
+    let total_elapsed = start_time.elapsed();
+    log!(
+        "[TIMING] get_pdf_page SERVER COMPLETE: Total server time {:?} (pool: {:?}, uuid: {:?}, query: {:?}, data: {:?}) for page {} of document {} - streaming {} PNG bytes",
+        total_elapsed, pool_elapsed, uuid_elapsed, query_elapsed, data_elapsed, page_index, doc_id, png_size
+    );
+
+    Ok(png_bytes)
 }
 
 /// Get all documents for the documents list

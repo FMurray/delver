@@ -26,13 +26,15 @@ uuid = { version = "1.8.0", features = ["v4", "serde", "js"] }
 futures-channel = "0.3"
 leptos = "0.8.6"
 leptos_router = "0.8.5"
+leptos-use = "0.16.2"
 axum = { version = "0.8.4", optional = true }
 leptos_axum = { version = "0.8.5", optional = true }
 leptos_meta = { version = "0.8.0" }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 wasm-bindgen = { version = "=0.2.100"}
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "ImageData"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "ImageData", "Performance", "HtmlImageElement", "Blob", "BlobPropertyBag", "Url"] }
 server_fn = { version = "0.8.5", features = ["serde-lite", "rkyv", "multipart", "postcard"] }
 bytes = "1.6.1"
 chrono = { version = "0.4", features = ["serde"] }

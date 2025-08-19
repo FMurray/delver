@@ -2,32 +2,64 @@ use leptos::html::*;
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 use leptos::ev;
+use leptos::logging::log;
 use uuid::Uuid;
 use wasm_bindgen::JsCast;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement, Blob, BlobPropertyBag};
 
 use crate::components::file_upload::{get_pdf_page, get_documents, get_document_by_id};
 
-// Helper function to render RGBA data to a canvas
-fn render_rgba_to_canvas(canvas: &HtmlCanvasElement, rgba_data: &[u8], width: u32, height: u32) {
-    canvas.set_width(width);
-    canvas.set_height(height);
+// Helper function to render PNG data to a canvas using an HTML Image element
+fn render_png_to_canvas(canvas: &HtmlCanvasElement, png_data: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
+    log!("[TIMING] CANVAS render_png_to_canvas START: {} PNG bytes", png_data.len());
     
     let context = canvas
-        .get_context("2d")
+        .get_context("2d")?
         .unwrap()
-        .unwrap()
-        .dyn_into::<CanvasRenderingContext2d>()
-        .unwrap();
+        .dyn_into::<CanvasRenderingContext2d>()?;
+
+    // Create a blob from PNG data
+    let uint8_array = js_sys::Uint8Array::new_with_length(png_data.len() as u32);
+    uint8_array.copy_from(png_data);
     
-    // Create ImageData from RGBA bytes
-    let image_data = ImageData::new_with_u8_clamped_array_and_sh(
-        wasm_bindgen::Clamped(rgba_data),
-        width,
-        height,
-    ).unwrap();
+    let blob_parts = js_sys::Array::new();
+    blob_parts.push(&uint8_array);
     
-    context.put_image_data(&image_data, 0.0, 0.0).unwrap();
+    let blob_property_bag = BlobPropertyBag::new();
+    blob_property_bag.set_type("image/png");
+    
+    let blob = Blob::new_with_u8_array_sequence_and_options(&blob_parts, &blob_property_bag)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+    
+    // Create an Image element and load the PNG
+    let img = HtmlImageElement::new()?;
+    let img_clone = img.clone();
+    let canvas_clone = canvas.clone();
+    let context_clone = context.clone();
+    let url_clone = url.clone();
+    
+    let onload = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+        log!("[TIMING] CANVAS PNG image loaded, drawing to canvas");
+        
+        // Set canvas size to match image
+        canvas_clone.set_width(img_clone.natural_width());
+        canvas_clone.set_height(img_clone.natural_height());
+        
+        // Draw the image to the canvas
+        let _ = context_clone.draw_image_with_html_image_element(&img_clone, 0.0, 0.0);
+        
+        // Clean up the object URL
+        let _ = web_sys::Url::revoke_object_url(&url_clone);
+        
+        log!("[TIMING] CANVAS PNG rendering complete: {}x{}", img_clone.natural_width(), img_clone.natural_height());
+    }) as Box<dyn FnMut()>);
+    
+    img.set_onload(Some(onload.as_ref().unchecked_ref()));
+    onload.forget(); // Keep the closure alive
+    
+    img.set_src(&url);
+    
+    Ok(())
 }
 
 
@@ -82,15 +114,29 @@ pub fn PdfViewer() -> impl IntoView {
         }
     );
 
-    // Resource for loading page images on demand
+    // Resource for loading page images on demand (now returns PNG bytes)
     let page_resource = Resource::new(
         move || (doc_id.get().map(|id| id.to_string()), page_id.get()),
-        move |(doc_id_opt, page_idx)| async move {
-            if let Some(doc_id) = doc_id_opt {
-                log!("Loading page {} for document {}", page_idx, doc_id);
-                get_pdf_page(doc_id, page_idx).await
-            } else {
-                Err(server_fn::ServerFnError::new(anyhow::anyhow!("No document ID")))
+        move |(doc_id_opt, page_idx)| {
+            async move {
+                if let Some(doc_id) = doc_id_opt {
+                    log!("[TIMING] CLIENT get_pdf_page START: Loading page {} for document {}", page_idx, doc_id);
+                    
+                    let result = get_pdf_page(doc_id.clone(), page_idx).await;
+                    
+                    match result {
+                        Ok(png_bytes) => {
+                            log!("[TIMING] CLIENT get_pdf_page SUCCESS: Received {} PNG bytes for page {}", png_bytes.len(), page_idx);
+                            Ok(png_bytes)
+                        }
+                        Err(e) => {
+                            log!("[TIMING] CLIENT get_pdf_page ERROR: {}", e);
+                            Err(e)
+                        }
+                    }
+                } else {
+                    Err(server_fn::ServerFnError::new(anyhow::anyhow!("No document ID")))
+                }
             }
         }
     );
@@ -204,33 +250,26 @@ pub fn PdfViewer() -> impl IntoView {
                                                 }>
                                                     {move || {
                                                 // Access page_resource within Suspense boundary  
-                                                if let Some(Ok(page_data)) = page_resource.get() {
-                                                    log!("Page data available for page {}", page_data.page_index);
-                                                    // Use the actual rendered dimensions
-                                                    let display_width = page_data.width as u32;
-                                                    let display_height = page_data.height as u32;
-                                                    log!("Page display dimensions: {}x{}", display_width, display_height);
+                                                if let Some(Ok(png_bytes)) = page_resource.get() {
+                                                    log!("PNG data available for page {}: {} bytes", page_id.get(), png_bytes.len());
                                                     
-                                                    // Effect to render to canvas when page data changes
+                                                    // Effect to render to canvas when PNG data changes
                                                     Effect::new({
                                                         let canvas_ref = canvas_ref.clone();
-                                                        let image_data = page_data.image_data.clone();
-                                                        let page_index = page_data.page_index;
-                                                        move |_| {
-                                                            log!("Canvas effect triggered for page {}", page_index);
+                                                        let png_data = png_bytes.clone();
+                                                        let current_page = page_id.get();
+                                                        move |_| { 
+                                                            log!("[TIMING] CANVAS effect START: triggered for page {} with {} PNG bytes", current_page, png_data.len());
                                                             if let Some(canvas_element) = canvas_ref.get() {
                                                                 if let Ok(canvas) = canvas_element.dyn_into::<HtmlCanvasElement>() {
-                                                                    log!("Rendering page {} to canvas ({}x{}, {} bytes)", 
-                                                                        page_index, display_width, display_height, image_data.len());
-                                                                    
-                                                                    render_rgba_to_canvas(
-                                                                        &canvas,
-                                                                        &image_data,
-                                                                        display_width,
-                                                                        display_height,
-                                                                    );
-                                                                    
-                                                                    log!("Canvas render complete for page {}", page_index);
+                                                                    match render_png_to_canvas(&canvas, &png_data) {
+                                                                        Ok(_) => {
+                                                                            log!("[TIMING] CANVAS effect COMPLETE: page {} PNG rendered successfully", current_page);
+                                                                        }
+                                                                        Err(e) => {
+                                                                            log!("[ERROR] CANVAS rendering failed for page {}: {:?}", current_page, e);
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -241,16 +280,14 @@ pub fn PdfViewer() -> impl IntoView {
                                                             .child(move || format!("Page {}", page_id.get() + 1)),
                                                         div().class("flex justify-center mb-2").child(
                                                             canvas()
-                                                                .attr("width", display_width.to_string())
-                                                                .attr("height", display_height.to_string())
                                                                 .class("border border-gray-200 max-w-full h-auto")
                                                                 .node_ref(canvas_ref)
                                                         ),
                                                         p().class("text-sm text-gray-500")
-                                                            .child(format!("{}x{} pixels", display_width, display_height)),
+                                                            .child(format!("{} bytes PNG", png_bytes.len())),
                                                     )).into_any()
                                                 } else {
-                                                    log!("No page data available for page {}", page_id.get());
+                                                    log!("No PNG data available for page {}", page_id.get());
                                                     div().class("text-center").child((
                                                         h3().class("text-lg font-medium text-gray-900 mb-2")
                                                             .child(move || format!("Page {}", page_id.get() + 1)),
