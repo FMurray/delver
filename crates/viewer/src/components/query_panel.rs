@@ -1,3 +1,4 @@
+use futures::channel::mpsc;
 use leptos::logging::log;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -18,112 +19,45 @@ async fn lsp_websocket(
 ) -> Result<BoxedStream<String, ServerFnError>, ServerFnError> {
     use futures::{channel::mpsc, SinkExt, StreamExt};
 
-    let mut input = input;
-    let (mut tx, rx) = mpsc::channel(100);
+    #[cfg(feature = "ssr")]
+    {
+        use crate::language_server::{DocQLLanguageServer, MockClient};
 
-    tokio::spawn(async move {
-        // Process incoming LSP requests
-        while let Some(msg) = input.next().await {
-            if let Ok(msg_str) = msg {
-                println!("Received LSP message: {}", msg_str);
+        let mut input = input;
+        let (mut tx, rx) = mpsc::channel(100);
 
-                // Parse as basic JSON to extract method and params
-                if let Ok(request) = serde_json::from_str::<Value>(&msg_str) {
-                    if let Some(method) = request.get("method").and_then(|m| m.as_str()) {
-                        println!("Processing LSP method: {}", method);
+        tokio::spawn(async move {
+            // Create language server instance
+            let (response_sender, mut _response_receiver) = tokio::sync::mpsc::channel(100);
+            let server = DocQLLanguageServer::new(MockClient {
+                sender: response_sender,
+            });
 
-                        let response = match method {
-                            "initialize" => {
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": request.get("id"),
-                                    "result": {
-                                        "capabilities": {
-                                            "textDocumentSync": 1,
-                                            "completionProvider": {
-                                                "resolveProvider": false,
-                                                "triggerCharacters": ["<", "(", "\"", " "]
-                                            },
-                                            "hoverProvider": true
-                                        }
-                                    }
-                                })
-                            }
-                            "textDocument/didChange" => {
-                                // Parse the text content for validation
-                                if let Some(params) = request.get("params") {
-                                    if let Some(changes) =
-                                        params.get("contentChanges").and_then(|c| c.as_array())
-                                    {
-                                        if let Some(first_change) = changes.first() {
-                                            if let Some(text) =
-                                                first_change.get("text").and_then(|t| t.as_str())
-                                            {
-                                                // Simple validation using basic string matching
-                                                let has_error = !text.trim().is_empty()
-                                                    && !text.contains("Section")
-                                                    && !text.contains("TextChunk")
-                                                    && !text.contains("Image");
+            // Process incoming LSP requests using the server
+            while let Some(msg) = input.next().await {
+                if let Ok(msg_str) = msg {
+                    println!("Received LSP message: {}", msg_str);
 
-                                                if has_error {
-                                                    let diagnostic_response = json!({
-                                                        "jsonrpc": "2.0",
-                                                        "method": "textDocument/publishDiagnostics",
-                                                        "params": {
-                                                            "uri": "file:///query.docql",
-                                                            "diagnostics": [{
-                                                                "range": {
-                                                                    "start": {"line": 0, "character": 0},
-                                                                    "end": {"line": 0, "character": 1}
-                                                                },
-                                                                "severity": 1,
-                                                                "message": "Expected DocQL element (Section, TextChunk, Image, etc.)"
-                                                            }]
-                                                        }
-                                                    });
+                    // Process message through the language server
+                    let responses = server.process_lsp_message(&msg_str).await;
 
-                                                    let _ = tx
-                                                        .send(Ok(diagnostic_response.to_string()))
-                                                        .await;
-                                                } else {
-                                                    // Clear diagnostics
-                                                    let clear_diagnostics = json!({
-                                                        "jsonrpc": "2.0",
-                                                        "method": "textDocument/publishDiagnostics",
-                                                        "params": {
-                                                            "uri": "file:///query.docql",
-                                                            "diagnostics": []
-                                                        }
-                                                    });
-
-                                                    let _ = tx
-                                                        .send(Ok(clear_diagnostics.to_string()))
-                                                        .await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                continue; // No direct response for didChange
-                            }
-                            _ => {
-                                // Generic acknowledgment for other methods
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": request.get("id"),
-                                    "result": null
-                                })
-                            }
-                        };
-
-                        let _ = tx.send(Ok(response.to_string())).await;
+                    // Send all responses
+                    for response in responses {
+                        let _ = tx.send(Ok(response)).await;
                     }
                 }
             }
-        }
-    });
+        });
 
-    Ok(rx.into())
+        Ok(rx.into())
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    {
+        // Client-side fallback (though this should never be called)
+        let (_, rx) = mpsc::channel(1);
+        Ok(rx.into())
+    }
 }
 
 #[component]
@@ -136,7 +70,7 @@ pub fn query_panel() -> impl IntoView {
     let (connected, set_connected) = signal(false);
     let tx = StoredValue::new(tx);
 
-    // we'll only listen for websocket messages on the client
+    // Handle WebSocket connection on client side
     #[cfg(feature = "hydrate")]
     {
         use futures::StreamExt;
@@ -148,98 +82,13 @@ pub fn query_panel() -> impl IntoView {
                     log!("Connected to DocQL Language Server");
 
                     // Send initialize request
-                    let init_request = json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "initialize",
-                        "params": {
-                            "processId": null,
-                            "clientInfo": {
-                                "name": "DocQL Query Editor",
-                                "version": "0.1.0"
-                            },
-                            "capabilities": {
-                                "textDocument": {
-                                    "synchronization": {
-                                        "didOpen": true,
-                                        "didChange": true
-                                    },
-                                    "completion": {
-                                        "completionItem": {
-                                            "snippetSupport": true
-                                        }
-                                    },
-                                    "hover": {}
-                                }
-                            }
-                        }
-                    });
+                    send_lsp_initialize(&tx).await;
 
-                    if let Ok(msg) = serde_json::to_string(&init_request) {
-                        let _ = tx.with_value(|tx| tx.clone().try_send(Ok(msg)));
-                    }
-
+                    // Handle incoming messages
                     while let Some(msg) = messages.next().await {
                         match msg {
                             Ok(response) => {
-                                log!("Received LSP message: {}", response);
-
-                                if let Ok(parsed) = serde_json::from_str::<Value>(&response) {
-                                    if let Some(method) =
-                                        parsed.get("method").and_then(|m| m.as_str())
-                                    {
-                                        match method {
-                                            "textDocument/publishDiagnostics" => {
-                                                if let Some(params) = parsed.get("params") {
-                                                    if let Some(diags) = params
-                                                        .get("diagnostics")
-                                                        .and_then(|d| d.as_array())
-                                                    {
-                                                        let parsed_diagnostics: Vec<LspDiagnostic> =
-                                                            diags
-                                                                .iter()
-                                                                .filter_map(|d| {
-                                                                    let range = d.get("range")?;
-                                                                    let start =
-                                                                        range.get("start")?;
-                                                                    let line = start
-                                                                        .get("line")?
-                                                                        .as_u64()?
-                                                                        as u32;
-                                                                    let character = start
-                                                                        .get("character")?
-                                                                        .as_u64()?
-                                                                        as u32;
-                                                                    let message = d
-                                                                        .get("message")?
-                                                                        .as_str()?
-                                                                        .to_string();
-                                                                    let severity = match d
-                                                                        .get("severity")?
-                                                                        .as_u64()?
-                                                                    {
-                                                                        1 => "error",
-                                                                        2 => "warning",
-                                                                        3 => "info",
-                                                                        _ => "hint",
-                                                                    };
-                                                                    Some(LspDiagnostic {
-                                                                        line,
-                                                                        column: character,
-                                                                        message,
-                                                                        severity: severity
-                                                                            .to_string(),
-                                                                    })
-                                                                })
-                                                                .collect();
-                                                        set_diagnostics.set(parsed_diagnostics);
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
+                                handle_lsp_response(&response, &set_diagnostics).await;
                             }
                             Err(e) => log!("LSP Error: {:?}", e),
                         }
@@ -264,23 +113,7 @@ pub fn query_panel() -> impl IntoView {
             set_query.set(value.clone());
 
             if connected.get() {
-                let did_change = json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didChange",
-                    "params": {
-                        "textDocument": {
-                            "uri": "file:///query.docql",
-                            "version": 1
-                        },
-                        "contentChanges": [{
-                            "text": value
-                        }]
-                    }
-                });
-
-                if let Ok(msg) = serde_json::to_string(&did_change) {
-                    let _ = tx.with_value(|tx| tx.clone().try_send(Ok(msg)));
-                }
+                send_lsp_did_change(&tx, &value);
             }
         }
     };
@@ -383,5 +216,107 @@ pub fn query_panel() -> impl IntoView {
                 </div>
             </div>
         </div>
+    }
+}
+
+// Helper functions for LSP communication
+#[cfg(feature = "hydrate")]
+async fn send_lsp_initialize(tx: &StoredValue<mpsc::Sender<Result<String, ServerFnError>>>) {
+    let init_request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "clientInfo": {
+                "name": "DocQL Query Editor",
+                "version": "0.1.0"
+            },
+            "capabilities": {
+                "textDocument": {
+                    "synchronization": {
+                        "didOpen": true,
+                        "didChange": true
+                    },
+                    "completion": {
+                        "completionItem": {
+                            "snippetSupport": true
+                        }
+                    },
+                    "hover": {}
+                }
+            }
+        }
+    });
+
+    if let Ok(msg) = serde_json::to_string(&init_request) {
+        let _ = tx.with_value(|tx| tx.clone().try_send(Ok(msg)));
+    }
+}
+
+#[cfg(feature = "hydrate")]
+async fn handle_lsp_response(response: &str, set_diagnostics: &WriteSignal<Vec<LspDiagnostic>>) {
+    log!("Received LSP message: {}", response);
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(response) {
+        if let Some(method) = parsed.get("method").and_then(|m| m.as_str()) {
+            match method {
+                "textDocument/publishDiagnostics" => {
+                    parse_and_set_diagnostics(&parsed, set_diagnostics);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(feature = "hydrate")]
+fn parse_and_set_diagnostics(parsed: &Value, set_diagnostics: &WriteSignal<Vec<LspDiagnostic>>) {
+    if let Some(params) = parsed.get("params") {
+        if let Some(diags) = params.get("diagnostics").and_then(|d| d.as_array()) {
+            let parsed_diagnostics: Vec<LspDiagnostic> = diags
+                .iter()
+                .filter_map(|d| {
+                    let range = d.get("range")?;
+                    let start = range.get("start")?;
+                    let line = start.get("line")?.as_u64()? as u32;
+                    let character = start.get("character")?.as_u64()? as u32;
+                    let message = d.get("message")?.as_str()?.to_string();
+                    let severity = match d.get("severity")?.as_u64()? {
+                        1 => "error",
+                        2 => "warning",
+                        3 => "info",
+                        _ => "hint",
+                    };
+                    Some(LspDiagnostic {
+                        line,
+                        column: character,
+                        message,
+                        severity: severity.to_string(),
+                    })
+                })
+                .collect();
+            set_diagnostics.set(parsed_diagnostics);
+        }
+    }
+}
+
+fn send_lsp_did_change(tx: &StoredValue<mpsc::Sender<Result<String, ServerFnError>>>, text: &str) {
+    let did_change = json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didChange",
+        "params": {
+            "textDocument": {
+                "uri": "file:///query.docql",
+                "version": 1
+            },
+            "contentChanges": [{
+                "text": text
+            }]
+        }
+    });
+
+    if let Ok(msg) = serde_json::to_string(&did_change) {
+        let _ = tx.with_value(|tx| tx.clone().try_send(Ok(msg)));
     }
 }

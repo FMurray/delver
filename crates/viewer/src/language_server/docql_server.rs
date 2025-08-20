@@ -1,5 +1,6 @@
 use delver_core::docql::{Rule, TemplateParser};
 use pest::Parser;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use tower_lsp::lsp_types::*;
 
@@ -345,5 +346,183 @@ impl DocQLLanguageServer {
     ) {
         // For now, we'll just log the diagnostics instead of sending via WebSocket
         log::info!("Diagnostics for {}: {:?}", uri, diagnostics);
+    }
+
+    /// Process a raw LSP message and return appropriate responses
+    pub async fn process_lsp_message(&self, message: &str) -> Vec<String> {
+        let mut responses = Vec::new();
+
+        if let Ok(request) = serde_json::from_str::<Value>(message) {
+            if let Some(method) = request.get("method").and_then(|m| m.as_str()) {
+                match method {
+                    "initialize" => {
+                        let response = json!({
+                            "jsonrpc": "2.0",
+                            "id": request.get("id"),
+                            "result": {
+                                "capabilities": {
+                                    "textDocumentSync": 1,
+                                    "completionProvider": {
+                                        "resolveProvider": false,
+                                        "triggerCharacters": ["<", "(", "\"", " "]
+                                    },
+                                    "hoverProvider": true
+                                }
+                            }
+                        });
+                        responses.push(response.to_string());
+                    }
+                    "textDocument/didChange" => {
+                        if let Some(params) = request.get("params") {
+                            if let Some(changes) =
+                                params.get("contentChanges").and_then(|c| c.as_array())
+                            {
+                                if let Some(first_change) = changes.first() {
+                                    if let Some(text) =
+                                        first_change.get("text").and_then(|t| t.as_str())
+                                    {
+                                        // Use actual DocQL validation
+                                        let diagnostic_response =
+                                            self.validate_and_create_diagnostics(text).await;
+                                        responses.push(diagnostic_response);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "textDocument/completion" => {
+                        if let Some(params) = request.get("params") {
+                            let completion_response = self.handle_completion_request(params).await;
+                            if let Some(response) = completion_response {
+                                responses.push(
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": request.get("id"),
+                                        "result": response
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    "textDocument/hover" => {
+                        if let Some(params) = request.get("params") {
+                            let hover_response = self.handle_hover_request(params).await;
+                            if let Some(response) = hover_response {
+                                responses.push(
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": request.get("id"),
+                                        "result": response
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        // Generic acknowledgment for other methods
+                        responses.push(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request.get("id"),
+                                "result": null
+                            })
+                            .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        responses
+    }
+
+    /// Validate DocQL text and create diagnostics response
+    async fn validate_and_create_diagnostics(&self, text: &str) -> String {
+        match TemplateParser::parse(Rule::template, text) {
+            Ok(_) => {
+                // Clear diagnostics for valid syntax
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": "file:///query.docql",
+                        "diagnostics": []
+                    }
+                })
+                .to_string()
+            }
+            Err(e) => {
+                // Send syntax error diagnostic
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": "file:///query.docql",
+                        "diagnostics": [{
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1}
+                            },
+                            "severity": 1,
+                            "message": format!("DocQL syntax error: {}", e)
+                        }]
+                    }
+                })
+                .to_string()
+            }
+        }
+    }
+
+    /// Handle completion requests
+    async fn handle_completion_request(&self, _params: &Value) -> Option<Value> {
+        // Return element completions as JSON
+        Some(json!([
+            {
+                "label": "Section",
+                "kind": 7, // CompletionItemKind::CLASS
+                "detail": "Document section element",
+                "documentation": "Defines a section that can contain other elements",
+                "insertText": "Section(match=\"\") {\n\t$0\n}",
+                "insertTextFormat": 2 // InsertTextFormat::SNIPPET
+            },
+            {
+                "label": "TextChunk",
+                "kind": 7,
+                "detail": "Text chunk element",
+                "documentation": "Defines a text chunk for processing",
+                "insertText": "TextChunk(chunkSize=500, chunkOverlap=150)",
+                "insertTextFormat": 2
+            },
+            {
+                "label": "Image",
+                "kind": 7,
+                "detail": "Image element",
+                "documentation": "Defines an image element that can have children for processing",
+                "insertText": "Image {\n\t$0\n}",
+                "insertTextFormat": 2
+            },
+            {
+                "label": "Match",
+                "kind": 14, // CompletionItemKind::KEYWORD
+                "detail": "Match definition",
+                "documentation": "Defines a reusable match configuration",
+                "insertText": "Match<$1> $2 {\n\t$0\n}",
+                "insertTextFormat": 2
+            }
+        ]))
+    }
+
+    /// Handle hover requests
+    async fn handle_hover_request(&self, params: &Value) -> Option<Value> {
+        // Simple hover support - in a real implementation, we'd parse the position
+        // and provide context-specific hover information
+        Some(json!({
+            "contents": {
+                "kind": "markdown",
+                "value": "**DocQL Element**\n\nHover over DocQL elements for documentation."
+            }
+        }))
     }
 }
