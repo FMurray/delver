@@ -43,6 +43,11 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <HydrationScripts options/>
                 <MetaTags/>
                 <link rel="stylesheet" id="leptos" href="/pkg/viewer.css"/>
+                <link rel="stylesheet" href="https://unpkg.com/codemirror@5.65.17/lib/codemirror.css" />
+                <script src="https://unpkg.com/codemirror@5.65.17/lib/codemirror.js"></script>
+
+                <link rel="stylesheet" href="https://unpkg.com/codemirror@5.65.17/addon/lint/lint.css" />
+                <script src="https://unpkg.com/codemirror@5.65.17/addon/lint/lint.js"></script>
             </head>
             <body>
                 <App />

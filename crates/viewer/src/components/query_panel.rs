@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use server_fn::{codec::JsonEncoding, BoxedStream, ServerFnError, Websocket};
 
+#[cfg(feature = "hydrate")]
+use codemirror::{DocApi, Editor, EditorOptions};
+#[cfg(feature = "hydrate")]
+use wasm_bindgen::prelude::*;
+#[cfg(feature = "hydrate")]
+use web_sys::HtmlTextAreaElement;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LspDiagnostic {
     pub line: u32,
@@ -65,6 +72,9 @@ pub fn query_panel() -> impl IntoView {
     let (query, set_query) = signal(String::new());
     let (diagnostics, set_diagnostics) = signal(Vec::<LspDiagnostic>::new());
 
+    // We'll use a simple approach - just initialize CodeMirror in an effect
+    // without storing the editor instance in reactive state
+
     use futures::channel::mpsc;
     let (tx, rx) = mpsc::channel::<Result<String, ServerFnError>>(1);
     let (connected, set_connected) = signal(false);
@@ -106,17 +116,66 @@ pub fn query_panel() -> impl IntoView {
     }
 
     // Handle query changes and send to LSP
+    #[cfg(feature = "hydrate")]
     let on_query_change = {
+        let tx = tx.clone();
+        move |text: String| {
+            set_query.set(text.clone());
+
+            if connected.get_untracked() {
+                send_lsp_did_change(&tx, &text);
+            }
+        }
+    };
+
+    // Fallback handler for non-hydrate mode
+    #[cfg(not(feature = "hydrate"))]
+    let on_textarea_input = {
         let tx = tx.clone();
         move |ev: web_sys::Event| {
             let value = event_target_value(&ev);
             set_query.set(value.clone());
 
-            if connected.get() {
+            if connected.get_untracked() {
                 send_lsp_did_change(&tx, &value);
             }
         }
     };
+
+    // Node ref for the textarea that will be converted to CodeMirror
+    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+
+    // Initialize CodeMirror editor after mount
+    #[cfg(feature = "hydrate")]
+    {
+        let on_change_clone = on_query_change.clone();
+        let textarea_ref_clone = textarea_ref.clone();
+
+        Effect::new(move |_| {
+            if let Some(textarea_element) = textarea_ref_clone.get() {
+                let textarea_element = textarea_element
+                    .clone()
+                    .unchecked_into::<HtmlTextAreaElement>();
+
+                let options = EditorOptions::default().line_numbers(true);
+
+                let editor = Editor::from_text_area(&textarea_element, &options);
+
+                // Set initial placeholder/example text
+                editor.set_value("// Enter your DocQL query here...\n\n// Example:\n// Section(match=\"Introduction\") {\n//     TextChunk(chunkSize=500)\n// }");
+
+                // Set up change handler
+                let on_change_effect = on_change_clone.clone();
+                editor.on_change(move |editor, _change| {
+                    if let Some(value) = editor.value() {
+                        on_change_effect(value);
+                    }
+                });
+
+                log!("CodeMirror editor initialized successfully");
+            }
+        });
+    }
 
     view! {
         <div class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg transition-all duration-300 ease-in-out">
@@ -158,10 +217,20 @@ pub fn query_panel() -> impl IntoView {
                 </div>
                 <div class="flex-1 p-4 relative">
                     <textarea
+                        node_ref=textarea_ref
                         class="w-full h-full resize-none border border-gray-300 rounded-md p-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                         placeholder="Enter your DocQL query here...\n\nExample:\nSection(match=\"Introduction\") {\n    TextChunk(chunkSize=500)\n}"
                         prop:value=move || query.get()
-                        on:input=on_query_change
+                        on:input={
+                            #[cfg(feature = "hydrate")]
+                            {
+                                move |_| {} // CodeMirror handles this
+                            }
+                            #[cfg(not(feature = "hydrate"))]
+                            {
+                                on_textarea_input
+                            }
+                        }
                         on:keydown=move |ev: web_sys::KeyboardEvent| {
                             if ev.ctrl_key() && ev.key() == "Enter" {
                                 // Execute query logic here

@@ -46,6 +46,7 @@ tower-lsp = "0.20.0"
 futures = "0.3"
 serde_derive = "1.0"
 pest = { workspace = true }
+codemirror = "0.2"
 
 [features]
 hydrate = [
