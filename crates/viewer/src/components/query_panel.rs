@@ -1,9 +1,17 @@
+//! DocQL editor (CodeMirror + LSP over a server-fn websocket) plus the
+//! template execution panel: runs the editor's template against the
+//! currently-open stored document via the same hydrate + `process_parsed`
+//! path the CLI `query --doc` uses (DV-006).
+
 use futures::channel::mpsc;
 use leptos::logging::log;
 use leptos::prelude::*;
+use leptos_router::hooks::{use_location, use_query_map};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use server_fn::{codec::JsonEncoding, BoxedStream, ServerFnError, Websocket};
+
+use crate::store::TemplateRun;
 
 #[cfg(feature = "hydrate")]
 use codemirror::{DocApi, Editor, EditorOptions};
@@ -18,6 +26,29 @@ pub struct LspDiagnostic {
     pub column: u32,
     pub message: String,
     pub severity: String,
+}
+
+/// Execute DocQL template source against a stored document. Template
+/// failures (parse errors, fail-loud matchers, missing embedder …) come back
+/// as a structured `TemplateRun` so the UI can render a readable banner
+/// instead of a transport error.
+#[server]
+pub async fn run_doc_template(
+    doc_id: String,
+    template: String,
+) -> Result<TemplateRun, ServerFnError> {
+    match crate::store::execute_template(&doc_id, &template).await {
+        Ok(output) => Ok(TemplateRun {
+            ok: true,
+            output: Some(output),
+            error: None,
+        }),
+        Err(e) => Ok(TemplateRun {
+            ok: false,
+            output: None,
+            error: Some(format!("{e:#}")),
+        }),
+    }
 }
 
 #[server(protocol = Websocket<JsonEncoding, JsonEncoding>)]
@@ -67,10 +98,53 @@ async fn lsp_websocket(
     }
 }
 
+/// Current document id parsed from the route path (`/viewer/<uuid>[/<page>]`).
+/// The panel lives outside the `<Routes>` tree, so `use_params_map` is not
+/// available; the location pathname is.
+fn doc_id_from_path(pathname: &str) -> Option<String> {
+    let rest = pathname.strip_prefix("/viewer/")?;
+    let id = rest.split('/').next()?;
+    uuid::Uuid::parse_str(id).ok().map(|u| u.to_string())
+}
+
 #[component]
 pub fn query_panel() -> impl IntoView {
-    let (query, set_query) = signal(String::new());
+    let location = use_location();
+    let query_params = use_query_map();
+
+    // Pre-fill the editor from ?template=… (urlencoded DocQL source).
+    let initial_template = query_params
+        .get_untracked()
+        .get("template")
+        .filter(|t| !t.trim().is_empty());
+    let autorun = query_params
+        .get_untracked()
+        .get("run")
+        .map(|r| r == "1" || r == "true")
+        .unwrap_or(false);
+
+    let (query, set_query) = signal(initial_template.clone().unwrap_or_default());
     let (diagnostics, set_diagnostics) = signal(Vec::<LspDiagnostic>::new());
+
+    let current_doc = Memo::new(move |_| doc_id_from_path(&location.pathname.get()));
+
+    // Template execution: bumping `run_request` (re)runs the resource.
+    type RunKey = (String, String, u32);
+    let run_request: RwSignal<Option<RunKey>> = RwSignal::new(
+        match (autorun, initial_template, current_doc.get_untracked()) {
+            (true, Some(template), Some(doc)) => Some((doc, template, 0)),
+            _ => None,
+        },
+    );
+    let run_result = Resource::new(
+        move || run_request.get(),
+        |request| async move {
+            match request {
+                Some((doc, template, _nonce)) => Some(run_doc_template(doc, template).await),
+                None => None,
+            }
+        },
+    );
 
     // We'll use a simple approach - just initialize CodeMirror in an effect
     // without storing the editor instance in reactive state
@@ -161,8 +235,13 @@ pub fn query_panel() -> impl IntoView {
 
                 let editor = Editor::from_text_area(&textarea_element, &options);
 
-                // Set initial placeholder/example text
-                editor.set_value("// Enter your DocQL query here...\n\n// Example:\n// Section(match=\"Introduction\") {\n//     TextChunk(chunkSize=500)\n// }");
+                // Initial content: URL-provided template, else an example.
+                let initial = query.get_untracked();
+                if initial.trim().is_empty() {
+                    editor.set_value("// Enter your DocQL query here...\n\n// Example:\n// Section(match=\"Introduction\") {\n//     TextChunk(chunkSize=500)\n// }");
+                } else {
+                    editor.set_value(&initial);
+                }
 
                 // Set up change handler
                 let on_change_effect = on_change_clone.clone();
@@ -177,14 +256,33 @@ pub fn query_panel() -> impl IntoView {
         });
     }
 
+    let execute = move || {
+        let template = query.get_untracked();
+        if template.trim().is_empty() {
+            return;
+        }
+        if let Some(doc) = current_doc.get_untracked() {
+            let nonce = run_request
+                .get_untracked()
+                .map(|(_, _, n)| n.wrapping_add(1))
+                .unwrap_or(0);
+            run_request.set(Some((doc, template, nonce)));
+        }
+    };
+
     view! {
-        <div class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg transition-all duration-300 ease-in-out">
-            <div class="h-64 flex flex-col">
-                <div class="p-4 border-b border-gray-200">
+        <div class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg transition-all duration-300 ease-in-out z-20">
+            <div class="flex flex-col" style="max-height:70vh">
+                <div class="p-3 border-b border-gray-200">
                     <div class="flex justify-between items-center">
                         <div>
                             <h3 class="text-lg font-semibold text-gray-900">DocQL Query Editor</h3>
-                            <p class="text-sm text-gray-600 mt-1">Write queries to search and analyze your documents</p>
+                            <p class="text-sm text-gray-600">
+                                {move || match current_doc.get() {
+                                    Some(doc) => format!("Runs against the open document {doc}"),
+                                    None => "Open a document to run templates against it".to_string(),
+                                }}
+                            </p>
                         </div>
                         <div class="flex items-center space-x-2">
                             <div class={move || {
@@ -203,19 +301,10 @@ pub fn query_panel() -> impl IntoView {
                                     }
                                 }}
                             </span>
-                            <button
-                                class="text-xs px-2 py-1 bg-blue-100 text-blue-600 rounded hover:bg-blue-200"
-                                on:click=move |_| {
-                                    // Connection control will be handled by the server function
-                                    log!("Connection toggle clicked - functionality to be implemented");
-                                }
-                            >
-                                {move || if connected.get() { "Disconnect" } else { "Connect" }}
-                            </button>
                         </div>
                     </div>
                 </div>
-                <div class="flex-1 p-4 relative">
+                <div class="h-48 p-3 relative shrink-0">
                     <textarea
                         node_ref=textarea_ref
                         class="w-full h-full resize-none border border-gray-300 rounded-md p-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -233,8 +322,7 @@ pub fn query_panel() -> impl IntoView {
                         }
                         on:keydown=move |ev: web_sys::KeyboardEvent| {
                             if ev.ctrl_key() && ev.key() == "Enter" {
-                                // Execute query logic here
-                                log!("Executing query...");
+                                execute();
                             }
                         }
                     />
@@ -265,19 +353,52 @@ pub fn query_panel() -> impl IntoView {
                         }
                     }}
                 </div>
-                <div class="p-4 border-t border-gray-200 bg-gray-50">
+                // Template execution results
+                <div class="px-3 pb-2" style="flex:1 1 auto;min-height:0;overflow-y:auto">
+                    <Suspense fallback=move || view! {
+                        <div class="flex items-center text-sm text-blue-600 py-2">
+                            <div class="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600 mr-2"></div>
+                            "Executing template..."
+                        </div>
+                    }>
+                        {move || run_result.get().flatten().map(|result| match result {
+                            Ok(TemplateRun { ok: true, output, .. }) => view! {
+                                <div class="border border-gray-200 rounded-md">
+                                    <div class="px-3 py-1.5 bg-gray-50 border-b border-gray-200 text-xs font-medium text-gray-600">
+                                        "Template outputs"
+                                    </div>
+                                    <pre class="p-3 text-xs font-mono text-gray-800" style="max-height:18rem;overflow:auto">
+                                        {output.unwrap_or_default()}
+                                    </pre>
+                                </div>
+                            }.into_any(),
+                            Ok(TemplateRun { error, .. }) => view! {
+                                <div class="border border-red-300 bg-red-50 rounded-md p-3">
+                                    <div class="text-xs font-semibold text-red-700 mb-1">"Template failed"</div>
+                                    <div class="text-xs text-red-700 font-mono whitespace-pre-wrap">
+                                        {error.unwrap_or_else(|| "unknown error".to_string())}
+                                    </div>
+                                </div>
+                            }.into_any(),
+                            Err(e) => view! {
+                                <div class="border border-red-300 bg-red-50 rounded-md p-3">
+                                    <div class="text-xs font-semibold text-red-700 mb-1">"Request failed"</div>
+                                    <div class="text-xs text-red-700 font-mono whitespace-pre-wrap">{e.to_string()}</div>
+                                </div>
+                            }.into_any(),
+                        })}
+                    </Suspense>
+                </div>
+                <div class="p-3 border-t border-gray-200 bg-gray-50">
                     <div class="flex justify-between items-center">
                         <div class="text-xs text-gray-500">
-                            "Press Ctrl+Enter to execute query • "
+                            "Press Ctrl+Enter to execute • "
                             {move || format!("{} diagnostics", diagnostics.get().len())}
                         </div>
                         <button
                             class="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition-colors duration-200 disabled:opacity-50"
-                            disabled=move || query.get().trim().is_empty()
-                            on:click=move |_| {
-                                log!("Executing query...");
-                                // Add query execution logic here
-                            }
+                            disabled=move || query.get().trim().is_empty() || current_doc.get().is_none()
+                            on:click=move |_| execute()
                         >
                             "Execute Query"
                         </button>
