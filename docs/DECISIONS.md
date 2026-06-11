@@ -506,3 +506,32 @@ non-top-level declaration are compile errors.
   author's choice. Chunk metadata (`chunk_char_count`, page stats) keeps describing the *source*
   chunk, independent of interpolation.
 
+**D-023 · 2026-06-11 · Stage C slice 2: partition capture + partition-scoped and multi-document queries.**
+No migration (the columns exist since 0001/0002; SCHEMA_VERSION stays 3); delver-store grows
+three additive functions, no existing signature changed.
+- **Capture**: `delver index` gains repeatable `--partition key=value` plus hive-style
+  auto-inference from the input path's *directory* components (`/loans/state=CA/type=Auto/x.pdf`
+  → `{state: CA, type: Auto}`; the file name never counts; non-`k=v` segments skip). Explicit
+  flags merge over inferred values (last duplicate key wins). Stored via
+  `DelverStore::set_document_partitions` — `jsonb_set(metadata, '{partitions}', …)`, replacing
+  the whole `partitions` object (last `delver index` wins) and leaving sibling metadata keys
+  (Info dict, D-016) untouched; runs on idempotent re-ingest too, so existing documents can be
+  (re)tagged. Unknown ids error. The ingest receipt gains a `"partitions"` key.
+- **Filtering**: `search` and `query` gain repeatable `--where key=value`; documents must contain
+  every pair — jsonb containment `metadata @> jsonb_build_object('partitions', $n)` in
+  `text_search_filtered(corpus, query, limit, partitions)` (corpus-scope `text_search` now
+  delegates to it with `None`) and `documents_matching(corpus, partitions)` (ordered by id, so
+  multi-doc output is deterministic). `--where` + `--doc` is rejected (clap `conflicts_with`;
+  note: `requires = "corpus"` would be silently absorbed by the source ArgGroup — clap resolves
+  the requirement through the group — hence explicit conflicts on `query`'s `--doc`/`--pdf`).
+- **Multi-document query**: `query --corpus <name> --template …` (the source group is now
+  doc | pdf | corpus) runs the template over every matching document via the same
+  `run_template_on_doc` path. **Output shape**: one JSON object keyed by document id (ascending),
+  each value that document's outputs array — exactly the `--doc` payload per document (asserted
+  equal in the integration test). No matching documents → `{}`, exit 0 (a data condition, not
+  template misuse).
+- Tests: lib unit tests (path inference incl. filename-with-`=` exclusion, key=value parsing,
+  duplicate-key precedence) + crates/delver/tests/partition_cli.rs (DB-gated, two docs with
+  different partitions in one corpus: inference + explicit-override receipts, `--where` on
+  search/query incl. multi-pair AND and no-match cases, multi-doc shape, corpus-vs-doc output
+  equality, and the rejected flag combinations).

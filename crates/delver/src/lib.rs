@@ -74,32 +74,90 @@ pub fn load_tokenizer(model: &str) -> Option<Tokenizer> {
     tokenizer
 }
 
+/// Parse one `key=value` CLI argument (`--partition` / `--where`), splitting
+/// at the first `=`. Empty key or value is an error (D-006).
+pub fn parse_key_value(arg: &str) -> Result<(String, String)> {
+    let Some((key, value)) = arg.split_once('=') else {
+        bail!("expected key=value, got {arg:?}");
+    };
+    if key.is_empty() || value.is_empty() {
+        bail!("expected non-empty key and value in key=value, got {arg:?}");
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// Infer hive-style partitions from the *directory* components of `path`
+/// (Stage C, D-023): `/loans/state=CA/type=Auto/loan1.pdf` yields
+/// `[("state","CA"), ("type","Auto")]`. The file name itself never counts;
+/// segments without `=` (or with an empty key/value) are skipped.
+pub fn infer_partitions_from_path(path: &Path) -> Vec<(String, String)> {
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    parent
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(seg) => seg.to_str(),
+            _ => None,
+        })
+        .filter_map(|seg| {
+            let (key, value) = seg.split_once('=')?;
+            (!key.is_empty() && !value.is_empty())
+                .then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Key/value pairs as the JSON object stored under
+/// `documents.metadata.partitions` (later duplicate keys win).
+pub fn partitions_json(pairs: &[(String, String)]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in pairs {
+        map.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+    serde_json::Value::Object(map)
+}
+
 /// Read a PDF from disk and ingest it into `corpus` (created if absent).
+/// `partitions` (inferred-from-path first, explicit `--partition` flags
+/// after, so explicit wins on key conflicts) are stored under
+/// `documents.metadata.partitions` — also on idempotent re-ingest, so
+/// existing documents can be (re)tagged (D-023).
 ///
 /// Returns the shared ingest JSON shape:
-/// `{"document_id", "created", "element_count", "corpus"}`.
+/// `{"document_id", "created", "element_count", "corpus", "partitions"}`.
 pub fn ingest_file(
     store: &DelverStoreBlocking,
     path: &Path,
     corpus: &str,
     uri: Option<&str>,
     parse_version: i32,
+    partitions: &[(String, String)],
 ) -> Result<serde_json::Value> {
     let corpus_id = store.ensure_corpus(corpus)?;
     let pdf_bytes =
         std::fs::read(path).with_context(|| format!("reading PDF {}", path.display()))?;
     let outcome: IngestOutcome =
         store.ingest_document(corpus_id, uri, &pdf_bytes, parse_version)?;
+    let partitions = partitions_json(partitions);
+    if !partitions.as_object().map_or(true, |m| m.is_empty()) {
+        store.set_document_partitions(outcome.document_id, &partitions)?;
+    }
     let element_count = store.element_count(outcome.document_id)?;
     Ok(serde_json::json!({
         "document_id": outcome.document_id,
         "created": outcome.created,
         "element_count": element_count,
         "corpus": corpus,
+        "partitions": partitions,
     }))
 }
 
 /// Full-text search over a corpus (or one document when `doc` is given).
+/// `partitions` (`--where key=value`, D-023) restricts corpus scope to
+/// documents whose stored partitions contain every pair; it cannot be
+/// combined with `doc` (a single document either matches or the search is
+/// pointless — fail loud).
 ///
 /// Returns the shared search JSON shape: an array of
 /// `{"element_id", "document_id", "page", "rank", "snippet"}` ranked by
@@ -110,13 +168,51 @@ pub fn search_store(
     corpus: &str,
     doc: Option<DocumentId>,
     limit: i64,
+    partitions: &[(String, String)],
 ) -> Result<serde_json::Value> {
-    let scope = match doc {
-        Some(doc) => SearchScope::Document(doc),
-        None => SearchScope::Corpus(store.ensure_corpus(corpus)?),
+    let hits = if partitions.is_empty() {
+        let scope = match doc {
+            Some(doc) => SearchScope::Document(doc),
+            None => SearchScope::Corpus(store.ensure_corpus(corpus)?),
+        };
+        store.text_search(scope, query, limit)?
+    } else {
+        if doc.is_some() {
+            bail!("--where filters corpus documents and cannot be combined with --doc");
+        }
+        let corpus_id = store.ensure_corpus(corpus)?;
+        store.text_search_filtered(corpus_id, query, limit, Some(&partitions_json(partitions)))?
     };
-    let hits = store.text_search(scope, query, limit)?;
     Ok(search_hits_json(&hits))
+}
+
+/// Execute a DocQL template across every document of `corpus` that matches
+/// the `--where` partition filter (all documents when empty), Stage C D-023.
+///
+/// Returns a JSON object keyed by document id (ascending), each value the
+/// document's outputs array — exactly what `run_template_on_doc` would
+/// return for that document. An empty object means no document matched the
+/// filter (a data condition, not an error).
+pub fn run_template_on_corpus(
+    store: &DelverStoreBlocking,
+    corpus: &str,
+    partitions: &[(String, String)],
+    template_str: &str,
+    tokenizer: Option<&Tokenizer>,
+    embedder: Option<Arc<dyn Embedder>>,
+) -> Result<String> {
+    let corpus_id = store.ensure_corpus(corpus)?;
+    let filter = (!partitions.is_empty()).then(|| partitions_json(partitions));
+    let docs = store.documents_matching(corpus_id, filter.as_ref())?;
+    let mut by_doc = serde_json::Map::new();
+    for doc in docs {
+        let outputs = run_template_on_doc(store, doc, template_str, tokenizer, embedder.clone())
+            .with_context(|| format!("running template on document {doc}"))?;
+        by_doc.insert(doc.to_string(), serde_json::from_str(&outputs)?);
+    }
+    Ok(serde_json::to_string_pretty(&serde_json::Value::Object(
+        by_doc,
+    ))?)
 }
 
 /// Hydrate a stored document and execute a DocQL template over it.
@@ -164,6 +260,63 @@ fn snippet(text: &str) -> String {
         snippet.push('…');
     }
     snippet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
+        raw.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn infers_partitions_from_directory_components_only() {
+        assert_eq!(
+            infer_partitions_from_path(Path::new("/loans/state=CA/type=Auto/loan1.pdf")),
+            pairs(&[("state", "CA"), ("type", "Auto")])
+        );
+        // The file name never contributes, even when it contains '='.
+        assert_eq!(
+            infer_partitions_from_path(Path::new("/data/state=NY/k=v.pdf")),
+            pairs(&[("state", "NY")])
+        );
+        // Non key=value segments and empty keys/values are skipped.
+        assert_eq!(
+            infer_partitions_from_path(Path::new("plain/dir/=x/y=/file.pdf")),
+            Vec::<(String, String)>::new()
+        );
+        // Relative paths work; a bare file name has no parent components.
+        assert_eq!(
+            infer_partitions_from_path(Path::new("year=2015/doc.pdf")),
+            pairs(&[("year", "2015")])
+        );
+        assert_eq!(infer_partitions_from_path(Path::new("doc.pdf")), Vec::new());
+    }
+
+    #[test]
+    fn parses_key_value_arguments() {
+        assert_eq!(
+            parse_key_value("state=CA").unwrap(),
+            ("state".to_string(), "CA".to_string())
+        );
+        // Split happens at the FIRST '='; the value may contain '='.
+        assert_eq!(
+            parse_key_value("expr=a=b").unwrap(),
+            ("expr".to_string(), "a=b".to_string())
+        );
+        assert!(parse_key_value("noequals").is_err());
+        assert!(parse_key_value("=v").is_err());
+        assert!(parse_key_value("k=").is_err());
+    }
+
+    #[test]
+    fn partitions_json_last_duplicate_wins() {
+        let value = partitions_json(&pairs(&[("state", "CA"), ("state", "NY")]));
+        assert_eq!(value, serde_json::json!({"state": "NY"}));
+    }
 }
 
 #[cfg(feature = "extension-module")]
@@ -222,6 +375,7 @@ mod python {
                 &corpus,
                 uri.as_deref(),
                 parse_version.unwrap_or(1),
+                &[],
             )
             .map_err(to_py_err)?;
             Ok(value.to_string())
@@ -237,6 +391,7 @@ mod python {
                 &corpus,
                 None,
                 limit.unwrap_or(10) as i64,
+                &[],
             )
             .map_err(to_py_err)?;
             Ok(value.to_string())

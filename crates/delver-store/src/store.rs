@@ -36,6 +36,14 @@ const ELEMENT_SELECT: &str = "SELECT e.id, e.document_id, e.page, e.kind, e.orde
   LEFT JOIN images i ON i.element_id = e.id \
   LEFT JOIN blobs b ON b.element_id = e.id";
 
+/// Shared full-text search projection/predicate (`text_search`,
+/// `text_search_filtered`): `$2` is the query, `$3` the limit.
+const SEARCH_PROJECTION: &str = "SELECT e.id, e.document_id, e.page, e.order_idx, e.text, \
+       ts_rank(e.text_fts, plainto_tsquery('english', $2)) AS rank \
+  FROM elements e";
+const SEARCH_PREDICATE: &str = "e.text_fts @@ plainto_tsquery('english', $2) \
+     ORDER BY rank DESC, e.document_id, e.order_idx LIMIT $3";
+
 /// Service layer for the persistent document index.
 #[derive(Debug, Clone)]
 pub struct DelverStore {
@@ -202,27 +210,13 @@ impl DelverStore {
         query: &str,
         limit: i64,
     ) -> Result<Vec<TextSearchHit>, StoreError> {
-        const PROJECTION: &str = "SELECT e.id, e.document_id, e.page, e.order_idx, e.text, \
-               ts_rank(e.text_fts, plainto_tsquery('english', $2)) AS rank \
-          FROM elements e";
-        const PREDICATE: &str = "e.text_fts @@ plainto_tsquery('english', $2) \
-             ORDER BY rank DESC, e.document_id, e.order_idx LIMIT $3";
-
         let rows = match scope.into() {
             SearchScope::Corpus(corpus) => {
-                let sql = format!(
-                    "{PROJECTION} JOIN documents d ON d.id = e.document_id \
-                     WHERE d.corpus_id = $1 AND {PREDICATE}"
-                );
-                sqlx::query(&sql)
-                    .bind(corpus)
-                    .bind(query)
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await?
+                return self.text_search_filtered(corpus, query, limit, None).await
             }
             SearchScope::Document(doc) => {
-                let sql = format!("{PROJECTION} WHERE e.document_id = $1 AND {PREDICATE}");
+                let sql =
+                    format!("{SEARCH_PROJECTION} WHERE e.document_id = $1 AND {SEARCH_PREDICATE}");
                 sqlx::query(&sql)
                     .bind(doc)
                     .bind(query)
@@ -231,21 +225,82 @@ impl DelverStore {
                     .await?
             }
         };
+        rows.iter().map(search_hit_from_row).collect()
+    }
 
-        rows.iter()
-            .map(|row| {
-                Ok(TextSearchHit {
-                    element_id: row.try_get("id")?,
-                    document_id: row.try_get("document_id")?,
-                    page: row.try_get("page")?,
-                    order_idx: row.try_get("order_idx")?,
-                    text: row
-                        .try_get::<Option<String>, _>("text")?
-                        .unwrap_or_default(),
-                    rank: row.try_get("rank")?,
-                })
-            })
-            .collect()
+    /// Corpus-scoped full-text search additionally filtered by document
+    /// partition values (Stage C, D-023): when `partitions` is given, only
+    /// documents whose `metadata.partitions` contains it (jsonb containment)
+    /// are searched. `None` is exactly [`Self::text_search`] corpus scope.
+    pub async fn text_search_filtered(
+        &self,
+        corpus: CorpusId,
+        query: &str,
+        limit: i64,
+        partitions: Option<&serde_json::Value>,
+    ) -> Result<Vec<TextSearchHit>, StoreError> {
+        let sql = format!(
+            "{SEARCH_PROJECTION} JOIN documents d ON d.id = e.document_id \
+             WHERE d.corpus_id = $1 \
+               AND ($4::jsonb IS NULL OR d.metadata @> jsonb_build_object('partitions', $4::jsonb)) \
+               AND {SEARCH_PREDICATE}"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(corpus)
+            .bind(query)
+            .bind(limit)
+            .bind(partitions)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(search_hit_from_row).collect()
+    }
+
+    /// Merge partition key/values into `documents.metadata` under
+    /// `"partitions"` (Stage C, D-023). The whole `partitions` object is
+    /// replaced (last `delver index` wins); other metadata keys are
+    /// untouched. Unknown document ids are an error (D-006).
+    pub async fn set_document_partitions(
+        &self,
+        doc: DocumentId,
+        partitions: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE documents \
+                SET metadata = jsonb_set(metadata, '{partitions}', $2, true) \
+              WHERE id = $1",
+        )
+        .bind(doc)
+        .bind(partitions)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::Corrupt(format!(
+                "cannot set partitions: unknown document {doc}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Document ids in `corpus` whose `metadata.partitions` contains
+    /// `partitions` (jsonb containment); `None` lists the whole corpus.
+    /// Ordered by id so multi-document query output is deterministic
+    /// (Stage C, D-023).
+    pub async fn documents_matching(
+        &self,
+        corpus: CorpusId,
+        partitions: Option<&serde_json::Value>,
+    ) -> Result<Vec<DocumentId>, StoreError> {
+        let ids: Vec<DocumentId> = sqlx::query_scalar(
+            "SELECT id FROM documents \
+              WHERE corpus_id = $1 \
+                AND ($2::jsonb IS NULL OR metadata @> jsonb_build_object('partitions', $2::jsonb)) \
+              ORDER BY id",
+        )
+        .bind(corpus)
+        .bind(partitions)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
     }
 
     /// Elements on one page whose bbox overlaps the query rectangle
@@ -697,6 +752,19 @@ fn decode_bbox(row: &PgRow) -> Result<Option<(f32, f32, f32, f32)>, StoreError> 
             (ay.max(by)) as f32,
         )),
         _ => None,
+    })
+}
+
+fn search_hit_from_row(row: &PgRow) -> Result<TextSearchHit, StoreError> {
+    Ok(TextSearchHit {
+        element_id: row.try_get("id")?,
+        document_id: row.try_get("document_id")?,
+        page: row.try_get("page")?,
+        order_idx: row.try_get("order_idx")?,
+        text: row
+            .try_get::<Option<String>, _>("text")?
+            .unwrap_or_default(),
+        rank: row.try_get("rank")?,
     })
 }
 

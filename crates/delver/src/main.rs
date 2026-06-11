@@ -12,7 +12,8 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use uuid::Uuid;
 
 use delver::{
-    build_embedder, connect_store, ingest_file, load_tokenizer, run_template_on_doc, search_store,
+    build_embedder, connect_store, infer_partitions_from_path, ingest_file, load_tokenizer,
+    parse_key_value, run_template_on_corpus, run_template_on_doc, search_store,
 };
 use delver_core::logging::{init_debug_logging, DebugDataStore};
 use delver_core::process_pdf;
@@ -100,13 +101,19 @@ struct IndexArgs {
     #[clap(long, default_value_t = 1)]
     parse_version: i32,
 
+    /// Partition key=value stored with the document (repeatable). Merged
+    /// over key=value segments auto-inferred from the input path's
+    /// directories (e.g. /loans/state=CA/x.pdf); explicit flags win.
+    #[clap(long = "partition", value_name = "KEY=VALUE")]
+    partition: Vec<String>,
+
     /// Postgres URL (default: $DATABASE_URL, then the local dev database)
     #[clap(long)]
     db: Option<String>,
 }
 
 #[derive(Args, Debug)]
-#[clap(group(ArgGroup::new("source").required(true).args(["doc", "pdf"])))]
+#[clap(group(ArgGroup::new("source").required(true).args(["doc", "pdf", "corpus"])))]
 struct QueryArgs {
     /// Path to the template file
     #[clap(short, long)]
@@ -119,6 +126,17 @@ struct QueryArgs {
     /// PDF file to query with a fresh parse (no database)
     #[clap(long)]
     pdf: Option<PathBuf>,
+
+    /// Run the template across every stored document of this corpus
+    /// (filtered by --where); output is keyed by document id
+    #[clap(long)]
+    corpus: Option<String>,
+
+    /// Partition filter key=value (repeatable; documents must match all).
+    /// Only meaningful with --corpus (`requires` would be absorbed by the
+    /// source group, so the single-source flags conflict explicitly).
+    #[clap(long = "where", value_name = "KEY=VALUE", conflicts_with_all = ["doc", "pdf"])]
+    r#where: Vec<String>,
 
     /// Postgres URL (default: $DATABASE_URL, then the local dev database)
     #[clap(long)]
@@ -150,6 +168,10 @@ struct SearchArgs {
     /// Restrict the search to one stored document
     #[clap(long)]
     doc: Option<Uuid>,
+
+    /// Partition filter key=value (repeatable; documents must match all)
+    #[clap(long = "where", value_name = "KEY=VALUE", conflicts_with = "doc")]
+    r#where: Vec<String>,
 
     /// Maximum number of hits
     #[clap(long, default_value_t = 10)]
@@ -202,12 +224,19 @@ fn run_process(args: ProcessArgs) -> Result<()> {
 
 fn run_index(args: IndexArgs) -> Result<()> {
     let store = connect_store(args.db.as_deref())?;
+    // Inferred path partitions first, explicit --partition flags after:
+    // partitions_json keeps the last duplicate, so explicit wins (D-023).
+    let mut partitions = infer_partitions_from_path(&args.pdf_path);
+    for arg in &args.partition {
+        partitions.push(parse_key_value(arg)?);
+    }
     let value = ingest_file(
         &store,
         &args.pdf_path,
         &args.corpus,
         args.uri.as_deref(),
         args.parse_version,
+        &partitions,
     )?;
     println!("{value}");
     Ok(())
@@ -218,14 +247,14 @@ fn run_query(args: QueryArgs) -> Result<()> {
     let tokenizer = load_tokenizer(&args.tokenizer_model);
     let embedder = build_embedder(args.embed_endpoint.as_deref())?;
 
-    let json = match (&args.pdf, args.doc) {
-        (Some(pdf_path), None) => {
+    let json = match (&args.pdf, args.doc, &args.corpus) {
+        (Some(pdf_path), None, None) => {
             let pdf_bytes = fs::read(pdf_path)?;
             let (json, _blocks, _doc) =
                 process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref(), embedder)?;
             json
         }
-        (None, Some(doc)) => {
+        (None, Some(doc), None) => {
             let store = connect_store(args.db.as_deref())?;
             run_template_on_doc(
                 &store,
@@ -235,7 +264,23 @@ fn run_query(args: QueryArgs) -> Result<()> {
                 embedder,
             )?
         }
-        _ => unreachable!("clap group enforces exactly one of --doc / --pdf"),
+        (None, None, Some(corpus)) => {
+            let partitions = args
+                .r#where
+                .iter()
+                .map(|arg| parse_key_value(arg))
+                .collect::<Result<Vec<_>>>()?;
+            let store = connect_store(args.db.as_deref())?;
+            run_template_on_corpus(
+                &store,
+                corpus,
+                &partitions,
+                &template_str,
+                tokenizer.as_ref(),
+                embedder,
+            )?
+        }
+        _ => unreachable!("clap group enforces exactly one of --doc / --pdf / --corpus"),
     };
 
     if args.pretty {
@@ -249,12 +294,18 @@ fn run_query(args: QueryArgs) -> Result<()> {
 
 fn run_search(args: SearchArgs) -> Result<()> {
     let store = connect_store(args.db.as_deref())?;
+    let partitions = args
+        .r#where
+        .iter()
+        .map(|arg| parse_key_value(arg))
+        .collect::<Result<Vec<_>>>()?;
     let value = search_store(
         &store,
         &args.query,
         &args.corpus,
         args.doc.map(DocumentId),
         args.limit,
+        &partitions,
     )?;
     println!("{value}");
     Ok(())

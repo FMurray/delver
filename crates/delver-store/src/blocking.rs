@@ -83,6 +83,37 @@ impl DelverStoreBlocking {
             .block_on(self.store.text_search(scope, query, limit))
     }
 
+    pub fn text_search_filtered(
+        &self,
+        corpus: CorpusId,
+        query: &str,
+        limit: i64,
+        partitions: Option<&serde_json::Value>,
+    ) -> Result<Vec<TextSearchHit>, StoreError> {
+        self.runtime.block_on(
+            self.store
+                .text_search_filtered(corpus, query, limit, partitions),
+        )
+    }
+
+    pub fn set_document_partitions(
+        &self,
+        doc: DocumentId,
+        partitions: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        self.runtime
+            .block_on(self.store.set_document_partitions(doc, partitions))
+    }
+
+    pub fn documents_matching(
+        &self,
+        corpus: CorpusId,
+        partitions: Option<&serde_json::Value>,
+    ) -> Result<Vec<DocumentId>, StoreError> {
+        self.runtime
+            .block_on(self.store.documents_matching(corpus, partitions))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn elements_in_bbox(
         &self,
