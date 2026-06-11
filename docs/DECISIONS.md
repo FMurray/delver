@@ -63,3 +63,33 @@ reprocessing" and gives extraction runs provenance.
 Integration tests generate small PDFs in-test via lopdf (no binary fixtures committed).
 DB-backed tests require `DATABASE_URL` and skip with an explicit message when absent.
 Real-corpus evaluation (3M 10-K, OfficeQA subset) runs locally only, from `~/datasets/`.
+
+**D-010 · 2026-06-11 · delver-core surface opened for the store: one read-only accessor.**
+`PdfIndex::style_key_bits(TextHandle) -> Option<u64>` exposes the packed per-row style
+signature so ingest can persist it (`elements.style_key`). Zero behavior change; the
+`StyleKey` type and buckets stay private. Persisted style keys are **informational only**:
+font ids inside the key come from a process-local interner, so they are not comparable
+across runs. Hydration never reads them back — it recomputes all style state.
+
+**D-011 · 2026-06-11 · delver-store slice-1 shape: hydration reuses the fresh-parse code path.**
+Equivalence (D-003) is guaranteed structurally, not re-implemented: hydration rebuilds the
+exact `BTreeMap<page, PageContents>` shape `get_page_content` produces (rows re-added in
+global `order_idx` order) and calls the same `PdfIndex::new` the fresh path uses.
+Supporting choices:
+- `ingest_parsed(corpus, uri, bytes, pages, parse_version)` exists alongside
+  `ingest_document`: callers that already parsed keep their element ids verbatim
+  (parse-time UUIDs are per-run, so the round-trip/match-equivalence tests require it),
+  and double parsing is avoided. Both share the D-008 dedup path.
+- `bbox` is written as `box(point(x0,y0), point(x1,y1))` and read back by corner
+  subscripting (`(bbox[1])[0]` etc.), so no geometric-type decoding is needed; Postgres
+  normalizes corners, rows are re-normalized to the parser's (min,min,max,max) convention.
+  Parser bboxes are always corner-ordered (min/max construction), so this is lossless.
+- Image rows persist stream bytes + Width/Height; hydration rebuilds a minimal lopdf
+  XObject carrier (not byte-identical to the original object — index behavior only reads
+  id/page/bbox, never the object).
+- Runtime `sqlx::query` only (no compile-time `query!` macros): builds never need a live
+  DB or offline cache. Ids are `#[sqlx(transparent)]` newtypes (CorpusId/DocumentId/ElementId).
+- Blocking facade `blocking::DelverStoreBlocking` wraps a private current-thread runtime.
+- Dev note: when Docker Desktop is gated by org sign-in, a local Homebrew Postgres 17 +
+  pgvector serving `postgres://delver:delver@localhost:5433/delver` satisfies the same
+  contract; the slice-1 tests were verified against it (4/4 green, none skipped).

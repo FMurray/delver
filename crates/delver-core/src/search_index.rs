@@ -1274,6 +1274,16 @@ impl PdfIndex {
         results
     }
 
+    /// Packed 64-bit style signature for a text row (font id, size bin,
+    /// z-score bin, position bin, caps/title flags — see `StyleKey`).
+    /// Font ids come from a process-local interner, so the bits are only
+    /// comparable within a single process run; persisted copies are
+    /// informational. Read-only accessor added for delver-store (D-010).
+    #[inline]
+    pub fn style_key_bits(&self, h: TextHandle) -> Option<u64> {
+        self.style_key.get(h.0 as usize).map(|key| key.0)
+    }
+
     /// Get style statistics for the efficient style buckets (NEW: for analytics)
     pub fn get_style_bucket_stats(&self) -> Vec<(u64, usize)> {
         self.style_buckets

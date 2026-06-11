@@ -2,6 +2,7 @@
 members = [
     "crates/delver",
     "crates/delver-core",
+    "crates/delver-store",
     "crates/viewer",
 ]
 resolver="3"

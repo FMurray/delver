@@ -1,0 +1,30 @@
+[package]
+name = "delver-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+delver-core = { path = "../delver-core" }
+
+# Workspace-managed deps
+lopdf = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "rt", "macros"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+# Store-specific deps (not in the workspace table)
+# NOTE: compile-time checked query!() macros are intentionally NOT used —
+# builds must not require a live database (no sqlx offline cache).
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-native-tls",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+    "json",
+] }
+sha2 = "0.10"
+thiserror = "2"
