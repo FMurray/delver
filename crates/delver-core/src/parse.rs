@@ -243,6 +243,9 @@ pub enum AuxKind {
     Path,
     Figure,
     Blob,
+    /// Detected table (Stage B slice 3, D-018); the cell structure rides in
+    /// `AuxElement::table`.
+    Table,
 }
 
 /// Raw bytes of an embedded file (kind == Blob), kept out of `metadata` so
@@ -267,6 +270,26 @@ pub struct AuxElement {
     pub text: Option<String>,
     pub metadata: serde_json::Value,
     pub blob: Option<BlobPayload>,
+    /// Structured cells for kind == Table (D-018), carried beside the
+    /// element like `blob` (never inside the metadata JSON); persisted to the
+    /// `table_cells` table by delver-store.
+    pub table: Option<crate::table::TableStructure>,
+}
+
+/// One glyph-run piece captured only for table detection (D-018). Text runs
+/// are split at column boundaries — two or more consecutive whitespace
+/// glyphs, or a horizontal jump between adjacent glyphs — so each fragment
+/// approximates one table cell's worth of text, even when a PDF draws a whole
+/// visual row as a single text run. Captured beside, and never affecting,
+/// `TextElement` production; not persisted.
+#[derive(Debug, Clone)]
+pub struct CellFragment {
+    pub text: String,
+    /// (x0, y0, x1, y1), flipped to top-left page coordinates with the rest
+    /// of the page at the end of the page walk.
+    pub bbox: (f32, f32, f32, f32),
+    pub font_size: f32,
+    pub font_name: Option<String>,
 }
 
 /// Lightweight handle that preserves document order
@@ -399,6 +422,10 @@ pub struct PageContents {
     pub text_store: TextStore,
     pub image_store: ImageStore,
     pub aux_store: AuxStore,
+    /// Transient glyph-run fragments used by table detection during the page
+    /// walk (D-018); drained once detection has run. Always empty on hydrated
+    /// pages — hydration never re-runs extraction (D-016).
+    pub cell_fragments: Vec<CellFragment>,
 }
 
 impl PageContents {
@@ -408,6 +435,7 @@ impl PageContents {
             text_store: TextStore::default(),
             image_store: ImageStore::default(),
             aux_store: AuxStore::default(),
+            cell_fragments: Vec::new(),
         }
     }
 
@@ -620,11 +648,12 @@ fn collect_text_glyphs(
     Ok(())
 }
 
-#[tracing::instrument()]
+#[tracing::instrument(skip(fragments))]
 fn finalize_text_run(
     tos: &mut TextObjectState,
     ts: &TextState,
     page_number: u32,
+    fragments: &mut Vec<CellFragment>,
 ) -> Option<TextElement> {
     // If both glyphs and text buffer are empty, there's nothing to return
     if tos.glyphs.is_empty()
@@ -647,6 +676,17 @@ fn finalize_text_run(
             page_number,
         });
     }
+
+    // Side-channel for table detection (D-018): split this run into
+    // cell-grained fragments while the per-glyph bboxes still exist. Never
+    // alters the TextElement produced below.
+    split_cell_fragments(
+        &tos.glyphs,
+        &tos.text_buffer,
+        ts.size,
+        &ts.fontname,
+        fragments,
+    );
 
     let mut x_min = f32::MAX;
     let mut y_min = f32::MAX;
@@ -681,6 +721,95 @@ fn finalize_text_run(
     );
 
     Some(text_element)
+}
+
+/// Split one finalized glyph run into cell-grained [`CellFragment`]s (D-018).
+///
+/// `process_glyph` pushes exactly one buffer char per glyph, so `glyphs` and
+/// `text.chars()` are parallel. A fragment boundary is:
+///   * two or more consecutive whitespace glyphs (the SEC-filing column
+///     separator inside a single run), or
+///   * a horizontal jump >= ~half a glyph height between adjacent non-space
+///     glyphs (TJ/Td kerning jumps that carry no space character).
+/// Single interior spaces stay inside the fragment. Fragment bboxes cover
+/// only the non-whitespace glyphs, so trailing space glyphs never inflate a
+/// cell's extent. Whitespace-only runs produce no fragments.
+fn split_cell_fragments(
+    glyphs: &[PositionedGlyph],
+    text: &str,
+    font_size: f32,
+    font_name: &str,
+    out: &mut Vec<CellFragment>,
+) {
+    if glyphs.is_empty() {
+        return;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() != glyphs.len() {
+        // Defensive: glyphs and buffer should be 1:1; bail rather than emit
+        // misaligned fragments (detection simply sees less evidence).
+        return;
+    }
+
+    // Gap threshold from the run's typical glyph height (device units; the
+    // raw font_size may be scaled away by the CTM).
+    let mut heights: Vec<f32> = glyphs
+        .iter()
+        .zip(&chars)
+        .filter(|(_, ch)| !ch.is_whitespace())
+        .map(|(g, _)| g.bbox.y1 - g.bbox.y0)
+        .filter(|h| h.is_finite() && *h > 0.0)
+        .collect();
+    heights.sort_by(f32::total_cmp);
+    let h_med = heights.get(heights.len() / 2).copied().unwrap_or(font_size);
+    let gap_threshold = (0.5 * h_med).clamp(2.5, 8.0);
+
+    let mut current_text = String::new();
+    let mut bbox: Option<(f32, f32, f32, f32)> = None;
+    let mut last_x1: Option<f32> = None;
+    let mut pending_ws = 0usize;
+
+    let mut flush = |text: &mut String, bbox: &mut Option<(f32, f32, f32, f32)>| {
+        let trimmed = text.trim();
+        if let (false, Some(b)) = (trimmed.is_empty(), *bbox) {
+            out.push(CellFragment {
+                text: trimmed.to_string(),
+                bbox: b,
+                font_size,
+                font_name: (!font_name.is_empty()).then(|| font_name.to_string()),
+            });
+        }
+        text.clear();
+        *bbox = None;
+    };
+
+    for (glyph, ch) in glyphs.iter().zip(&chars) {
+        if ch.is_whitespace() {
+            pending_ws += 1;
+            continue;
+        }
+        if !current_text.is_empty() {
+            let gap = last_x1.map_or(0.0, |x1| glyph.bbox.x0 - x1);
+            if pending_ws >= 2 || gap >= gap_threshold {
+                flush(&mut current_text, &mut bbox);
+            } else if pending_ws == 1 {
+                current_text.push(' ');
+            }
+        }
+        pending_ws = 0;
+        current_text.push(*ch);
+        bbox = Some(match bbox {
+            Some((x0, y0, x1, y1)) => (
+                x0.min(glyph.bbox.x0),
+                y0.min(glyph.bbox.y0),
+                x1.max(glyph.bbox.x1),
+                y1.max(glyph.bbox.y1),
+            ),
+            None => (glyph.bbox.x0, glyph.bbox.y0, glyph.bbox.x1, glyph.bbox.y1),
+        });
+        last_x1 = Some(glyph.bbox.x1);
+    }
+    flush(&mut current_text, &mut bbox);
 }
 
 pub fn get_page_content(doc: &Document) -> Result<BTreeMap<u32, PageContents>, Error> {
@@ -863,6 +992,7 @@ impl PathTracker {
             text: None,
             metadata,
             blob: None,
+            table: None,
         });
         self.captured += 1;
     }
@@ -990,7 +1120,12 @@ fn handle_operator<'a>(
         "cm" => {
             // Finalize any pending text run before CTM change
             if let Some(text_elem) =
-                finalize_text_run(text_object_state, &current_gs.text_state, page_number)
+                finalize_text_run(
+                text_object_state,
+                &current_gs.text_state,
+                page_number,
+                &mut page_contents.cell_fragments,
+            )
             {
                 page_contents.add_text(text_elem);
             }
@@ -1007,7 +1142,12 @@ fn handle_operator<'a>(
         "ET" => {
             // Finalize the last text run within the text object
             if let Some(text_elem) =
-                finalize_text_run(text_object_state, &current_gs.text_state, page_number)
+                finalize_text_run(
+                text_object_state,
+                &current_gs.text_state,
+                page_number,
+                &mut page_contents.cell_fragments,
+            )
             {
                 page_contents.add_text(text_elem);
             }
@@ -1020,7 +1160,12 @@ fn handle_operator<'a>(
         // Text State
         "Tf" => {
             if let Some(text_elem) =
-                finalize_text_run(text_object_state, &current_gs.text_state, page_number)
+                finalize_text_run(
+                text_object_state,
+                &current_gs.text_state,
+                page_number,
+                &mut page_contents.cell_fragments,
+            )
             {
                 page_contents.add_text(text_elem);
             }
@@ -1089,7 +1234,12 @@ fn handle_operator<'a>(
         "Tm" => {
             // Finalize pending text before matrix change
             if let Some(text_elem) =
-                finalize_text_run(text_object_state, &current_gs.text_state, page_number)
+                finalize_text_run(
+                text_object_state,
+                &current_gs.text_state,
+                page_number,
+                &mut page_contents.cell_fragments,
+            )
             {
                 page_contents.add_text(text_elem);
             }
@@ -1144,7 +1294,12 @@ fn handle_operator<'a>(
         "Do" => {
             // Finalize any pending text run before handling graphics object
             if let Some(text_elem) =
-                finalize_text_run(text_object_state, &current_gs.text_state, page_number)
+                finalize_text_run(
+                text_object_state,
+                &current_gs.text_state,
+                page_number,
+                &mut page_contents.cell_fragments,
+            )
             {
                 page_contents.add_text(text_elem);
             }
@@ -1505,6 +1660,7 @@ fn get_page_elements(
         &mut text_object_state,
         &gs_stack.last().unwrap().text_state,
         page_number,
+        &mut page_contents.cell_fragments,
     ) {
         page_contents.add_text(text_elem);
     }
@@ -1554,6 +1710,42 @@ fn get_page_elements(
         };
         *bbox = top_left_bbox;
     }
+
+    // Cell fragments flip with the rest of the page content.
+    for frag in &mut page_contents.cell_fragments {
+        let (x0, y0, x1, y1) = frag.bbox;
+        frag.bbox = (x0, mediabox.y1 - y1, x1, mediabox.y1 - y0);
+    }
+
+    // TABLE detection (D-018): deterministic, parse-time only. Consumes the
+    // page's painted paths and cell fragments. Hydration never re-runs this —
+    // persisted documents round-trip verbatim (D-016).
+    let tables = crate::table::detect_tables_on_page(
+        &page_contents.cell_fragments,
+        &page_contents.aux_store.items,
+        page_number,
+        mediabox.x1 - mediabox.x0,
+    );
+    // Unlike annotations (page tail), each table handle is inserted at its
+    // reading position — before the first text element that starts below the
+    // table's top — so section partitions that begin or end mid-page keep
+    // tables on the correct side of the heading. Aux elements stay
+    // transparent to all matching, so text behavior is unchanged (D-016).
+    // Reverse order keeps equal-position tables in (y, x) order.
+    for table_elem in tables.into_iter().rev() {
+        let table_top = table_elem.bbox.y0;
+        let aux_idx = page_contents.aux_store.push(table_elem);
+        let pos = page_contents
+            .order
+            .iter()
+            .position(|handle| match handle {
+                ContentHandle::Text(t) => page_contents.text_store.bbox[*t].1 > table_top,
+                _ => false,
+            })
+            .unwrap_or(page_contents.order.len());
+        page_contents.order.insert(pos, ContentHandle::Aux(aux_idx));
+    }
+    page_contents.cell_fragments.clear();
 
     Ok(page_contents)
 }
@@ -1692,6 +1884,7 @@ fn extract_page_annotations(
                     text: None,
                     metadata,
                     blob: Some(blob),
+                    table: None,
                 });
                 continue;
             }
@@ -1739,6 +1932,7 @@ fn extract_page_annotations(
             text,
             metadata: serde_json::Value::Object(metadata),
             blob: None,
+            table: None,
         });
     }
 }
@@ -1901,6 +2095,7 @@ fn detect_figures(pages: &mut BTreeMap<u32, PageContents>, refs: &mut Vec<RefEdg
                 text: None,
                 metadata,
                 blob: None,
+                table: None,
             });
             refs.push(RefEdge {
                 from: figure_id,
@@ -1969,6 +2164,7 @@ fn extract_embedded_files(doc: &Document, pages: &mut BTreeMap<u32, PageContents
                 text: None,
                 metadata,
                 blob: Some(blob),
+                table: None,
             });
     }
 }

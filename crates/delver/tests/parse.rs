@@ -10,6 +10,7 @@ mod common;
 
 #[test]
 fn test_load_pdf() {
+    let _fixture = crate::setup::fixture_guard();
     common::setup();
 
     // Create the test PDF
@@ -23,6 +24,7 @@ fn test_load_pdf() {
 
 #[test]
 fn test_get_pdf_text() {
+    let _fixture = crate::setup::fixture_guard();
     common::setup();
 
     // Create new test PDF
@@ -74,6 +76,7 @@ fn test_get_pdf_text() {
 
 #[test]
 fn test_get_refs() {
+    let _fixture = crate::setup::fixture_guard();
     common::setup();
     create_test_pdf().expect("Failed to create test PDF");
 
@@ -123,6 +126,7 @@ fn test_text_element_display() {
 
 #[test]
 fn test_coordinate_transformations() {
+    let _fixture = crate::setup::fixture_guard();
     common::setup();
 
     // Create a PDF with specific text positions and transformations

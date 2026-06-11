@@ -188,6 +188,30 @@ pub struct FigureOutput {
     pub parent_index: Option<usize>,
 }
 
+/// Output for a matched detected table (Stage B slice 3, D-018).
+/// `header`/`rows` are the convenience text view (header row when one was
+/// detected, body rows otherwise); `cells` carries the full per-cell
+/// structure. `name` is the `as="..."` value, falling back to the template
+/// element name. Field `page` (not `page_number`) per the slice spec.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct TableOutput {
+    pub name: String,
+    pub page: u32,
+    pub bbox: (f32, f32, f32, f32),
+    pub n_rows: u32,
+    pub n_cols: u32,
+    pub header: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub cells: Vec<crate::table::TableCell>,
+    pub strategy: crate::table::TableStrategy,
+    pub confidence: f64,
+    /// Inherited template metadata (section attribution etc.), as for the
+    /// sibling output types.
+    pub metadata: HashMap<String, serde_json::Value>,
+    pub parent_name: Option<String>,
+    pub parent_index: Option<usize>,
+}
+
 #[derive(Debug, serde::Serialize, Clone)]
 #[serde(tag = "type")] // Add type field for distinguishing in JSON
 pub enum ProcessedOutput {
@@ -195,6 +219,7 @@ pub enum ProcessedOutput {
     Image(ImageOutput),
     Annotation(AnnotationOutput),
     Figure(FigureOutput),
+    Table(TableOutput),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -616,6 +641,26 @@ fn compile_match_configs(elements: &mut [Element]) -> Result<(), Error> {
         if let Some(config) = element.end_match_config.as_mut() {
             let owner = config.name.clone().unwrap_or_else(|| element.name.clone());
             compile_match_config(&owner, config)?;
+        }
+        // Documented D-006 exception (D-018): `Table(model=..., targetSchema=...)`
+        // attributes are output *enrichment*, not match/selection semantics —
+        // selection correctness is unaffected, so this warns (once, at
+        // template compile) instead of erroring; structural extraction
+        // proceeds. Stage C wires LLM enrichment.
+        if element.element_type == ElementType::Table {
+            let unimplemented: Vec<&str> = ["model", "targetSchema"]
+                .into_iter()
+                .filter(|key| element.attributes.contains_key(*key))
+                .collect();
+            if !unimplemented.is_empty() {
+                tracing::warn!(
+                    "Table '{}': attribute(s) {} are not implemented yet; proceeding with \
+                     structural extraction only (model= is output enrichment, not selection \
+                     semantics — Stage C wires LLM enrichment)",
+                    element.name,
+                    unimplemented.join(", ")
+                );
+            }
         }
         compile_match_configs(&mut element.children)?;
     }
@@ -1240,6 +1285,7 @@ pub fn process_matched_content(
 ) -> Vec<ProcessedOutput> {
     let mut global_chunk_counter = 0;
     let mut all_outputs = Vec::new();
+    let mut deferred_tables = Vec::new();
 
     // Process all content and then fix parent references
     process_matched_content_recursive(
@@ -1247,20 +1293,30 @@ pub fn process_matched_content(
         index,
         tokenizer,
         &mut all_outputs,
+        &mut deferred_tables,
         &mut global_chunk_counter,
         None, // parent_info: Option<(String, usize)>
         &HashMap::new(),
     );
 
+    // TableOutputs append after all positional outputs (D-018): chunk
+    // parent_index links are positions in this array, so inserting tables
+    // inline would shift the recorded indices of every later section. The
+    // table outputs themselves carry parent_name/parent_index captured at
+    // match time, which stay valid because earlier positions never move.
+    all_outputs.extend(deferred_tables);
+
     all_outputs
 }
 
 // Recursive function that builds the output list and tracks parent relationships
+#[allow(clippy::too_many_arguments)]
 fn process_matched_content_recursive(
     matched_items: &Vec<TemplateContentMatch>,
     index: &crate::search_index::PdfIndex,
     tokenizer: Option<&Tokenizer>,
     all_outputs: &mut Vec<ProcessedOutput>,
+    deferred_tables: &mut Vec<ProcessedOutput>,
     global_chunk_counter: &mut usize,
     parent_info: Option<(String, usize)>, // (parent_name, parent_output_index)
     parent_metadata: &HashMap<String, Value>,
@@ -1392,6 +1448,7 @@ fn process_matched_content_recursive(
                                     index,
                                     tokenizer,
                                     all_outputs,
+                                    deferred_tables,
                                     global_chunk_counter,
                                     textchunk_parent_info,
                                     &current_metadata,
@@ -1404,6 +1461,7 @@ fn process_matched_content_recursive(
                                     index,
                                     tokenizer,
                                     all_outputs,
+                                    deferred_tables,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
                                     &current_metadata,
@@ -1416,6 +1474,7 @@ fn process_matched_content_recursive(
                                     index,
                                     tokenizer,
                                     all_outputs,
+                                    deferred_tables,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
                                     &current_metadata,
@@ -1451,40 +1510,34 @@ fn process_matched_content_recursive(
                     );
                 }
             }
+            // Table selector (D-018): every matched kind=table aux element in
+            // the assigned range produces one TableOutput. Outputs are
+            // deferred to the tail of the array (see process_matched_content)
+            // so positional parent_index links of later sections stay stable.
             ElementType::Table => {
-                warn!(
-                    "Processing for ElementType::Table in process_matched_content is simplified."
-                );
-                let table_text_elements: Vec<TextElement> = match_item
-                    .matched_content
-                    .iter()
-                    .filter_map(|mc_ref| match mc_ref {
-                        MatchedContent::Index(doc_idx) => {
-                            // Resolve index to get actual content
-                            if let Some(content) = index.content_at(*doc_idx) {
-                                match content {
-                                    PageContent::Text(text_elem) => Some(text_elem),
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            }
-                        }
-                        MatchedContent::None => None,
-                    })
-                    .collect();
-                if !table_text_elements.is_empty() {
-                    let chunk_outputs = process_text_chunk_elements_simple(
-                        &table_text_elements,
+                for mc_ref in &match_item.matched_content {
+                    let MatchedContent::Index(doc_idx) = mc_ref else {
+                        continue;
+                    };
+                    let Some(aux) = index
+                        .aux_at(*doc_idx)
+                        .filter(|aux| aux.kind == crate::parse::AuxKind::Table)
+                    else {
+                        continue;
+                    };
+                    let Some(table) = aux.table.as_ref() else {
+                        warn!(
+                            "kind=table element {} carries no TableStructure; skipping output",
+                            aux.id
+                        );
+                        continue;
+                    };
+                    deferred_tables.push(process_table_element_simple(
+                        table,
                         &match_item.template_element,
                         &current_metadata,
                         parent_info.clone(),
-                        global_chunk_counter,
-                        tokenizer,
-                    );
-                    for chunk_output in chunk_outputs {
-                        all_outputs.push(ProcessedOutput::Text(chunk_output));
-                    }
+                    ));
                 }
             }
             // Annotation / Figure selectors (D-016): every matched element of
@@ -1612,6 +1665,51 @@ fn process_aux_element_simple(
             parent_index,
         }),
     }
+}
+
+/// Build the output for a matched table (D-018). `name` is the `as="..."`
+/// value, falling back to the template element name ("Table"); inherited
+/// template metadata rides along like the other output types.
+fn process_table_element_simple(
+    table: &crate::table::TableStructure,
+    template_element: &Element,
+    metadata: &HashMap<String, Value>,
+    parent_info: Option<(String, usize)>,
+) -> ProcessedOutput {
+    let json_metadata: HashMap<String, serde_json::Value> = metadata
+        .iter()
+        .map(|(k, v)| (k.clone(), template_value_to_json(v)))
+        .collect();
+    let name = match template_element.attributes.get("as") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => format!("{other:?}"),
+        None => template_element.name.clone(),
+    };
+    let (parent_name, parent_index) = match parent_info {
+        Some((name, index)) => (Some(name), Some(index)),
+        None => (None, None),
+    };
+
+    ProcessedOutput::Table(TableOutput {
+        name,
+        page: table.page,
+        bbox: (
+            table.bbox.x0,
+            table.bbox.y0,
+            table.bbox.x1,
+            table.bbox.y1,
+        ),
+        n_rows: table.n_rows,
+        n_cols: table.n_cols,
+        header: table.header_texts(),
+        rows: table.body_rows(),
+        cells: table.cells.clone(),
+        strategy: table.strategy,
+        confidence: table.confidence,
+        metadata: json_metadata,
+        parent_name,
+        parent_index,
+    })
 }
 
 // Helper function to process a matched Image element based on its children

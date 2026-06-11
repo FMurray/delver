@@ -289,3 +289,91 @@ layout.rs, and docql.rs are now `tracing::debug!` — quiet unless a subscriber 
 `search` install none). stdout untouched. Measured on the 10-K regression query: stderr
 204 849 → 0 bytes, stdout byte-identical (414 534). Intentional user-facing warnings (e.g.
 the tokenizer fallback in the service layer) stay on stderr.
+
+**D-018 · 2026-06-11 · Stage B slice 3: TABLE structure end to end (detect → structure → output → persist → hydrate).**
+`make TABLE real`: tables are detected at parse time, become kind=table elements, are selectable in
+templates, persist to Postgres, and hydrate back bit-faithfully. Detection is deterministic and
+parse-time-only; hydration never re-runs it (D-011/D-016 round-trip holds verbatim).
+- **Cell fragments (new parse side-channel)**: SEC HTML-to-PDF filings draw a whole visual row as
+  one text run with multi-space gaps between cells ("28.9%␣␣28.1%"), so post-grouping TextElements
+  are row-grained and even raw runs are line-grained. `finalize_text_run` now also emits
+  `CellFragment`s — the run split at ≥2 consecutive whitespace glyphs or an inter-glyph x-jump
+  ≥ clamp(0.5×glyph-height, 2.5, 8)pt, bboxes from the per-glyph boxes (whitespace never inflates
+  an extent). TextElement production is untouched (`process_glyph` pushes exactly one buffer char
+  per glyph, so glyphs↔chars stay 1:1); fragments live in `PageContents.cell_fragments`, are
+  consumed by detection at the end of the page walk, then dropped — never persisted, always empty
+  on hydrated pages.
+- **Core model**: `table::TableStructure { bbox, page, n_rows, n_cols, cells, strategy,
+  confidence }`, `TableCell { row, col, row_span, col_span, bbox, text, is_header }` (spans always
+  1 this slice — span *detection* was deliberately cut: missing-edge merging misfires on
+  zebra-striped tables whose unshaded rows have no rules at all; the fields exist so consumers and
+  the schema need no change when it lands). Tables are `AuxKind::Table` aux elements with the
+  structure carried beside the element (`AuxElement.table`, the D-016 BlobPayload pattern — never
+  inside metadata JSON); element metadata carries exactly `{n_rows, n_cols, strategy, confidence}`.
+  Element placement: handles are inserted into the page order at reading position (before the
+  first text element starting below the table top), not appended at page end like annotations —
+  this keeps tables on the correct side of section headings that split a page (verified: the
+  page-24 effective-tax table physically above "PERFORMANCE BY BUSINESS SEGMENT" stays out of that
+  section). Aux transparency (D-016) keeps all text matching byte-identical.
+- **Detection strategies** (priority order; each consumes its evidence; strategy + confidence
+  recorded per table; candidates <2×2 after dropping fully-empty rows/columns rejected):
+  1. **ruled** — painted paths become axis-aligned rules: thin paths (≤2.5pt thick, ≥6pt long),
+     the 4 edges of stroked rects and of filled cell-background boxes (≤60pt tall, ≤95% page
+     width — the SEC row-shading pattern), plus per-segment extraction from captured PATH points
+     (D-016's 32-point cap is the designed hook). Rules cluster by position (2pt) and merge
+     collinearly across ≤20pt gaps (bridges zebra striping); H–V intersection (2pt across,
+     10pt slack along verticals) builds connected components via union-find; components with ≥2 H
+     and ≥2 V rules become lattices; fragments snap to cells by bbox-center containment. At most
+     one text line just above the lattice (≤12pt, ≥2 columns hit) is absorbed as a header row —
+     SEC tables set the header above the first shaded/ruled band. Confidence = 0.7 + 0.3×occupancy.
+  2. **row-ruled** — leftover horizontal rules ≥50pt long, stacked ≤40pt apart with ≥0.8 mutual
+     x-overlap, ≥3 per band, evenly stacked (max gap ≤ 2.5×min gap, floor 4pt); text rows are the
+     lines inside [top−median-gap, bottom]; columns from strategy-3 inference. Rows above the first
+     rule are rule-separated headers. Confidence = 0.55 + 0.35×alignment-support (+0.05 for ≥4 rules), cap 0.95.
+  3. **aligned** — ≥3 consecutive lines of ≥2 cells each (≤28pt spacing); columns are merged
+     x-extents of cell intervals; a column is valid when supported by ≥max(2, 60% of lines) and
+     left- or right-edge aligned within 3pt for ≥80% of its cells (right-edge stands in for
+     decimal-point alignment, which it equals for uniformly formatted numeric columns); needs ≥2
+     valid columns and a ≥3-line streak hitting ≥2 of them. **Prose guard**: any single column
+     spanning >75% of the band rejects the candidate (kills the canonical false positive, bulleted
+     lists — caught live on 10-K pages 27/28/31). Confidence = 0.4 + 0.4×support + size bonus, cap 0.9.
+- **Header heuristic** (documented order): absorbed above-lattice line ⇒ header; row-ruled rows
+  above the first rule ⇒ header; else first row is header when its dominant (font name, size)
+  differs from the body's dominant style. Uniform-style borderless tables get no header row.
+- **Template integration**: `Table(as="…")` routes through Pass 2 exactly like Annotation/Figure
+  (D-016), scoped to section partitions. Output: `TableOutput { type:"Table", name, page, bbox,
+  n_rows, n_cols, header, rows, cells, strategy, confidence }` plus metadata/parent_* like sibling
+  outputs (`header` = the detected header row's texts, `rows` = body rows; full per-cell objects in
+  `cells`). TableOutputs are appended after all positional outputs: chunk `parent_index` links are
+  array positions, so inline insertion would shift every later section's recorded indices — the
+  deferral is what makes the old-objects-unchanged guarantee below possible (table outputs carry
+  their own parent_name/parent_index captured at match time; earlier positions never move).
+  **`Table(model=, targetSchema=)` is a documented, justified exception to D-006**: the existing
+  10k.tmpl carries them, they are NOT implemented this slice, and template compile emits a single
+  WARN line (tracing — quiet on default runs per D-017) and proceeds with structural extraction.
+  Rationale: model= is output *enrichment*, not match/selection semantics — selection correctness
+  is unaffected; Stage C wires LLM enrichment.
+- **Persistence (migration 0003_tables.sql, SCHEMA_VERSION=3)**: `table_cells(table_element_id
+  uuid FK→elements ON DELETE CASCADE, "row", col, row_span/col_span default 1, text, bbox box,
+  is_header bool, PK(table_element_id, "row", col))` — `"row"` is quoted (reserved word).
+  Table-level fields live in the element's metadata jsonb. Ingest bulk-UNNESTs cells; load
+  (`load_document`, `elements_in_bbox`) attaches cells to kind=table rows via one extra query
+  (skipped when no tables); hydration rebuilds `TableStructure` from metadata + cells (cell-derived
+  fallbacks if metadata is absent). Round-trip contract extended and enforced by test: fresh vs
+  hydrated template runs produce byte-identical TableOutputs (TableOutput carries no per-run ids).
+- **Regression baseline (intentional change)**: making Table real grows the 10k.tmpl 10-K query
+  output 414 534 → **466 678 bytes**, 175 → **181 objects**. Verified: all 175 previous objects
+  unchanged AND still at their exact array positions; the 6 additions are TableOutputs only (the
+  five "Performance by Business Segment" per-segment tables, pages 26/27/28/30/31, plus the
+  page-25 segment summary). `query --doc` on the pre-slice v2 document stays byte-identical at
+  414 534 (hydration re-runs nothing). Real-doc evidence at `--parse-version 3`
+  (56e30967-eff1-4c0f-acdb-3fa13b30d4ef): kinds text 11 476 / path 14 977 / annotation 79 /
+  **table 125** (114 ruled, 8 aligned, 3 row-ruled), 11 615 table_cells.
+- **Known limits** (acceptable this slice): cells inside one glyph run separated by a single
+  space + no x-jump stay joined; tables without any of (rules, cell boxes, ≥3 aligned multi-cell
+  lines) — e.g. header + one data row, borderless — are below the 2×2/3-line floors; pages past
+  the 512-path cap (D-016) lose late-page rule evidence; spans are not detected.
+- **Test-suite hygiene**: pre-existing race fixed — parse.rs/setup.rs tests create→read→delete the
+  shared tests/example.pdf in parallel; table detection shifted timings enough to surface it as
+  rare test_get_pdf_text/test_get_refs failures. They now hold a `setup::fixture_guard()` mutex
+  for the test body. (Surgical: only the six fixture-file tests serialize.)

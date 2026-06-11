@@ -17,11 +17,11 @@ use sqlx::Row;
 use crate::error::StoreError;
 use crate::types::{
     BlobRow, CorpusId, DocumentId, ElementId, ElementKind, ElementRow, ImagePayload, IngestOutcome,
-    LoadedDocument, RefEdgeRow, SearchScope, TextSearchHit,
+    LoadedDocument, RefEdgeRow, SearchScope, TableCellRow, TextSearchHit,
 };
 
 /// Bump when migrations change the logical schema.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Shared projection used everywhere element rows are returned: box corners
 /// are decomposed into floats so no geometric-type decoding is needed
@@ -160,10 +160,11 @@ impl DelverStore {
 
         let sql = format!("{ELEMENT_SELECT} WHERE e.document_id = $1 ORDER BY e.order_idx");
         let rows = sqlx::query(&sql).bind(doc).fetch_all(&self.pool).await?;
-        let elements: Vec<ElementRow> = rows
+        let mut elements: Vec<ElementRow> = rows
             .iter()
             .map(element_from_row)
             .collect::<Result<_, _>>()?;
+        self.attach_table_cells(&mut elements).await?;
 
         let refs = sqlx::query(
             "SELECT r.from_element, r.to_element, r.kind, r.metadata \
@@ -274,7 +275,64 @@ impl DelverStore {
             .bind(y1 as f64)
             .fetch_all(&self.pool)
             .await?;
-        rows.iter().map(element_from_row).collect()
+        let mut elements: Vec<ElementRow> = rows
+            .iter()
+            .map(element_from_row)
+            .collect::<Result<_, _>>()?;
+        self.attach_table_cells(&mut elements).await?;
+        Ok(elements)
+    }
+
+    /// Populate `table_cells` for any kind=table rows in `elements` (D-018).
+    /// One query for all tables; no-op (and no query) when there are none.
+    async fn attach_table_cells(&self, elements: &mut [ElementRow]) -> Result<(), StoreError> {
+        let table_ids: Vec<uuid::Uuid> = elements
+            .iter()
+            .filter(|e| e.kind == ElementKind::Table)
+            .map(|e| e.id.into_uuid())
+            .collect();
+        if table_ids.is_empty() {
+            return Ok(());
+        }
+
+        let rows = sqlx::query(
+            "SELECT c.table_element_id, c.\"row\", c.col, c.row_span, c.col_span, c.text, \
+                    c.is_header, \
+                    (c.bbox[1])[0] AS bx0, (c.bbox[1])[1] AS by0, \
+                    (c.bbox[0])[0] AS bx1, (c.bbox[0])[1] AS by1 \
+               FROM table_cells c \
+              WHERE c.table_element_id = ANY($1) \
+              ORDER BY c.table_element_id, c.\"row\", c.col",
+        )
+        .bind(&table_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut by_table: std::collections::HashMap<uuid::Uuid, Vec<TableCellRow>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let table_id: uuid::Uuid = row.try_get("table_element_id")?;
+            by_table
+                .entry(table_id)
+                .or_default()
+                .push(TableCellRow {
+                    row: row.try_get("row")?,
+                    col: row.try_get("col")?,
+                    row_span: row.try_get("row_span")?,
+                    col_span: row.try_get("col_span")?,
+                    text: row.try_get("text")?,
+                    bbox: decode_bbox(row)?,
+                    is_header: row.try_get("is_header")?,
+                });
+        }
+        for element in elements
+            .iter_mut()
+            .filter(|e| e.kind == ElementKind::Table)
+        {
+            element.table_cells =
+                Some(by_table.remove(&element.id.into_uuid()).unwrap_or_default());
+        }
+        Ok(())
     }
 
     async fn find_document(
@@ -403,6 +461,32 @@ impl DelverStore {
             .await?;
         }
 
+        if !flat.cell_table_ids.is_empty() {
+            sqlx::query(
+                "INSERT INTO table_cells \
+                   (table_element_id, \"row\", col, row_span, col_span, text, bbox, is_header) \
+                 SELECT u.table_element_id, u.row, u.col, u.row_span, u.col_span, u.text, \
+                        box(point(u.x0, u.y0), point(u.x1, u.y1)), u.is_header \
+                   FROM UNNEST($1::uuid[], $2::int4[], $3::int4[], $4::int4[], $5::int4[], \
+                               $6::text[], $7::float8[], $8::float8[], $9::float8[], \
+                               $10::float8[], $11::bool[]) \
+                     AS u(table_element_id, row, col, row_span, col_span, text, x0, y0, x1, y1, is_header)",
+            )
+            .bind(&flat.cell_table_ids)
+            .bind(&flat.cell_rows)
+            .bind(&flat.cell_cols)
+            .bind(&flat.cell_row_spans)
+            .bind(&flat.cell_col_spans)
+            .bind(&flat.cell_texts)
+            .bind(&flat.cell_x0s)
+            .bind(&flat.cell_y0s)
+            .bind(&flat.cell_x1s)
+            .bind(&flat.cell_y1s)
+            .bind(&flat.cell_is_headers)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         if !parsed.refs.is_empty() {
             let from: Vec<uuid::Uuid> = parsed.refs.iter().map(|r| r.from).collect();
             let to: Vec<uuid::Uuid> = parsed.refs.iter().map(|r| r.to).collect();
@@ -462,6 +546,19 @@ struct FlatElements {
     blob_datas: Vec<Vec<u8>>,
     blob_mimes: Vec<Option<String>>,
     blob_filenames: Vec<Option<String>>,
+
+    // table_cells staging (one entry per cell of every kind=table element).
+    cell_table_ids: Vec<uuid::Uuid>,
+    cell_rows: Vec<i32>,
+    cell_cols: Vec<i32>,
+    cell_row_spans: Vec<i32>,
+    cell_col_spans: Vec<i32>,
+    cell_texts: Vec<Option<String>>,
+    cell_x0s: Vec<f64>,
+    cell_y0s: Vec<f64>,
+    cell_x1s: Vec<f64>,
+    cell_y1s: Vec<f64>,
+    cell_is_headers: Vec<bool>,
 }
 
 impl FlatElements {
@@ -537,6 +634,22 @@ impl FlatElements {
                         flat.blob_mimes.push(blob.mime.clone());
                         flat.blob_filenames.push(blob.filename.clone());
                     }
+                    if let Some(table) = &aux.table {
+                        for cell in &table.cells {
+                            flat.cell_table_ids.push(aux.id);
+                            flat.cell_rows.push(cell.row as i32);
+                            flat.cell_cols.push(cell.col as i32);
+                            flat.cell_row_spans.push(cell.row_span as i32);
+                            flat.cell_col_spans.push(cell.col_span as i32);
+                            flat.cell_texts
+                                .push((!cell.text.is_empty()).then(|| cell.text.clone()));
+                            flat.cell_x0s.push(cell.bbox.0 as f64);
+                            flat.cell_y0s.push(cell.bbox.1 as f64);
+                            flat.cell_x1s.push(cell.bbox.2 as f64);
+                            flat.cell_y1s.push(cell.bbox.3 as f64);
+                            flat.cell_is_headers.push(cell.is_header);
+                        }
+                    }
                 }
             }
         }
@@ -568,16 +681,15 @@ fn image_payload(object: &Object) -> (Option<i32>, Option<i32>, Vec<u8>) {
     }
 }
 
-fn element_from_row(row: &PgRow) -> Result<ElementRow, StoreError> {
-    let kind = ElementKind::parse(&row.try_get::<String, _>("kind")?)?;
-
+/// Decode the corner-subscripted `bbox` projection columns (bx0..by1).
+/// Postgres normalizes box corners (upper-right first); reorder to the
+/// (min, min, max, max) convention parsed bboxes use.
+fn decode_bbox(row: &PgRow) -> Result<Option<(f32, f32, f32, f32)>, StoreError> {
     let bx0: Option<f64> = row.try_get("bx0")?;
     let by0: Option<f64> = row.try_get("by0")?;
     let bx1: Option<f64> = row.try_get("bx1")?;
     let by1: Option<f64> = row.try_get("by1")?;
-    // Postgres normalizes box corners (upper-right first); reorder to the
-    // (min, min, max, max) convention parsed bboxes use.
-    let bbox = match (bx0, by0, bx1, by1) {
+    Ok(match (bx0, by0, bx1, by1) {
         (Some(ax), Some(ay), Some(bx), Some(by)) => Some((
             (ax.min(bx)) as f32,
             (ay.min(by)) as f32,
@@ -585,7 +697,12 @@ fn element_from_row(row: &PgRow) -> Result<ElementRow, StoreError> {
             (ay.max(by)) as f32,
         )),
         _ => None,
-    };
+    })
+}
+
+fn element_from_row(row: &PgRow) -> Result<ElementRow, StoreError> {
+    let kind = ElementKind::parse(&row.try_get::<String, _>("kind")?)?;
+    let bbox = decode_bbox(row)?;
 
     let image = match kind {
         ElementKind::Image => Some(ImagePayload {
@@ -623,5 +740,7 @@ fn element_from_row(row: &PgRow) -> Result<ElementRow, StoreError> {
         metadata: row.try_get("metadata")?,
         image,
         blob,
+        // Filled by `attach_table_cells` for kind=table rows.
+        table_cells: None,
     })
 }

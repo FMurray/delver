@@ -8,6 +8,7 @@ pub mod logging;
 pub mod matcher;
 pub mod parse;
 pub mod search_index;
+pub mod table;
 // pub mod viewer;
 
 use crate::docql::{parse_template, process_matched_content, ProcessedOutput, Root};

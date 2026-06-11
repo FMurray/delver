@@ -412,6 +412,16 @@ fn align_template_with_content_with_depth<'a>(
                     content_end,
                     AuxKind::Figure,
                 ),
+                // Table selector collects every detected table in the
+                // assigned range (D-018), same routing as Annotation/Figure.
+                ElementType::Table => match_aux_kind_with_boundaries(
+                    template_element,
+                    index,
+                    actual_inherited_metadata,
+                    content_start,
+                    content_end,
+                    AuxKind::Table,
+                ),
                 _ => unreachable!("is_pass2_element gates the variants above"),
             };
 
@@ -1243,12 +1253,15 @@ fn maintains_document_flow<'a>(
 }
 
 /// Non-structural template types assigned in Pass 2 (within section
-/// boundaries / between section partitions): TextChunk plus the Annotation
-/// and Figure selectors (D-016).
+/// boundaries / between section partitions): TextChunk plus the Annotation,
+/// Figure (D-016) and Table (D-018) selectors.
 fn is_pass2_element(element_type: &ElementType) -> bool {
     matches!(
         element_type,
-        ElementType::TextChunk | ElementType::Annotation | ElementType::Figure
+        ElementType::TextChunk
+            | ElementType::Annotation
+            | ElementType::Figure
+            | ElementType::Table
     )
 }
 

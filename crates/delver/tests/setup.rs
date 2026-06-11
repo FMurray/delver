@@ -2,6 +2,20 @@ use lopdf::content::{Content, Operation};
 use lopdf::dictionary;
 use lopdf::{Document, Object, Stream};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
+
+/// Serializes tests that create/read/delete the shared fixture PDFs
+/// (tests/example.pdf and friends). Tests in one binary run in parallel, so
+/// an unsynchronized create → use → cleanup_all() of a single shared path is
+/// a race; it surfaced as rare test_get_pdf_text/test_get_refs failures.
+/// Hold the guard for the whole test body.
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn fixture_guard() -> MutexGuard<'static, ()> {
+    FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone)]
 pub struct PdfConfig {
@@ -151,11 +165,13 @@ pub fn create_test_pdf() -> Result<(), std::io::Error> {
 
 #[test]
 fn test_create_test_pdf() {
+    let _fixture = fixture_guard();
     assert!(create_test_pdf().is_ok());
 }
 
 #[test]
 fn test_create_custom_pdf() {
+    let _fixture = fixture_guard();
     let config = PdfConfig {
         title: "Custom PDF".to_string(),
         sections: vec![Section {

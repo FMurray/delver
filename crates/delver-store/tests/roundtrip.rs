@@ -708,3 +708,190 @@ async fn text_search_and_bbox_queries() {
     );
     assert!(band.iter().all(|r| r.page == 1));
 }
+
+// ─────────────────────────── TABLE round-trip (D-018) ───────────────────────────
+
+/// One-page PDF with a fully ruled 3x3 table (bold header row): 4 horizontal
+/// + 4 vertical stroked rules at known boundaries, one text run per cell.
+fn build_table_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+
+    let regular = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let bold = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica-Bold",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => regular, "F2" => bold },
+    });
+
+    let mut ops: Vec<Operation> = Vec::new();
+    push_text_ops(&mut ops, "Quarterly Metrics", 24.0, 72.0, 750.0);
+    for y in [600.0_f32, 630.0, 660.0, 690.0] {
+        ops.push(Operation::new("m", vec![100.0.into(), y.into()]));
+        ops.push(Operation::new("l", vec![460.0.into(), y.into()]));
+        ops.push(Operation::new("S", vec![]));
+    }
+    for x in [100.0_f32, 220.0, 340.0, 460.0] {
+        ops.push(Operation::new("m", vec![x.into(), 600.0.into()]));
+        ops.push(Operation::new("l", vec![x.into(), 690.0.into()]));
+        ops.push(Operation::new("S", vec![]));
+    }
+    let mut cell = |font: &str, text: &str, x: f32, y: f32| {
+        ops.push(Operation::new("BT", vec![]));
+        ops.push(Operation::new("Tf", vec![font.into(), 10.0.into()]));
+        ops.push(Operation::new("Td", vec![x.into(), y.into()]));
+        ops.push(Operation::new("Tj", vec![Object::string_literal(text)]));
+        ops.push(Operation::new("ET", vec![]));
+    };
+    cell("F2", "Name", 105.0, 668.0);
+    cell("F2", "Q1", 225.0, 668.0);
+    cell("F2", "Q2", 345.0, 668.0);
+    cell("F1", "Alpha", 105.0, 638.0);
+    cell("F1", "10", 225.0, 638.0);
+    cell("F1", "20", 345.0, 638.0);
+    cell("F1", "Beta", 105.0, 608.0);
+    cell("F1", "30", 225.0, 608.0);
+    cell("F1", "40", 345.0, 608.0);
+
+    let content_id = doc.add_object(Stream::new(
+        dictionary! {},
+        Content { operations: ops }
+            .encode()
+            .expect("encode content"),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => resources_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize pdf to memory");
+    bytes
+}
+
+/// D-018 round-trip contract: persist → load → hydrate must reproduce the
+/// detected table exactly — same cells in table_cells, same metadata, and
+/// identical TableOutputs when the same template runs over fresh vs hydrated
+/// pages.
+#[tokio::test]
+async fn roundtrip_table_structure_and_outputs() {
+    let Some(store) = connect_or_skip("roundtrip_table_structure_and_outputs").await else {
+        return;
+    };
+
+    let bytes = build_table_pdf();
+    let parsed = parse_pdf(&bytes);
+
+    // Parse-time detection: exactly one ruled 3x3 table.
+    let fresh_tables: Vec<&delver_core::parse::AuxElement> = parsed
+        .pages
+        .values()
+        .flat_map(|p| p.aux_store.iter())
+        .filter(|aux| aux.kind == AuxKind::Table)
+        .collect();
+    assert_eq!(fresh_tables.len(), 1, "expected one detected table");
+    let fresh_structure = fresh_tables[0]
+        .table
+        .clone()
+        .expect("table element carries structure");
+    assert_eq!((fresh_structure.n_rows, fresh_structure.n_cols), (3, 3));
+
+    let corpus = store
+        .ensure_corpus(&unique_corpus("tables"))
+        .await
+        .expect("ensure corpus");
+    let outcome = store
+        .ingest_parsed(corpus, None, &bytes, &parsed, 1)
+        .await
+        .expect("ingest parsed");
+    assert!(outcome.created);
+
+    // Stored rows: the table element row carries the table-level metadata and
+    // its cells payload, ordered by (row, col).
+    let loaded = store
+        .load_document(outcome.document_id)
+        .await
+        .expect("load document");
+    let table_rows: Vec<&delver_store::ElementRow> = loaded
+        .elements
+        .iter()
+        .filter(|r| r.kind == ElementKind::Table)
+        .collect();
+    assert_eq!(table_rows.len(), 1, "expected one stored table element");
+    let row = table_rows[0];
+    assert_eq!(row.metadata["n_rows"], serde_json::json!(3));
+    assert_eq!(row.metadata["n_cols"], serde_json::json!(3));
+    assert_eq!(row.metadata["strategy"], serde_json::json!("ruled"));
+    assert_eq!(
+        row.metadata["confidence"],
+        serde_json::json!(fresh_structure.confidence)
+    );
+    let cells = row.table_cells.as_ref().expect("cells loaded");
+    assert_eq!(cells.len(), 9);
+    let texts: Vec<&str> = cells
+        .iter()
+        .map(|c| c.text.as_deref().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["Name", "Q1", "Q2", "Alpha", "10", "20", "Beta", "30", "40"]
+    );
+    assert!(cells.iter().take(3).all(|c| c.is_header));
+    assert!(cells.iter().skip(3).all(|c| !c.is_header));
+    assert!(cells.iter().all(|c| c.row_span == 1 && c.col_span == 1));
+    for (cell, fresh) in cells.iter().zip(&fresh_structure.cells) {
+        assert_eq!((cell.row, cell.col), (fresh.row as i32, fresh.col as i32));
+        assert_bbox_close(
+            cell.bbox.expect("cell bbox"),
+            fresh.bbox,
+            &format!("cell ({},{})", cell.row, cell.col),
+        );
+    }
+
+    // Hydrated pages must produce byte-identical TableOutputs (TableOutput
+    // carries no per-run ids).
+    let template = "Table(as=\"t\")\n";
+    let fresh_json = delver_core::process_parsed(
+        &parsed.pages,
+        &MatchContext::default(),
+        template,
+        None,
+    )
+    .expect("fresh template run");
+    let hydrated_pages = delver_store::hydrate_pages(&loaded.elements);
+    let hydrated_json = delver_core::process_parsed(
+        &hydrated_pages,
+        &MatchContext::default(),
+        template,
+        None,
+    )
+    .expect("hydrated template run");
+    assert_eq!(
+        fresh_json, hydrated_json,
+        "hydrated TableOutputs must equal fresh TableOutputs"
+    );
+    assert!(fresh_json.contains("\"type\": \"Table\""));
+}

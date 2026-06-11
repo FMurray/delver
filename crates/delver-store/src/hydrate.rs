@@ -13,6 +13,7 @@ use delver_core::geo::Rect;
 use delver_core::layout::MatchContext;
 use delver_core::parse::{AuxElement, BlobPayload, ImageElement, PageContents, TextElement};
 use delver_core::search_index::PdfIndex;
+use delver_core::table::{TableCell, TableStrategy, TableStructure};
 use lopdf::{dictionary, Object, Stream};
 
 use crate::types::{ElementKind, ElementRow};
@@ -50,13 +51,15 @@ pub fn hydrate_pages(rows: &[ElementRow]) -> BTreeMap<u32, PageContents> {
                 },
                 image_object: rebuild_image_object(row),
             }),
-            // Aux kinds (annotation/path/figure/blob, D-016) round-trip
-            // verbatim: bbox/text/metadata from the element row, blob bytes
-            // from the blobs table payload.
+            // Aux kinds (annotation/path/figure/blob D-016, table D-018)
+            // round-trip verbatim: bbox/text/metadata from the element row,
+            // blob bytes from the blobs table payload, table cells from the
+            // table_cells payload. Detection is never re-run.
             ElementKind::Annotation
             | ElementKind::Path
             | ElementKind::Figure
-            | ElementKind::Blob => page.add_aux(AuxElement {
+            | ElementKind::Blob
+            | ElementKind::Table => page.add_aux(AuxElement {
                 id: row.id.into_uuid(),
                 kind: row.kind.as_aux().expect("aux kinds matched above"),
                 page_number,
@@ -73,10 +76,67 @@ pub fn hydrate_pages(rows: &[ElementRow]) -> BTreeMap<u32, PageContents> {
                     mime: b.mime.clone(),
                     filename: b.filename.clone(),
                 }),
+                table: (row.kind == ElementKind::Table).then(|| rebuild_table(row, bbox)),
             }),
         }
     }
     pages
+}
+
+/// Rebuild a [`TableStructure`] from a stored table row: table-level fields
+/// from the element's metadata jsonb, cells from the `table_cells` payload
+/// (D-018). Missing metadata falls back to values derived from the cells so
+/// older/partial rows still hydrate.
+fn rebuild_table(row: &ElementRow, bbox: (f32, f32, f32, f32)) -> TableStructure {
+    let cells: Vec<TableCell> = row
+        .table_cells
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|c| TableCell {
+            row: c.row.max(0) as u32,
+            col: c.col.max(0) as u32,
+            row_span: c.row_span.max(1) as u32,
+            col_span: c.col_span.max(1) as u32,
+            bbox: c.bbox.unwrap_or((0.0, 0.0, 0.0, 0.0)),
+            text: c.text.clone().unwrap_or_default(),
+            is_header: c.is_header,
+        })
+        .collect();
+
+    let meta_u32 = |key: &str| -> Option<u32> {
+        row.metadata.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
+    };
+    let n_rows = meta_u32("n_rows")
+        .unwrap_or_else(|| cells.iter().map(|c| c.row + c.row_span).max().unwrap_or(0));
+    let n_cols = meta_u32("n_cols")
+        .unwrap_or_else(|| cells.iter().map(|c| c.col + c.col_span).max().unwrap_or(0));
+    let strategy = row
+        .metadata
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .and_then(TableStrategy::parse)
+        .unwrap_or(TableStrategy::Aligned);
+    let confidence = row
+        .metadata
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    TableStructure {
+        bbox: Rect {
+            x0: bbox.0,
+            y0: bbox.1,
+            x1: bbox.2,
+            y1: bbox.3,
+        },
+        page: row.page as u32,
+        n_rows,
+        n_cols,
+        cells,
+        strategy,
+        confidence,
+    }
 }
 
 /// Rebuild a ready-to-match `PdfIndex` from stored rows.

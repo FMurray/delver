@@ -63,6 +63,7 @@ pub enum ElementKind {
     Path,
     Figure,
     Blob,
+    Table,
 }
 
 impl ElementKind {
@@ -74,6 +75,7 @@ impl ElementKind {
             ElementKind::Path => "path",
             ElementKind::Figure => "figure",
             ElementKind::Blob => "blob",
+            ElementKind::Table => "table",
         }
     }
 
@@ -85,6 +87,7 @@ impl ElementKind {
             "path" => Ok(ElementKind::Path),
             "figure" => Ok(ElementKind::Figure),
             "blob" => Ok(ElementKind::Blob),
+            "table" => Ok(ElementKind::Table),
             other => Err(crate::StoreError::Corrupt(format!(
                 "unknown element kind {other:?}"
             ))),
@@ -98,6 +101,7 @@ impl ElementKind {
             AuxKind::Path => ElementKind::Path,
             AuxKind::Figure => ElementKind::Figure,
             AuxKind::Blob => ElementKind::Blob,
+            AuxKind::Table => ElementKind::Table,
         }
     }
 
@@ -108,6 +112,7 @@ impl ElementKind {
             ElementKind::Path => Some(AuxKind::Path),
             ElementKind::Figure => Some(AuxKind::Figure),
             ElementKind::Blob => Some(AuxKind::Blob),
+            ElementKind::Table => Some(AuxKind::Table),
             ElementKind::Text | ElementKind::Image => None,
         }
     }
@@ -143,6 +148,20 @@ pub struct BlobRow {
     pub data: Vec<u8>,
     pub mime: Option<String>,
     pub filename: Option<String>,
+}
+
+/// One stored table cell (`table_cells`, D-018). Mirrors
+/// `delver_core::table::TableCell`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCellRow {
+    pub row: i32,
+    pub col: i32,
+    pub row_span: i32,
+    pub col_span: i32,
+    pub text: Option<String>,
+    /// (x0, y0, x1, y1) in top-left page coordinates.
+    pub bbox: Option<(f32, f32, f32, f32)>,
+    pub is_header: bool,
 }
 
 /// One typed edge between two elements of a document (`element_refs`,
@@ -189,6 +208,9 @@ pub struct ElementRow {
     pub image: Option<ImagePayload>,
     /// Present only for `kind == Blob` rows loaded with their payload.
     pub blob: Option<BlobRow>,
+    /// Present only for `kind == Table` rows loaded with their cells
+    /// (D-018), ordered by (row, col).
+    pub table_cells: Option<Vec<TableCellRow>>,
 }
 
 /// Scope selector for [`crate::DelverStore::text_search`].
