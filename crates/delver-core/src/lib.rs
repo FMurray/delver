@@ -9,10 +9,10 @@ pub mod parse;
 pub mod search_index;
 // pub mod viewer;
 
-use crate::docql::{parse_template, process_matched_content, ProcessedOutput};
-use crate::layout::{group_text_into_lines_and_blocks, TextBlock};
+use crate::docql::{parse_template, process_matched_content, ProcessedOutput, Root};
+use crate::layout::{group_text_into_lines_and_blocks, MatchContext, TextBlock};
 use crate::matcher::align_template_with_content;
-use crate::parse::{get_page_content, get_refs, TextElement};
+use crate::parse::{get_page_content, get_refs, PageContents, TextElement};
 use anyhow::Result;
 use lopdf::Document;
 use search_index::PdfIndex;
@@ -55,9 +55,42 @@ pub fn process_pdf(
 
     let match_context = get_refs(&doc)?;
 
+    let json = run_template(&dom, &pages_map, &match_context, tokenizer)?;
+    Ok((json, blocks, doc))
+}
+
+/// Execute a template against already-parsed page content (D-012).
+///
+/// This is the back half of [`process_pdf`], exposed so callers that already
+/// hold a `BTreeMap<page, PageContents>` — e.g. delver-store hydrating a
+/// persisted document — run the exact same index/match/chunk pipeline as a
+/// fresh parse. Callers without a PDF in hand (no named destinations) pass
+/// `&MatchContext::default()`.
+///
+/// # Returns
+/// * JSON string containing the processed outputs (same payload as the JSON
+///   returned by [`process_pdf`]).
+pub fn process_parsed(
+    pages_map: &BTreeMap<u32, PageContents>,
+    match_context: &MatchContext,
+    template_str: &str,
+    tokenizer: Option<&Tokenizer>,
+) -> Result<String> {
+    let dom = parse_template(template_str)?;
+    run_template(&dom, pages_map, match_context, tokenizer)
+}
+
+/// Shared template-execution core for [`process_pdf`] and [`process_parsed`]:
+/// build the index, align the template, process matches, serialize.
+fn run_template(
+    dom: &Root,
+    pages_map: &BTreeMap<u32, PageContents>,
+    match_context: &MatchContext,
+    tokenizer: Option<&Tokenizer>,
+) -> Result<String> {
     let mut all_outputs: Vec<ProcessedOutput> = Vec::new();
 
-    let index = PdfIndex::new(&pages_map, &match_context);
+    let index = PdfIndex::new(pages_map, match_context);
 
     if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None) {
         let outputs = process_matched_content(&matched_content, &index, tokenizer);
@@ -65,5 +98,5 @@ pub fn process_pdf(
     }
 
     let json = serde_json::to_string_pretty(&all_outputs)?;
-    Ok((json, blocks, doc))
+    Ok(json)
 }

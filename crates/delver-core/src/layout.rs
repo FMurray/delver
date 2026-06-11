@@ -362,7 +362,7 @@ pub fn identify_heading_levels(
     let (mean, std_dev) = index.get_font_size_stats(start_index, end_index);
     let text_element_count = index.get_text_element_count(start_index, end_index);
 
-    println!(
+    eprintln!(
         "[identify_heading_levels] Calculated avg_font_size: {}, std_dev: {}",
         mean, std_dev
     );
@@ -384,7 +384,7 @@ pub fn identify_heading_levels(
             0
         };
 
-        println!("[identify_heading_levels] Checking style: ({}, {}), usage: {}, z_score: {:.2}, text_count: {}, max_rel_thresh: {}", 
+        eprintln!("[identify_heading_levels] Checking style: ({}, {}), usage: {}, z_score: {:.2}, text_count: {}, max_rel_thresh: {}", 
             font_name, font_size, usage_count, z_score, text_element_count, max_rel_usage_threshold);
 
         // Check if this font/size combination could be a heading:
@@ -393,10 +393,10 @@ pub fn identify_heading_levels(
             && z_score > 0.0
         // Must be above average
         {
-            println!("    -> Candidate ACCEPTED");
+            eprintln!("    -> Candidate ACCEPTED");
             candidates.push(((font_name, font_size), usage_count));
         } else {
-            println!(
+            eprintln!(
                 "    -> Candidate REJECTED (usage: {}, z_score_check: {}, rel_usage_check: {})",
                 usage_count >= min_abs_usage,
                 z_score > 0.0,
@@ -455,7 +455,7 @@ pub fn find_elements_at_heading_level(
     start_index: Option<usize>,
     end_index: Option<usize>,
 ) -> Vec<PageContent> {
-    println!(
+    eprintln!(
         "Looking for heading elements with font '{}' and size {}",
         font_name, font_size
     );

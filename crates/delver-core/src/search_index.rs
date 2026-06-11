@@ -655,7 +655,7 @@ impl PdfIndex {
                         // Check if we've exceeded the max_content_index limit
                         if let Some(max_idx) = max_content_index {
                             if doc_idx >= max_idx {
-                                println!("[find_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
+                                eprintln!("[find_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
                                 break;
                             }
                         }
@@ -663,7 +663,7 @@ impl PdfIndex {
                         results.push((TextHandle(text_store_idx as u32), score));
                     }
                 } else {
-                    println!(
+                    eprintln!(
                         "[find_text_matches] Match found but no doc_idx for text_idx {}",
                         text_store_idx
                     );
@@ -1048,34 +1048,34 @@ impl PdfIndex {
         let start_id = start_element.id();
         let end_id = end_element.map(|e| e.id());
 
-        println!(
+        eprintln!(
             "[get_elements_between_markers] Looking for start_id: {}",
             start_id
         );
         if let Some(end_id) = end_id {
-            println!(
+            eprintln!(
                 "[get_elements_between_markers] Looking for end_id: {}",
                 end_id
             );
         } else {
-            println!("[get_elements_between_markers] No end element specified");
+            eprintln!("[get_elements_between_markers] No end element specified");
         }
 
-        println!(
+        eprintln!(
             "[get_elements_between_markers] element_id_to_index contains {} mappings",
             self.element_id_to_index.len()
         );
 
         let start_idx_inclusive = match self.element_id_to_index.get(&start_id) {
             Some(&idx) => {
-                println!(
+                eprintln!(
                     "[get_elements_between_markers] Found start_id at index: {}",
                     idx
                 );
                 idx
             }
             None => {
-                println!(
+                eprintln!(
                     "[get_elements_between_markers] Start element ID {} not found in index",
                     start_id
                 );
@@ -1088,31 +1088,31 @@ impl PdfIndex {
                 let end_id = end.id();
                 match self.element_id_to_index.get(&end_id) {
                     Some(&idx) => {
-                        println!(
+                        eprintln!(
                             "[get_elements_between_markers] Found end_id at index: {}",
                             idx
                         );
                         idx // This index is exclusive for the slice
                     }
                     None => {
-                        println!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
+                        eprintln!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
                         self.order.len() // End element not found, go to end of document
                     }
                 }
             }
             None => {
-                println!("[get_elements_between_markers] No end element, using document end");
+                eprintln!("[get_elements_between_markers] No end element, using document end");
                 self.order.len() // No end element, go to end of document
             }
         };
 
-        println!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
+        eprintln!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
                  start_idx_inclusive, end_idx_exclusive, self.order.len());
 
         // Now, start_idx_inclusive will be used directly for the slice start.
         // Ensure start_idx_inclusive is not past end_idx_exclusive or bounds.
         if start_idx_inclusive >= end_idx_exclusive || start_idx_inclusive >= self.order.len() {
-            println!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
+            eprintln!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
                      start_idx_inclusive, end_idx_exclusive, self.order.len());
             return Vec::new();
         }
@@ -1120,7 +1120,7 @@ impl PdfIndex {
         // Ensure the slice end is within bounds.
         let effective_end_idx = std::cmp::min(end_idx_exclusive, self.order.len());
 
-        println!(
+        eprintln!(
             "[get_elements_between_markers] Effective slice: [{}..{}]",
             start_idx_inclusive, effective_end_idx
         );
@@ -1128,7 +1128,7 @@ impl PdfIndex {
         // Use cache-efficient content_slice method
         let result = self.content_slice(start_idx_inclusive, effective_end_idx);
 
-        println!(
+        eprintln!(
             "[get_elements_between_markers] Returning {} elements",
             result.len()
         );

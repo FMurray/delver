@@ -898,7 +898,7 @@ fn process_matched_content_recursive(
                         global_chunk_counter,
                         tokenizer,
                     );
-                    println!("chunk outputs: {:?}", chunk_outputs);
+                    eprintln!("chunk outputs: {:?}", chunk_outputs);
                     for chunk_output in chunk_outputs {
                         all_outputs.push(ProcessedOutput::Text(chunk_output));
                     }
@@ -1175,7 +1175,7 @@ fn process_image_element_simple(
                 match &image_bytes_result {
                     Ok(bytes) => {
                         image_output.bytes_base64 = Some(BASE64_STANDARD.encode(bytes));
-                        println!("Successfully decoded and encoded image bytes for ImageBytes.");
+                        eprintln!("Successfully decoded and encoded image bytes for ImageBytes.");
                     }
                     Err(e) => {
                         if e != "Bytes not needed" {
@@ -1190,7 +1190,7 @@ fn process_image_element_simple(
                 // TODO: Implement actual caption finding logic
                 // This likely involves searching nearby TextElements in the PdfIndex
                 // based on the image_element.bbox and page_number.
-                println!("Placeholder: Need to implement caption finding for ImageCaption");
+                eprintln!("Placeholder: Need to implement caption finding for ImageCaption");
                 image_output.caption = Some("PLACEHOLDER_IMAGE_CAPTION".to_string());
             }
             ElementType::ImageSummary => {
@@ -1219,7 +1219,7 @@ fn process_image_element_simple(
                     Ok(_bytes) => {
                         // TODO: Implement actual call to external LLM for summary
                         // let summary = call_llm_summary(&config, bytes);
-                        println!("Placeholder: Call external summary model ('{:?}')", config);
+                        eprintln!("Placeholder: Call external summary model ('{:?}')", config);
                         image_output.summary =
                             Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", config.model));
                     }
@@ -1245,7 +1245,7 @@ fn process_image_element_simple(
                         match generate_embedding(&embedding_model, bytes) {
                             Ok(embedding) => {
                                 image_output.embedding = Some(embedding);
-                                println!(
+                                eprintln!(
                                     "Successfully generated placeholder embedding using {:?}.",
                                     embedding_model
                                 );
@@ -1437,17 +1437,17 @@ fn generate_embedding(model: &EmbeddingModel, image_bytes: &[u8]) -> Result<Vec<
     match model {
         EmbeddingModel::Clip => {
             // --- Placeholder Logic ---
-            println!(
+            eprintln!(
                 "Placeholder: Simulating CLIP embedding generation for image ({} bytes)",
                 image_bytes.len()
             );
             // Basic validation: Try to guess format and check dimensions (optional)
             match image::guess_format(image_bytes) {
                 Ok(format) => {
-                    println!("Placeholder: Detected image format: {:?}", format);
+                    eprintln!("Placeholder: Detected image format: {:?}", format);
                     match image::load_from_memory(image_bytes) {
                         Ok(img) => {
-                            println!(
+                            eprintln!(
                                 "Placeholder: Image dimensions {}x{}",
                                 img.width(),
                                 img.height()

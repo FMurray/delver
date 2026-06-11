@@ -149,7 +149,7 @@ fn align_template_with_content_with_depth<'a>(
         return None;
     }
 
-    println!(
+    eprintln!(
         "align_template_with_content_with_depth: {:?}",
         template_elements
     );
@@ -192,7 +192,7 @@ fn align_template_with_content_with_depth<'a>(
                     .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
                     .unwrap_or(index.doc_len());
 
-                println!(
+                eprintln!(
                     "MATCHER: Processing children within section boundaries {} to {}",
                     start_idx, end_idx
                 );
@@ -215,7 +215,7 @@ fn align_template_with_content_with_depth<'a>(
 
     for template_element in template_elements {
         if template_element.element_type == ElementType::Section {
-            println!("  PASS 1: Processing Section '{:#?}'", template_element);
+            eprintln!("  PASS 1: Processing Section '{:#?}'", template_element);
 
             // Determine which context to pass: previous sibling for most sections,
             // but for the *last* section pass the parent so it can inherit the
@@ -284,7 +284,7 @@ fn align_template_with_content_with_depth<'a>(
                 effective_start_index,
                 recursion_depth,
             ) {
-                println!(
+                eprintln!(
                     "  PASS 1: Found Section '{}' boundaries",
                     template_element.name
                 );
@@ -319,7 +319,7 @@ fn align_template_with_content_with_depth<'a>(
 
     for (template_idx, template_element) in template_elements.iter().enumerate() {
         if template_element.element_type == ElementType::TextChunk {
-            println!(
+            eprintln!(
                 "  PASS 2: Processing TextChunk '{}' (template order: {})",
                 template_element.name, template_idx
             );
@@ -338,7 +338,7 @@ fn align_template_with_content_with_depth<'a>(
                     if template_idx < first_section_idx {
                         // TextChunk comes before first section - process content before first section
                         let first_partition_start = content_partitions[0].0;
-                        println!(
+                        eprintln!(
                             "    TextChunk '{}' processes content BEFORE first section: {} to {}",
                             template_element.name, start_search_index, first_partition_start
                         );
@@ -356,7 +356,7 @@ fn align_template_with_content_with_depth<'a>(
                             } else {
                                 last_partition_end
                             };
-                        println!(
+                        eprintln!(
                             "    TextChunk '{}' processes content AFTER sections: {} to {}",
                             template_element.name,
                             content_start_after_section,
@@ -378,10 +378,10 @@ fn align_template_with_content_with_depth<'a>(
                 content_start,
                 content_end,
             ) {
-                println!("    SUCCESS: Matched TextChunk '{}'", template_element.name);
+                eprintln!("    SUCCESS: Matched TextChunk '{}'", template_element.name);
                 textchunk_matches.push(textchunk_match);
             } else {
-                println!(
+                eprintln!(
                     "    FAILURE: No match for TextChunk '{}'",
                     template_element.name
                 );
@@ -638,7 +638,7 @@ fn find_start_boundary_candidates<'a>(
 ) -> Option<Vec<BoundaryCandidate>> {
     let mut candidates = Vec::new();
 
-    println!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
+    eprintln!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
     // 1. Text-based candidates
     let text_matches = index.find_text_matches(
         &match_config.pattern,
@@ -646,7 +646,7 @@ fn find_start_boundary_candidates<'a>(
         Some(start_index),
         max_search_index,
     );
-    println!(
+    eprintln!(
         "[find_start_boundary_candidates] Text-based candidates found: {}",
         text_matches.len()
     );
@@ -667,11 +667,11 @@ fn find_start_boundary_candidates<'a>(
     }
 
     if candidates.is_empty() {
-        println!("[find_start_boundary_candidates] No candidates found. Returning None.");
+        eprintln!("[find_start_boundary_candidates] No candidates found. Returning None.");
         None
     } else {
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        println!(
+        eprintln!(
             "[find_start_boundary_candidates] Returning {} sorted candidates.",
             candidates.len()
         );
@@ -724,7 +724,7 @@ fn find_end_boundary_candidates<'a>(
             candidates.push(bc);
         }
     } else {
-        println!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");
+        eprintln!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");
         // If no end_match is specified, we might want a default behavior,
         // for example, consider all elements after start_content on the same page,
         // or up to the start of a *next* identifiable section if one exists soon.
@@ -732,11 +732,11 @@ fn find_end_boundary_candidates<'a>(
     }
 
     // 2. Natural boundaries (Currently Commented Out)
-    // println!("[find_end_boundary_candidates] Considering natural boundaries...");
+    // eprintln!("[find_end_boundary_candidates] Considering natural boundaries...");
     // candidates.extend(find_natural_boundaries(start_content, index, children));
 
     // 3. Filter based on child elements (Currently Commented Out)
-    // println!("[find_end_boundary_candidates] Validating boundary candidates based on children...");
+    // eprintln!("[find_end_boundary_candidates] Validating boundary candidates based on children...");
     // candidates = validate_boundary_candidates(&candidates, children, index);
 
     // --- Structural similarity driven candidates ---------------------------
@@ -947,7 +947,7 @@ fn match_text_chunk_with_boundaries<'a>(
     }
 
     if !has_text_content {
-        println!("[match_text_chunk_with_boundaries] No text content found");
+        eprintln!("[match_text_chunk_with_boundaries] No text content found");
         return None;
     }
 
@@ -1057,7 +1057,7 @@ pub fn extract_section_content_handles<'a>(
         PageContent::Text(t) => format!("Text('{}', ID: {})", t.text, t.id),
         PageContent::Image(i) => format!("Image(ID: {})", i.id),
     });
-    println!(
+    eprintln!(
         "[extract_section_content] Start: {}, End: {}",
         start_debug_info, end_debug_info
     );
@@ -1089,7 +1089,7 @@ pub fn extract_section_content_handles<'a>(
 //     _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a PageContent>>,
 //     inherited_metadata: &HashMap<String, Value>,
 // ) -> Option<TemplateContentMatch<'a>> {
-//     println!("MATCHER: Processing Table template element");
+//     eprintln!("MATCHER: Processing Table template element");
 
 //     let _match_config = template.attributes.get("match")?.as_match_config()?;
 
@@ -1113,7 +1113,7 @@ pub fn extract_section_content_handles<'a>(
 //         let start_marker = potential_table_elements.first().copied()?;
 //         let end_marker = potential_table_elements.last().copied();
 
-//         println!(
+//         eprintln!(
 //             "MATCHER: Found potential table starting with element: {:?}",
 //             start_marker.text()
 //         );
@@ -1150,13 +1150,13 @@ pub fn extract_section_content_handles<'a>(
 //     inherited_metadata: &HashMap<String, Value>,
 //     start_image_index: usize,
 // ) -> Option<TemplateContentMatch<'a>> {
-//     println!(
+//     eprintln!(
 //         "MATCHER: Processing Image template element, starting search from index {}",
 //         start_image_index
 //     );
 
 //     index.images.get(start_image_index).map(|image_elem| {
-//         println!("MATCHER: Found image with ID {}", image_elem.id);
+//         eprintln!("MATCHER: Found image with ID {}", image_elem.id);
 //         let mut result =
 //             TemplateContentMatch::with_content(template, MatchedContent::Image(image_elem.clone()));
 //         result.metadata = inherited_metadata.clone();
