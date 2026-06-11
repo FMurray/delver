@@ -62,6 +62,10 @@ impl DelverStoreBlocking {
         )
     }
 
+    pub fn element_count(&self, doc: DocumentId) -> Result<i64, StoreError> {
+        self.runtime.block_on(self.store.element_count(doc))
+    }
+
     pub fn load_document(&self, doc: DocumentId) -> Result<Vec<ElementRow>, StoreError> {
         self.runtime.block_on(self.store.load_document(doc))
     }

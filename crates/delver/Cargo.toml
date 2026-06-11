@@ -15,6 +15,7 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 delver-core = { path = "../delver-core" }
+delver-store = { path = "../delver-store" }
 clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 tokio = { workspace = true }
@@ -25,12 +26,15 @@ shellexpand = { workspace = true }
 pyo3 = { version = "0.25.1", features = ["extension-module"], optional = true }
 tokenizers = { version = "0.21.2", features = ["http"] }
 anyhow.workspace = true
-
-[dev-dependencies]
-flamegraph = { workspace = true }
-pretty_assertions = { workspace = true } 
+serde_json = { workspace = true }
 uuid = { workspace = true }
+
+# NOTE: flamegraph is intentionally not a dev-dependency: it is the
+# `cargo flamegraph` subcommand (install with `cargo install flamegraph`),
+# not a library, and listing it forced every `cargo test -p delver` to
+# build the whole cargo toolchain dependency tree.
+[dev-dependencies]
+pretty_assertions = { workspace = true }
 strsim = { workspace = true }
 lopdf = { workspace = true }
-serde_json = { workspace = true }
 ordered-float = { workspace = true }

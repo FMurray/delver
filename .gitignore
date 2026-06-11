@@ -1,4 +1,5 @@
 /target
+/libpdfium.dylib
 /tests/Felix.pdf
 /deps
 /logs/*

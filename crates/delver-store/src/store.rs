@@ -134,6 +134,15 @@ impl DelverStore {
             .await
     }
 
+    /// Number of element rows stored for a document (0 if the id is unknown).
+    pub async fn element_count(&self, doc: DocumentId) -> Result<i64, StoreError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM elements WHERE document_id = $1")
+            .bind(doc)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
     /// Load all element rows of a document in global document order.
     pub async fn load_document(&self, doc: DocumentId) -> Result<Vec<ElementRow>, StoreError> {
         let sql = format!("{ELEMENT_SELECT} WHERE e.document_id = $1 ORDER BY e.order_idx");

@@ -93,3 +93,52 @@ Supporting choices:
 - Dev note: when Docker Desktop is gated by org sign-in, a local Homebrew Postgres 17 +
   pgvector serving `postgres://delver:delver@localhost:5433/delver` satisfies the same
   contract; the slice-1 tests were verified against it (4/4 green, none skipped).
+
+**D-012 · 2026-06-11 · Slice-2 CLI surface, Python facade, and `process_parsed` extraction.**
+The `delver` binary is now subcommand-based (clap): `process` (the pre-subcommand CLI,
+verbatim flags and behavior), `index`, `query`, `search`. Database URL precedence everywhere:
+`--db` flag > `DATABASE_URL` env > the D-002 local dev default.
+- `index <pdf> --corpus <name> [--uri] [--parse-version=1] [--db]` → ingest via
+  `DelverStoreBlocking::ingest_document` (D-008 idempotency holds through the CLI), prints
+  `{"document_id","created","element_count","corpus"}`. `DelverStore::element_count` was
+  added (COUNT query) so the receipt does not load full rows/image bytes.
+- `query --template <path> (--doc <uuid> | --pdf <path>) [--db] [--pretty] [--tokenizer-model]`
+  → `--pdf` runs the fresh `process_pdf` pipeline; `--doc` loads rows, `hydrate_pages`, and
+  executes the same pipeline. To enable this, delver-core gained
+  `process_parsed(pages, match_context, template_str, tokenizer) -> Result<String>`: a pure
+  refactor-extract of the back half of `process_pdf` (index → align → process → serialize via
+  a shared private `run_template`; `process_pdf` routes through it with identical operation
+  order, so the fresh path is behavior-identical). The hydrated path passes
+  `MatchContext::default()` — named destinations are not persisted yet (same Stage A
+  limitation as D-011 hydration). Verified on the 3M 2015 10-K: fresh vs hydrated outputs are
+  equal on all stable fields (175/175 chunks, texts, metadata, pages 1–45) — element UUIDs
+  are per-parse and excluded per D-011. `--tokenizer-model none` disables token chunking
+  explicitly; an unfetchable model warns on stderr and falls back to character chunking
+  (`process` keeps its original silent fallback). Output is compact JSON unless `--pretty`
+  (`process` keeps its always-pretty output).
+- `search <query> --corpus <name> [--doc <uuid>] [--limit=10] [--db]` → `text_search`
+  (corpus scope, or document scope when `--doc` given), prints a JSON array of
+  `{"element_id","document_id","page","rank","snippet"}` (snippet = element text truncated
+  to 200 chars).
+- Python facade: `delver_pdf.DelverStore` (pyclass) wraps `DelverStoreBlocking` with
+  `new(db_url=None)`, `ingest(path, corpus, uri=None, parse_version=None)`,
+  `search(query, corpus, limit=None)`, `run_template(doc_id, template, tokenizer_model=None)`
+  where `template` is DocQL source text. CLI and Python route through one shared service
+  layer in `crates/delver/src/lib.rs` (`ingest_file`/`search_store`/`run_template_on_doc`),
+  so the JSON shapes cannot drift. `process_pdf_file` is unchanged.
+- Tests: `crates/delver/tests/store_cli.rs` drives the real binary
+  (`env!("CARGO_BIN_EXE_delver")`, no assert_cmd dependency) through
+  index → re-index (idempotent) → `query --doc` vs `query --pdf` (stable-field equality) →
+  corpus/document search, using the D-009 synthetic-PDF + skip-without-DB pattern
+  (PDF builder duplicated from delver-store/tests/roundtrip.rs by design — no shared
+  test-util crate for ~60 lines).
+
+**D-013 · 2026-06-11 · Library stdout is reserved for data: debug prints moved to stderr.**
+`index`/`query`/`search` print exactly one JSON document on stdout so they compose with
+pipes and tests parse stdout wholesale. delver-core's match pipeline contained ~50 stray
+debug `println!`s (matcher, search_index, layout, docql) that broke that contract; they are
+now `eprintln!` (computation untouched, diagnostics preserved on stderr). `logging.rs` is
+unchanged (its prints only fire under the `process` subcommand's debug subscriber).
+Related hygiene: `flamegraph` was removed from delver's dev-dependencies — it is the
+`cargo flamegraph` subcommand, not a library, and it forced every `cargo test -p delver`
+to build the cargo-toolchain dependency tree (which also blocked offline test runs).
