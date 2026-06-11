@@ -161,6 +161,15 @@ struct SearchArgs {
 }
 
 fn main() -> Result<()> {
+    // Rust ignores SIGPIPE by default, so `delver query ... | head` would
+    // panic with "failed printing to stdout: Broken pipe" when the reader
+    // closes the pipe. Restore the conventional Unix behavior (terminate
+    // silently on SIGPIPE) before any output happens (D-018).
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     match Cli::parse().command {
         Command::Process(args) => run_process(args),
         Command::Index(args) => run_index(args),

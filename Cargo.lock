@@ -1572,6 +1572,7 @@ dependencies = [
  "delver-embed",
  "delver-store",
  "env_logger",
+ "libc",
  "lopdf",
  "ordered-float 5.0.0",
  "pretty_assertions",

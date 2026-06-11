@@ -29,6 +29,9 @@ tokenizers = { version = "0.21.2", features = ["http"] }
 anyhow.workspace = true
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# SIGPIPE reset in main() (D-018). Already pinned in Cargo.lock (transitive),
+# so the firewalled crates.io index is never consulted.
+libc = "0.2"
 
 # NOTE: flamegraph is intentionally not a dev-dependency: it is the
 # `cargo flamegraph` subcommand (install with `cargo install flamegraph`),

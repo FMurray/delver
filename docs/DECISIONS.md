@@ -377,3 +377,12 @@ parse-time-only; hydration never re-runs it (D-011/D-016 round-trip holds verbat
   shared tests/example.pdf in parallel; table detection shifted timings enough to surface it as
   rare test_get_pdf_text/test_get_refs failures. They now hold a `setup::fixture_guard()` mutex
   for the test body. (Surgical: only the six fixture-file tests serialize.)
+
+**D-019 · 2026-06-11 · CLI: SIGPIPE restored to default disposition.**
+Rust ignores SIGPIPE, so `delver query … | head` panicked with "failed printing to stdout: Broken
+pipe" once the reader closed the pipe — every JSON-emitting subcommand was affected. `main()` now
+restores `SIG_DFL` for SIGPIPE first thing (unix only): conventional silent termination, chosen
+over EPIPE-tolerant write wrapping because every stdout/stderr writer (including panics-on-print
+inside libraries) is covered with one line and no error-path audit. `libc` added as a direct
+dependency (already Cargo.lock-pinned transitively — the firewalled index was never consulted).
+Verified: `query --doc … --pretty | head -5` exits silently, 0 bytes on stderr, no panic.
