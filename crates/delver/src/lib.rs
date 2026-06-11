@@ -7,10 +7,13 @@
 //! logic in `delver-core` / `delver-store`.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use delver_core::embed::Embedder;
 use delver_core::layout::MatchContext;
 use delver_core::process_parsed;
+use delver_embed::DatabricksEmbedder;
 use delver_store::blocking::DelverStoreBlocking;
 use delver_store::{DocumentId, IngestOutcome, SearchScope, TextSearchHit};
 use tokenizers::Tokenizer;
@@ -34,6 +37,24 @@ pub fn connect_store(db_flag: Option<&str>) -> Result<DelverStoreBlocking> {
     let url = resolve_db_url(db_flag);
     DelverStoreBlocking::connect(&url)
         .with_context(|| format!("connecting to Postgres at {url}"))
+}
+
+/// Build the embedding backend for `EmbeddingSim(...)` matches (D-014).
+/// Endpoint precedence mirrors `resolve_db_url`: explicit flag >
+/// `DELVER_EMBED_ENDPOINT` env. `Ok(None)` when neither is set — templates
+/// that need embeddings then fail loud at match time (D-006).
+pub fn build_embedder(flag: Option<&str>) -> Result<Option<Arc<dyn Embedder>>> {
+    let endpoint = flag
+        .map(str::to_string)
+        .or_else(|| std::env::var("DELVER_EMBED_ENDPOINT").ok());
+    match endpoint {
+        None => Ok(None),
+        Some(endpoint) => {
+            let embedder = DatabricksEmbedder::new(&endpoint)
+                .with_context(|| format!("configuring embedding endpoint {endpoint:?}"))?;
+            Ok(Some(Arc::new(embedder) as Arc<dyn Embedder>))
+        }
+    }
 }
 
 /// Load a tokenizer by Hugging Face model id. `"none"` disables token-based
@@ -109,13 +130,16 @@ pub fn run_template_on_doc(
     doc: DocumentId,
     template_str: &str,
     tokenizer: Option<&Tokenizer>,
+    embedder: Option<Arc<dyn Embedder>>,
 ) -> Result<String> {
     let rows = store.load_document(doc)?;
     if rows.is_empty() {
         bail!("document {doc} has no stored elements (unknown id or empty document)");
     }
     let pages = delver_store::hydrate_pages(&rows);
-    process_parsed(&pages, &MatchContext::default(), template_str, tokenizer)
+    let mut match_context = MatchContext::default();
+    match_context.embedder = embedder.into();
+    process_parsed(&pages, &match_context, template_str, tokenizer)
 }
 
 fn search_hits_json(hits: &[TextSearchHit]) -> serde_json::Value {
@@ -157,7 +181,7 @@ mod python {
         let tokenizer = Tokenizer::from_pretrained("Qwen/Qwen2-7B-Instruct", None).unwrap();
 
         let (json, _blocks, _doc) =
-            delver_core::process_pdf(&pdf_bytes, &template_str, Some(&tokenizer))
+            delver_core::process_pdf(&pdf_bytes, &template_str, Some(&tokenizer), None)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(json)
@@ -221,13 +245,16 @@ mod python {
         /// Execute DocQL template source over a stored document (hydrated
         /// from Postgres). Returns the outputs JSON (same payload as
         /// `process_pdf_file`). `tokenizer_model` of `None` or `"none"`
-        /// uses character-based chunking.
-        #[pyo3(signature = (doc_id, template, tokenizer_model=None))]
+        /// uses character-based chunking. `embed_endpoint` (name or full
+        /// URL; falls back to $DELVER_EMBED_ENDPOINT) enables
+        /// EmbeddingSim(...) matches via Databricks serving (D-014).
+        #[pyo3(signature = (doc_id, template, tokenizer_model=None, embed_endpoint=None))]
         fn run_template(
             &self,
             doc_id: String,
             template: String,
             tokenizer_model: Option<String>,
+            embed_endpoint: Option<String>,
         ) -> PyResult<String> {
             let doc = uuid::Uuid::parse_str(&doc_id)
                 .map(DocumentId)
@@ -239,7 +266,8 @@ mod python {
             let tokenizer = tokenizer_model
                 .as_deref()
                 .and_then(crate::load_tokenizer);
-            crate::run_template_on_doc(&self.store, doc, &template, tokenizer.as_ref())
+            let embedder = crate::build_embedder(embed_endpoint.as_deref()).map_err(to_py_err)?;
+            crate::run_template_on_doc(&self.store, doc, &template, tokenizer.as_ref(), embedder)
                 .map_err(to_py_err)
         }
     }

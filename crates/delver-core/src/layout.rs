@@ -11,6 +11,9 @@ use uuid::Uuid;
 #[derive(Debug, Default)]
 pub struct MatchContext {
     pub destinations: IndexMap<String, Object>,
+    /// Embedding backend for `EmbeddingSim(...)` matches (D-014). When unset,
+    /// templates that use embedding matches fail loud at match time (D-006).
+    pub embedder: crate::embed::SharedEmbedder,
 }
 
 /// Represents a single line of text on the page after grouping TextElements.

@@ -11,7 +11,9 @@ use anyhow::Result;
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use uuid::Uuid;
 
-use delver::{connect_store, ingest_file, load_tokenizer, run_template_on_doc, search_store};
+use delver::{
+    build_embedder, connect_store, ingest_file, load_tokenizer, run_template_on_doc, search_store,
+};
 use delver_core::logging::{init_debug_logging, DebugDataStore};
 use delver_core::process_pdf;
 use delver_store::DocumentId;
@@ -74,6 +76,11 @@ struct ProcessArgs {
     /// Tokenizer model name
     #[clap(long, default_value = "Qwen/Qwen2-7B-Instruct")]
     tokenizer_model: String,
+
+    /// Databricks embedding endpoint (name or full URL) for EmbeddingSim
+    /// matches; falls back to $DELVER_EMBED_ENDPOINT
+    #[clap(long)]
+    embed_endpoint: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -124,6 +131,11 @@ struct QueryArgs {
     /// Tokenizer model name ("none" for character-based chunking)
     #[clap(long, default_value = "Qwen/Qwen2-7B-Instruct")]
     tokenizer_model: String,
+
+    /// Databricks embedding endpoint (name or full URL) for EmbeddingSim
+    /// matches; falls back to $DELVER_EMBED_ENDPOINT
+    #[clap(long)]
+    embed_endpoint: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -169,7 +181,8 @@ fn run_process(args: ProcessArgs) -> Result<()> {
     let pdf_bytes = fs::read(&args.pdf_path)?;
     let template_str = fs::read_to_string(&args.template)?;
     let tokenizer = Tokenizer::from_pretrained(&args.tokenizer_model, None).ok();
-    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref())?;
+    let embedder = build_embedder(args.embed_endpoint.as_deref())?;
+    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref(), embedder)?;
 
     match args.output {
         Some(path) => fs::write(&path, json)?,
@@ -194,16 +207,24 @@ fn run_index(args: IndexArgs) -> Result<()> {
 fn run_query(args: QueryArgs) -> Result<()> {
     let template_str = fs::read_to_string(&args.template)?;
     let tokenizer = load_tokenizer(&args.tokenizer_model);
+    let embedder = build_embedder(args.embed_endpoint.as_deref())?;
 
     let json = match (&args.pdf, args.doc) {
         (Some(pdf_path), None) => {
             let pdf_bytes = fs::read(pdf_path)?;
-            let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref())?;
+            let (json, _blocks, _doc) =
+                process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref(), embedder)?;
             json
         }
         (None, Some(doc)) => {
             let store = connect_store(args.db.as_deref())?;
-            run_template_on_doc(&store, DocumentId(doc), &template_str, tokenizer.as_ref())?
+            run_template_on_doc(
+                &store,
+                DocumentId(doc),
+                &template_str,
+                tokenizer.as_ref(),
+                embedder,
+            )?
         }
         _ => unreachable!("clap group enforces exactly one of --doc / --pdf"),
     };

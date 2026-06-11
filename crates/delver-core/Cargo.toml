@@ -39,3 +39,8 @@ serde.workspace = true
 rusttype.workspace = true
 lazy_static.workspace = true
 
+
+# Dev-only cycle (allowed by cargo): matcher execution tests drive
+# EmbeddingSim through the delver-embed MockEmbedder via the core trait.
+[dev-dependencies]
+delver-embed = { path = "../delver-embed" }

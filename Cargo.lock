@@ -1569,6 +1569,7 @@ dependencies = [
  "anyhow",
  "clap",
  "delver-core",
+ "delver-embed",
  "delver-store",
  "env_logger",
  "lopdf",
@@ -1593,6 +1594,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "dashmap 6.1.0",
+ "delver-embed",
  "geo",
  "image",
  "indexmap",
@@ -1620,6 +1622,15 @@ dependencies = [
  "tracing-tree",
  "unicode-normalization",
  "uuid",
+]
+
+[[package]]
+name = "delver-embed"
+version = "0.1.0"
+dependencies = [
+ "delver-core",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

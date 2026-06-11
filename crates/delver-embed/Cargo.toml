@@ -1,0 +1,14 @@
+[package]
+name = "delver-embed"
+version = "0.1.0"
+edition = "2021"
+
+# Embedding backends for delver-core's `Embedder` trait (docs/DECISIONS.md
+# D-005/D-014). Deliberately NOT a delver-core dependency: core stays free of
+# HTTP. ureq is already pinned in Cargo.lock (via tokenizers/hf-hub), so this
+# crate builds offline against the locked dependency tree (D-014).
+
+[dependencies]
+delver-core = { path = "../delver-core" }
+serde_json = { workspace = true }
+ureq = { version = "2.12.1", features = ["json"] }

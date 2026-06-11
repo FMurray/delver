@@ -605,7 +605,7 @@ fn test_real_nested_sections_parent_references() {
         .build();
 
     // Execute proper template matching
-    let template_matches = align_template_with_content(&template, &index, None, None)
+    let template_matches = align_template_with_content(&template, &index, None, None).expect("match execution failed")
         .expect("Should find nested section matches");
 
     // Process the matched content to get the actual output with parent references
@@ -785,7 +785,7 @@ fn test_10k_template_structure_parent_references() {
         .build();
 
     // Execute proper template matching
-    let template_matches = align_template_with_content(&template, &index, None, None)
+    let template_matches = align_template_with_content(&template, &index, None, None).expect("match execution failed")
         .expect("Should find template matches");
 
     // Process the matched content to get the actual output with parent references

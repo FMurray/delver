@@ -162,18 +162,45 @@ pub enum ProcessedOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchType {
-    Text,           // Simple text matching
-    Semantic,       // Vector embedding similarity
-    Regex,          // Regular expression matching
-    Custom(String), // For future extension
+    /// Simple fuzzy text matching (normalized Levenshtein)
+    Text,
+    /// Vector embedding cosine similarity. Canonical syntax is
+    /// `EmbeddingSim("query", threshold=0.6, endpoint="databricks-bge")`;
+    /// `Cosine(...)` and `Semantic(...)` parse as aliases (D-014).
+    EmbeddingSim,
+    /// Regular expression matching
+    Regex,
+    /// Element-property comparisons (e.g. `fontSize > 14`), ANDed together
+    Heuristic(Vec<ComparisonExpr>),
+    /// Try alternatives in order; the first that yields any candidates wins
+    FirstMatch(Vec<MatchConfig>),
+    /// Unknown type from the array form; rejected at template compile (D-006)
+    Custom(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct MatchConfig {
     pub match_type: MatchType,
-    pub pattern: String,                 // Text to match or regex pattern
+    pub pattern: String,                 // Text to match, regex pattern, or embedding query
     pub threshold: f64,                  // Similarity threshold (0.0-1.0)
+    pub endpoint: Option<String>,        // EmbeddingSim: serving endpoint name or URL
+    pub model: Option<String>,           // EmbeddingSim: optional model hint
+    pub name: Option<String>,            // Source match-definition name (diagnostics)
+    pub compiled_regex: Option<regex::Regex>, // Regex: compiled at template compile time
     pub options: HashMap<String, Value>, // Additional match-specific options
+}
+
+/// `compiled_regex` is a cache of `pattern` and intentionally excluded.
+impl PartialEq for MatchConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.match_type == other.match_type
+            && self.pattern == other.pattern
+            && self.threshold == other.threshold
+            && self.endpoint == other.endpoint
+            && self.model == other.model
+            && self.name == other.name
+            && self.options == other.options
+    }
 }
 
 impl Default for MatchConfig {
@@ -182,6 +209,10 @@ impl Default for MatchConfig {
             match_type: MatchType::Text,
             pattern: String::new(),
             threshold: 0.6,
+            endpoint: None,
+            model: None,
+            name: None,
+            compiled_regex: None,
             options: HashMap::new(),
         }
     }
@@ -236,7 +267,7 @@ pub enum ComparisonOp {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ComparisonValue {
     String(String),
-    Number(i64),
+    Number(f64),
     Boolean(bool),
     Identifier(String),
 }
@@ -248,15 +279,67 @@ pub struct ComparisonExpr {
     pub right: ComparisonValue,
 }
 
+/// Element properties that `Heuristic(...)` comparisons may reference
+/// (D-014). Derived from what the index actually stores per text element:
+/// font size/name, page number, bbox corners, and text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeuristicProperty {
+    /// `fontSize` / `font_size`
+    FontSize,
+    /// `fontName` / `font_name` (string; equality compares canonicalized names)
+    FontName,
+    /// `page` / `page_number`
+    Page,
+    /// `x0` / `x` / `x_position` (left edge of bbox)
+    X0,
+    /// `y0` / `y` / `y_position` (bottom edge of bbox)
+    Y0,
+    /// `x1` (right edge of bbox)
+    X1,
+    /// `y1` (top edge of bbox)
+    Y1,
+    /// `textLength` / `text_length` (character count)
+    TextLength,
+    /// `text` (string; exact equality)
+    Text,
+}
+
+impl HeuristicProperty {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "fontSize" | "font_size" => Some(Self::FontSize),
+            "fontName" | "font_name" => Some(Self::FontName),
+            "page" | "page_number" => Some(Self::Page),
+            "x0" | "x" | "x_position" => Some(Self::X0),
+            "y0" | "y" | "y_position" => Some(Self::Y0),
+            "x1" => Some(Self::X1),
+            "y1" => Some(Self::Y1),
+            "textLength" | "text_length" => Some(Self::TextLength),
+            "text" => Some(Self::Text),
+            _ => None,
+        }
+    }
+
+    /// String properties only support `==` / `!=`; the rest are numeric.
+    pub fn is_string(self) -> bool {
+        matches!(self, Self::FontName | Self::Text)
+    }
+
+    /// Human-readable list of every accepted property name, for error
+    /// messages (D-006: unknown property is a hard error listing these).
+    pub fn supported_list() -> &'static str {
+        "fontSize/font_size, fontName/font_name, page/page_number, \
+         x0/x/x_position, y0/y/y_position, x1, y1, textLength/text_length, text"
+    }
+}
+
 impl Value {
     // Add a helper to extract match config from attributes
     pub fn as_match_config(&self) -> Option<MatchConfig> {
         if let Value::String(s) = self {
             Some(MatchConfig {
-                match_type: MatchType::Text,
                 pattern: s.clone(),
-                threshold: 0.6,
-                options: HashMap::new(),
+                ..MatchConfig::default()
             })
         } else if let Value::Array(values) = self {
             if values.len() >= 2 {
@@ -265,7 +348,9 @@ impl Value {
 
                 let match_type = if values.len() >= 3 {
                     match values[2].as_string() {
-                        Some(t) if t == "semantic" => MatchType::Semantic,
+                        Some(t) if t == "semantic" || t == "cosine" || t == "embedding_sim" => {
+                            MatchType::EmbeddingSim
+                        }
                         Some(t) if t == "regex" => MatchType::Regex,
                         Some(t) => MatchType::Custom(t),
                         None => MatchType::Text,
@@ -292,6 +377,7 @@ impl Value {
                     pattern,
                     threshold,
                     options,
+                    ..MatchConfig::default()
                 })
             } else {
                 None
@@ -341,8 +427,190 @@ pub fn parse_template(template_str: &str) -> Result<Root, Error> {
         }
     };
     let mut root = _parse_template(pairs);
-    resolve_match_configs(&mut root.elements, &root.match_definitions);
+    // Template-compile-time fail-loud (D-006/D-014): every declared match
+    // clause must be executable, every referenced definition must exist, and
+    // regex patterns / heuristic properties are checked (and regexes cached)
+    // before any matching starts.
+    validate_match_definitions(&root.match_definitions)?;
+    resolve_match_configs(&mut root.elements, &root.match_definitions)?;
+    compile_match_configs(&mut root.elements)?;
     Ok(root)
+}
+
+fn template_error(msg: String) -> Error {
+    Error::new(ErrorKind::InvalidData, msg)
+}
+
+/// Reject any match-definition clause that cannot execute (D-006). After
+/// `process_match_expression`, executable clauses are `MatchConfig`s; any
+/// clause still parked as a `FunctionCall` (unknown name, bad arguments,
+/// `Optional`) or a bare value would previously be dropped silently.
+fn validate_match_definitions(defs: &HashMap<String, MatchDefinition>) -> Result<(), Error> {
+    for def in defs.values() {
+        for clause in &def.clauses {
+            match clause {
+                MatchExpression::MatchConfig(config) => {
+                    validate_match_config(&def.name, config)?;
+                }
+                MatchExpression::FunctionCall(fc) => {
+                    return Err(unsupported_match_function(&def.name, fc));
+                }
+                MatchExpression::Value(v) => {
+                    return Err(template_error(format!(
+                        "match definition '{}': bare value {:?} is not an executable match \
+                         clause; use Text(\"...\"), Regex(\"...\"), EmbeddingSim(\"...\"), or \
+                         Heuristic(...)",
+                        def.name, v
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_match_function(owner: &str, fc: &FunctionCall) -> Error {
+    let msg = match fc.name.as_str() {
+        "Optional" => format!(
+            "match definition '{owner}': Optional(...) is not yet implemented; \
+             remove it or use an executable matcher (D-006: no silent pass-through)"
+        ),
+        "Text" | "Regex" | "EmbeddingSim" | "Cosine" | "Semantic" => format!(
+            "match definition '{owner}': {}(...) requires a quoted string pattern as its \
+             first argument",
+            fc.name
+        ),
+        "Heuristic" => format!(
+            "match definition '{owner}': Heuristic(...) arguments must be property \
+             comparisons like fontSize > 14 (supported properties: {})",
+            HeuristicProperty::supported_list()
+        ),
+        "FirstMatch" => format!(
+            "match definition '{owner}': FirstMatch(...) arguments must be nested match \
+             functions, e.g. FirstMatch(Text(\"a\"), Regex(\"b\"))"
+        ),
+        other => format!(
+            "match definition '{owner}': unknown match function '{other}'; supported: \
+             Text, Regex, EmbeddingSim (aliases: Cosine, Semantic), Heuristic, FirstMatch"
+        ),
+    };
+    template_error(msg)
+}
+
+/// Compile-time checks for a single config (no caching; see
+/// `compile_match_config` for the element-side pass that also caches).
+fn validate_match_config(owner: &str, config: &MatchConfig) -> Result<(), Error> {
+    match &config.match_type {
+        MatchType::Text | MatchType::EmbeddingSim => Ok(()),
+        MatchType::Regex => regex::Regex::new(&config.pattern)
+            .map(|_| ())
+            .map_err(|e| invalid_regex_error(owner, &config.pattern, &e)),
+        MatchType::Heuristic(comps) => {
+            for comp in comps {
+                validate_comparison(owner, comp)?;
+            }
+            Ok(())
+        }
+        MatchType::FirstMatch(subs) => {
+            for sub in subs {
+                validate_match_config(owner, sub)?;
+            }
+            Ok(())
+        }
+        MatchType::Custom(t) => Err(template_error(format!(
+            "match '{owner}': unsupported match type '{t}'; supported types: text, regex, \
+             semantic/cosine/embedding_sim (D-006: no silent skip)"
+        ))),
+    }
+}
+
+fn invalid_regex_error(owner: &str, pattern: &str, e: &regex::Error) -> Error {
+    template_error(format!(
+        "match '{owner}': invalid regex pattern '{pattern}': {e}"
+    ))
+}
+
+fn validate_comparison(owner: &str, comp: &ComparisonExpr) -> Result<(), Error> {
+    let Some(prop) = HeuristicProperty::parse(&comp.left) else {
+        return Err(template_error(format!(
+            "match '{owner}': Heuristic(...) references unknown property '{}'; supported \
+             properties: {}",
+            comp.left,
+            HeuristicProperty::supported_list()
+        )));
+    };
+    match &comp.right {
+        ComparisonValue::Number(_) if !prop.is_string() => Ok(()),
+        ComparisonValue::String(_) | ComparisonValue::Identifier(_) if prop.is_string() => {
+            if matches!(comp.op, ComparisonOp::Equal | ComparisonOp::NotEqual) {
+                Ok(())
+            } else {
+                Err(template_error(format!(
+                    "match '{owner}': property '{}' is a string; only == and != are supported",
+                    comp.left
+                )))
+            }
+        }
+        ComparisonValue::Boolean(_) => Err(template_error(format!(
+            "match '{owner}': property '{}' cannot be compared to a boolean (no boolean \
+             properties exist; supported properties: {})",
+            comp.left,
+            HeuristicProperty::supported_list()
+        ))),
+        other => Err(template_error(format!(
+            "match '{owner}': type mismatch comparing {} property '{}' with {:?}",
+            if prop.is_string() { "string" } else { "numeric" },
+            comp.left,
+            other
+        ))),
+    }
+}
+
+/// Validate-and-cache pass over the configs that elements actually carry
+/// after resolution: compiles `Regex` patterns into `compiled_regex` and
+/// re-checks inline (non-definition) configs that skipped
+/// `validate_match_definitions`.
+fn compile_match_configs(elements: &mut [Element]) -> Result<(), Error> {
+    for element in elements {
+        if let Some(config) = element.match_config.as_mut() {
+            let owner = config.name.clone().unwrap_or_else(|| element.name.clone());
+            compile_match_config(&owner, config)?;
+        }
+        if let Some(config) = element.end_match_config.as_mut() {
+            let owner = config.name.clone().unwrap_or_else(|| element.name.clone());
+            compile_match_config(&owner, config)?;
+        }
+        compile_match_configs(&mut element.children)?;
+    }
+    Ok(())
+}
+
+fn compile_match_config(owner: &str, config: &mut MatchConfig) -> Result<(), Error> {
+    match &mut config.match_type {
+        MatchType::Regex => {
+            let re = regex::Regex::new(&config.pattern)
+                .map_err(|e| invalid_regex_error(owner, &config.pattern, &e))?;
+            config.compiled_regex = Some(re);
+            Ok(())
+        }
+        MatchType::Heuristic(comps) => {
+            for comp in comps.iter() {
+                validate_comparison(owner, comp)?;
+            }
+            Ok(())
+        }
+        MatchType::FirstMatch(subs) => {
+            for sub in subs {
+                compile_match_config(owner, sub)?;
+            }
+            Ok(())
+        }
+        MatchType::Custom(t) => Err(template_error(format!(
+            "match '{owner}': unsupported match type '{t}'; supported types: text, regex, \
+             semantic/cosine/embedding_sim (D-006: no silent skip)"
+        ))),
+        MatchType::Text | MatchType::EmbeddingSim => Ok(()),
+    }
 }
 
 fn _parse_template(pair: Pair<Rule>) -> Root {
@@ -527,46 +795,93 @@ fn process_match_definition(pair: Pair<Rule>) -> MatchDefinition {
 fn resolve_match_configs(
     elements: &mut [Element],
     match_definitions: &HashMap<String, MatchDefinition>,
-) {
+) -> Result<(), Error> {
     for element in elements {
         // Resolve match_config
         if let Some(match_value) = element.attributes.get("match") {
-            element.match_config = match match_value {
-                Value::Identifier(id) => resolve_identifier_to_match_config(id, match_definitions),
-                _ => match_value.as_match_config(),
-            };
+            element.match_config = Some(resolve_attr_to_match_config(
+                &element.name,
+                "match",
+                match_value,
+                match_definitions,
+            )?);
         }
 
         // Resolve end_match_config
         if let Some(end_match_value) = element.attributes.get("end_match") {
-            element.end_match_config = match end_match_value {
-                Value::Identifier(id) => resolve_identifier_to_match_config(id, match_definitions),
-                _ => end_match_value.as_match_config(),
-            };
+            element.end_match_config = Some(resolve_attr_to_match_config(
+                &element.name,
+                "end_match",
+                end_match_value,
+                match_definitions,
+            )?);
         }
 
         // Recurse for children
         if !element.children.is_empty() {
-            resolve_match_configs(&mut element.children, match_definitions);
+            resolve_match_configs(&mut element.children, match_definitions)?;
         }
+    }
+    Ok(())
+}
+
+/// Resolve a `match=` / `end_match=` attribute value to a config, failing
+/// loud (D-006) where the old code silently left the element configless.
+fn resolve_attr_to_match_config(
+    element_name: &str,
+    attr: &str,
+    value: &Value,
+    match_definitions: &HashMap<String, MatchDefinition>,
+) -> Result<MatchConfig, Error> {
+    match value {
+        Value::Identifier(id) => {
+            let def = match_definitions.get(id).ok_or_else(|| {
+                template_error(format!(
+                    "element '{element_name}': {attr}={id} references unknown match \
+                     definition '{id}'"
+                ))
+            })?;
+            definition_to_match_config(def)
+        }
+        other => other.as_match_config().ok_or_else(|| {
+            template_error(format!(
+                "element '{element_name}': {attr} must be a string, a \
+                 [pattern, threshold(, type)] array, or a match-definition identifier"
+            ))
+        }),
     }
 }
 
-// Helper to resolve an identifier to a MatchConfig from the definitions map
-fn resolve_identifier_to_match_config(
-    id: &str,
-    match_definitions: &HashMap<String, MatchDefinition>,
-) -> Option<MatchConfig> {
-    match_definitions.get(id).and_then(|match_def| {
-        // Find the first clause that can be interpreted as a MatchConfig
-        match_def.clauses.iter().find_map(|clause| {
-            if let MatchExpression::MatchConfig(config) = clause {
-                Some(config.clone())
-            } else {
-                None
-            }
+/// One executable clause resolves to that config; several resolve to a
+/// `FirstMatch` over them in order (D-014 — previously every clause after
+/// the first was silently dropped). The definition name is recorded on the
+/// config for diagnostics ("naming the match block", D-006).
+fn definition_to_match_config(def: &MatchDefinition) -> Result<MatchConfig, Error> {
+    let mut configs: Vec<MatchConfig> = def
+        .clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            MatchExpression::MatchConfig(config) => Some(config.clone()),
+            _ => None,
         })
-    })
+        .collect();
+
+    let mut config = match configs.len() {
+        0 => {
+            return Err(template_error(format!(
+                "match definition '{}' has no executable match clause (D-006)",
+                def.name
+            )))
+        }
+        1 => configs.pop().expect("len checked"),
+        _ => MatchConfig {
+            match_type: MatchType::FirstMatch(configs),
+            threshold: 1.0,
+            ..MatchConfig::default()
+        },
+    };
+    config.name = Some(def.name.clone());
+    Ok(config)
 }
 
 fn function_call_to_match_config(function_call: &FunctionCall) -> Option<MatchConfig> {
@@ -616,10 +931,12 @@ fn function_call_to_match_config(function_call: &FunctionCall) -> Option<MatchCo
                 pattern,
                 threshold,
                 options,
+                ..MatchConfig::default()
             })
         }
-        "Cosine" | "Semantic" => {
-            // Cosine(pattern, threshold=0.7) or Semantic(pattern, threshold=0.7)
+        // Canonical: EmbeddingSim("query", threshold=0.6, endpoint="databricks-bge",
+        // model="..."). Cosine/Semantic are aliases for backwards compatibility (D-014).
+        "EmbeddingSim" | "Cosine" | "Semantic" => {
             if function_call.args.is_empty() {
                 return None;
             }
@@ -629,23 +946,28 @@ fn function_call_to_match_config(function_call: &FunctionCall) -> Option<MatchCo
                 _ => return None,
             };
 
-            let mut threshold = 0.7; // Default threshold for semantic matching
+            let mut threshold = 0.7; // Default threshold for embedding similarity
+            let mut endpoint = None;
+            let mut model = None;
             let mut options = HashMap::new();
 
             // Process additional arguments
             for arg in &function_call.args[1..] {
                 match arg {
-                    FunctionArg::Named { name, value } => match name.as_str() {
-                        "threshold" => {
-                            if let FunctionArgValue::Value(Value::Number(n)) = value {
-                                threshold = *n as f64 / 1000.0;
-                            }
+                    FunctionArg::Named { name, value } => match (name.as_str(), value) {
+                        ("threshold", FunctionArgValue::Value(Value::Number(n))) => {
+                            threshold = *n as f64 / 1000.0;
                         }
-                        _ => {
-                            if let FunctionArgValue::Value(v) = value {
-                                options.insert(name.clone(), v.clone());
-                            }
+                        ("endpoint", FunctionArgValue::Value(Value::String(s))) => {
+                            endpoint = Some(s.clone());
                         }
+                        ("model", FunctionArgValue::Value(Value::String(s))) => {
+                            model = Some(s.clone());
+                        }
+                        (_, FunctionArgValue::Value(v)) => {
+                            options.insert(name.clone(), v.clone());
+                        }
+                        _ => {}
                     },
                     FunctionArg::Positional(FunctionArgValue::Value(Value::Number(n))) => {
                         threshold = *n as f64 / 1000.0;
@@ -655,14 +977,18 @@ fn function_call_to_match_config(function_call: &FunctionCall) -> Option<MatchCo
             }
 
             Some(MatchConfig {
-                match_type: MatchType::Semantic,
+                match_type: MatchType::EmbeddingSim,
                 pattern,
                 threshold,
+                endpoint,
+                model,
                 options,
+                ..MatchConfig::default()
             })
         }
         "Regex" => {
-            // Regex(pattern)
+            // Regex(pattern); the pattern is compiled (and cached) at template
+            // compile time — see compile_match_config (D-014).
             if function_call.args.is_empty() {
                 return None;
             }
@@ -688,9 +1014,54 @@ fn function_call_to_match_config(function_call: &FunctionCall) -> Option<MatchCo
                 pattern,
                 threshold: 1.0, // Regex is exact match
                 options,
+                ..MatchConfig::default()
             })
         }
-        _ => None, // Unknown function types remain as FunctionCall
+        // Heuristic(fontSize > 14, y_position >= 700, ...): every argument
+        // must be a comparison; multiple comparisons AND together (D-014).
+        "Heuristic" => {
+            let mut comparisons = Vec::new();
+            for arg in &function_call.args {
+                match arg {
+                    FunctionArg::Positional(FunctionArgValue::Comparison(comp)) => {
+                        comparisons.push(comp.clone());
+                    }
+                    // Anything else (named args, bare values) is malformed;
+                    // leave as FunctionCall so validation reports it (D-006).
+                    _ => return None,
+                }
+            }
+            if comparisons.is_empty() {
+                return None;
+            }
+            Some(MatchConfig {
+                match_type: MatchType::Heuristic(comparisons),
+                threshold: 1.0,
+                ..MatchConfig::default()
+            })
+        }
+        // FirstMatch(Text("a"), Regex("b"), ...): alternatives tried in
+        // order; first that yields candidates wins (D-014).
+        "FirstMatch" => {
+            let mut subs = Vec::new();
+            for arg in &function_call.args {
+                match arg {
+                    FunctionArg::Positional(FunctionArgValue::FunctionCall(fc)) => {
+                        subs.push(function_call_to_match_config(fc)?);
+                    }
+                    _ => return None,
+                }
+            }
+            if subs.is_empty() {
+                return None;
+            }
+            Some(MatchConfig {
+                match_type: MatchType::FirstMatch(subs),
+                threshold: 1.0,
+                ..MatchConfig::default()
+            })
+        }
+        _ => None, // Unknown function types remain as FunctionCall (rejected in validation)
     }
 }
 
@@ -787,12 +1158,10 @@ fn process_comparison_expr(pair: Pair<Rule>) -> ComparisonExpr {
             ComparisonValue::String(s[1..s.len() - 1].to_string()) // Remove quotes
         }
         Rule::number => {
+            // Stored as the literal f64 (no fixed-point encoding): heuristic
+            // comparisons need the real value at evaluation time (D-014).
             let n = right_pair.as_str().parse::<f64>().unwrap();
-            if n.fract() == 0.0 {
-                ComparisonValue::Number(n as i64)
-            } else {
-                ComparisonValue::Number((n * 1000.0) as i64) // Store as fixed-point
-            }
+            ComparisonValue::Number(n)
         }
         Rule::boolean => {
             let b = right_pair.as_str().parse::<bool>().unwrap();

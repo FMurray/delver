@@ -120,6 +120,7 @@ fn basic_page_map_and_context() -> (BTreeMap<u32, PageContents>, MatchContext) {
 
     let match_context = MatchContext {
         destinations: Default::default(),
+        embedder: Default::default(),
     };
     (page_map, match_context)
 }

@@ -142,3 +142,63 @@ unchanged (its prints only fire under the `process` subcommand's debug subscribe
 Related hygiene: `flamegraph` was removed from delver's dev-dependencies — it is the
 `cargo flamegraph` subcommand, not a library, and it forced every `cargo test -p delver`
 to build the cargo-toolchain dependency tree (which also blocked offline test runs).
+
+**D-014 · 2026-06-11 · Stage B slice 1: match rules execute for real, fail-loud (D-005/D-006).**
+`EmbeddingSim`/`Regex`/`Heuristic` were parse-only; they now execute, and every config that
+cannot execute is a hard error — at template compile where possible, at match time otherwise.
+- **Embedder trait in core, zero new core deps**: `delver_core::embed::Embedder`
+  (`embed(&[&str]) -> Result<Vec<Vec<f32>>, EmbedError>`, `Send + Sync`). Threading follows the
+  MatchContext flow: `MatchContext.embedder` (a `SharedEmbedder` newtype over
+  `Option<Arc<dyn Embedder>>`, kept so `Debug`/`Default` derives and `catch_unwind` keep working)
+  is copied into `PdfIndex` by `PdfIndex::new` — the previously ignored `_match_context`
+  parameter now earns its keep — and the matcher reads `index.embedder()`. `process_pdf` gained
+  an `embedder: Option<Arc<dyn Embedder>>` parameter; `process_parsed` callers set it on the
+  context they already pass.
+- **Grammar/config**: canonical `EmbeddingSim("q", threshold=0.6, endpoint="…", model="…")`;
+  `Cosine`/`Semantic` parse as aliases of the same `MatchType::EmbeddingSim`. `MatchConfig` gained
+  typed `endpoint`/`model` fields, a `name` field (source match-definition name, so errors can
+  name the match block), and `compiled_regex` (compiled+cached at template compile; invalid
+  pattern → compile error quoting the pattern). `ComparisonValue::Number` is now `f64` as written
+  (the old i64 fixed-point ×1000 encoding was ambiguous at evaluation time).
+- **Execution semantics** (all scoped to the same `[start, max)` document range the Text matcher
+  uses): Regex = `is_match` over element text, score 1.0, document order. Heuristic = comparisons
+  ANDed per element, score 1.0; properties: fontSize/font_size, fontName/font_name (equality on
+  canonicalized names, case-insensitive), page/page_number, x0/x/x_position, y0/y/y_position, x1,
+  y1, textLength/text_length, text (exact equality); unknown property → compile error listing the
+  set; strings only allow ==/!=. EmbeddingSim = embed query once + scoped candidates as one batch,
+  cosine ≥ threshold, ranked by similarity; no embedder configured → match-time error naming the
+  match block (template `endpoint=` is recorded and echoed in that error, but backend selection is
+  the caller's `--embed-endpoint`/env for now — per-config endpoints are future work).
+- **Combinators**: `FirstMatch(...)` is real (alternatives tried in order, first non-empty result
+  wins) — and a match definition with several executable clauses now resolves to an implicit
+  FirstMatch instead of silently dropping all but the first. `Optional(...)` errors
+  "not yet implemented" (semantics need non-optional failure to mean something first).
+- **Fail-loud sweep**: unknown match functions, malformed args, bare-value clauses, references to
+  unknown or empty match definitions, non-config `match=` attribute values, and `Custom` array
+  types are all template-compile errors now; `align_template_with_content` returns
+  `Result<Option<…>>` so match-time failures propagate to callers (CLI: non-zero exit, stderr
+  message, zero stdout — verified). Tests asserting the old inert behavior (FirstMatch/Optional
+  parked as FunctionCalls, CustomFunction tolerated, empty definition referenced silently,
+  fixed-point comparison numbers) were rewritten to assert the new contracts.
+
+**D-015 · 2026-06-11 · delver-embed crate: Databricks + mock backends; offline-lock dependency rule held.**
+New workspace member `delver-embed` (NOT a delver-core dependency) implements the core trait:
+- `DatabricksEmbedder`: endpoint name → `https://$DATABRICKS_HOST/serving-endpoints/{name}/invocations`
+  (scheme/trailing-slash tolerant) or full URL as-is; Bearer `$DATABRICKS_TOKEN` required. Request
+  body `{"input": [...]}` (+ optional `"model"`); accepts `{"data":[{"embedding":…,"index":…}]}`
+  (reordered by index) and `{"predictions":[[…]]}` response shapes, rejects others naming the keys
+  found, and enforces vector-count == input-count. Pure helpers (`request_body`, `parse_response`,
+  `resolve_endpoint_url`) are unit-tested against canned JSON — no network in any test.
+- `MockEmbedder`: seeded `HashMap<String, Vec<f32>>`; all seeds padded with a trailing 0 component
+  and unknown texts embed to the extra-axis unit vector — orthogonal to every seed by construction.
+  Used by delver-core's matcher tests via a dev-dependency cycle (allowed by cargo).
+- **Dependency approach**: HTTP client is `ureq 2.12.1` + `features=["json"]` — already pinned in
+  Cargo.lock (hf-hub transitively) with its closure in the local cargo cache, so the firewalled
+  crates.io index was never needed; the whole slice builds/tests with `--offline`. No new external
+  crates were added anywhere.
+- **CLI/Python wiring**: `delver query|process --embed-endpoint <name-or-url>` (fallback
+  `$DELVER_EMBED_ENDPOINT`; precedence mirrors `--db`/`DATABASE_URL`), service-layer
+  `build_embedder` shared by both subcommands and the PyO3 facade;
+  `DelverStore.run_template(doc_id, template, tokenizer_model=None, embed_endpoint=None)`.
+  Verified: the 3M 10-K `query --doc` output is byte-identical to the pre-change baseline
+  (no behavior change without embedding configs).

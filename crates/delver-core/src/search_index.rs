@@ -182,10 +182,13 @@ pub struct PdfIndex {
     style_key: Vec<StyleKey>,                          // row → key
     style_buckets: HashMap<StyleKey, Vec<TextHandle>>, // key → rows for O(1) similarity lookup
     page_y_values: HashMap<u32, Vec<f32>>, // page → sorted Y positions for percentile calc
+    /// Embedding backend carried over from `MatchContext` (D-014) so the
+    /// matcher can execute `EmbeddingSim(...)` configs.
+    embedder: crate::embed::SharedEmbedder,
 }
 
 impl PdfIndex {
-    pub fn new(page_map: &BTreeMap<u32, PageContents>, _match_context: &MatchContext) -> Self {
+    pub fn new(page_map: &BTreeMap<u32, PageContents>, match_context: &MatchContext) -> Self {
         // PASS 1: Ingest raw content, collect per‑row basics and aggregates
         let mut by_page = BTreeMap::new();
         let mut font_size_index_construction = Vec::new();
@@ -351,7 +354,13 @@ impl PdfIndex {
             style_key,
             style_buckets,
             page_y_values,
+            embedder: match_context.embedder.clone(),
         }
+    }
+
+    /// Embedding backend configured for this run, if any (D-014).
+    pub fn embedder(&self) -> Option<&dyn crate::embed::Embedder> {
+        self.embedder.get()
     }
 
     // Helper method to reconstruct PageContent from SoA based on ContentHandle
@@ -672,6 +681,36 @@ impl PdfIndex {
         }
 
         results
+    }
+
+    /// Text handles whose document index lies in `[start, end)`, in document
+    /// order. This is the candidate scope for Regex/Heuristic/EmbeddingSim
+    /// match execution (D-014).
+    pub fn text_handles_in_range(&self, start: usize, end: usize) -> Vec<TextHandle> {
+        (start..end.min(self.order.len()))
+            .filter_map(|doc_idx| match self.order.get(doc_idx) {
+                Some(ContentHandle::Text(text_idx)) => Some(TextHandle(*text_idx as u32)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Execute a compiled regex over the scoped elements' text (D-014).
+    /// Every element whose text contains a match scores 1.0; results are in
+    /// document order.
+    pub fn find_regex_matches(
+        &self,
+        re: &regex::Regex,
+        start_content_index: Option<usize>,
+        max_content_index: Option<usize>,
+    ) -> Vec<(TextHandle, f64)> {
+        let start = start_content_index.unwrap_or(0);
+        let end = max_content_index.unwrap_or(self.order.len());
+        self.text_handles_in_range(start, end)
+            .into_iter()
+            .filter(|h| re.is_match(&self.text_store.text[h.0 as usize]))
+            .map(|h| (h, 1.0))
+            .collect()
     }
 
     /// Helper method to find document index for a text store index

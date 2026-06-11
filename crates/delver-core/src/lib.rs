@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod docql;
+pub mod embed;
 pub mod fonts;
 pub mod geo;
 pub mod layout;
@@ -24,6 +25,9 @@ use tokenizers::Tokenizer;
 /// # Arguments
 /// * `pdf_bytes` - The PDF file contents as bytes
 /// * `template_str` - The template string to use for processing
+/// * `embedder` - Embedding backend for `EmbeddingSim(...)` matches; pass
+///   `None` when the template uses no embedding matches (using one anyway is
+///   a hard error at match time, D-006)
 ///
 /// # Returns
 /// * `Result<String, Box<dyn std::error::Error>>` - JSON string containing the chunks
@@ -31,6 +35,7 @@ pub fn process_pdf(
     pdf_bytes: &[u8],
     template_str: &str,
     tokenizer: Option<&Tokenizer>,
+    embedder: Option<std::sync::Arc<dyn embed::Embedder>>,
 ) -> Result<(String, Vec<TextBlock>, Document)> {
     let dom = parse_template(template_str)?;
 
@@ -53,7 +58,8 @@ pub fn process_pdf(
         block_join_threshold,
     );
 
-    let match_context = get_refs(&doc)?;
+    let mut match_context = get_refs(&doc)?;
+    match_context.embedder = embed::SharedEmbedder::from(embedder);
 
     let json = run_template(&dom, &pages_map, &match_context, tokenizer)?;
     Ok((json, blocks, doc))
@@ -92,7 +98,7 @@ fn run_template(
 
     let index = PdfIndex::new(pages_map, match_context);
 
-    if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None) {
+    if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None)? {
         let outputs = process_matched_content(&matched_content, &index, tokenizer);
         all_outputs.extend(outputs);
     }

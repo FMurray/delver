@@ -36,7 +36,7 @@ fn test_3m_2015_10k() -> Result<()> {
     let template_str = fs::read_to_string(&template_full_path)?;
     println!("Successfully read template file.");
 
-    let (actual_json_str, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, None)?;
+    let (actual_json_str, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, None, None)?;
     println!("Successfully processed PDF.");
 
     let expected_output_full_path = workspace_root.join(expected_output_path);

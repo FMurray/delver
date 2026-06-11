@@ -34,7 +34,7 @@ mod collation_flow_tests {
             .build();
 
         // Execute matching
-        let results = align_template_with_content(&template, &index, None, None)
+        let results = align_template_with_content(&template, &index, None, None).expect("match execution failed")
             .expect("Should find section match");
 
         // Verify results
@@ -84,7 +84,7 @@ mod collation_flow_tests {
             .build();
 
         // Execute matching
-        let results = align_template_with_content(&template, &index, None, None)
+        let results = align_template_with_content(&template, &index, None, None).expect("match execution failed")
             .expect("Should find nested section matches");
 
         // Verify main chapter
@@ -178,7 +178,7 @@ mod collation_flow_tests {
             .build();
 
         // Execute matching
-        let results = align_template_with_content(&template, &index, None, None)
+        let results = align_template_with_content(&template, &index, None, None).expect("match execution failed")
             .expect("Should find section with textchunk");
 
         // Verify section
@@ -264,7 +264,7 @@ mod collation_flow_tests {
             .build();
 
         // Execute matching
-        let results = align_template_with_content(&template, &index, None, None)
+        let results = align_template_with_content(&template, &index, None, None).expect("match execution failed")
             .expect("Should find textchunk-section-textchunk pattern");
 
         // Verify results structure
@@ -339,7 +339,7 @@ mod collation_flow_tests {
             .build();
 
         // Execute matching
-        let results = align_template_with_content(&template, &index, None, None).expect("should get results");
+        let results = align_template_with_content(&template, &index, None, None).expect("match execution failed").expect("should get results");
         // Verify we found the textchunk
         assert_eq!(results.len(), 1, "Should find one textchunk match");
         let textchunk_match = &results[0];
@@ -456,7 +456,7 @@ mod collation_flow_tests {
                     .match_pattern("Heading A.2").build()
             .build().build();
 
-        let results = align_template_with_content(&template, &index, None, None)
+        let results = align_template_with_content(&template, &index, None, None).expect("match execution failed")
             .expect("matcher should succeed");
         assert_eq!(results.len(), 1);
         let a_match = &results[0];
@@ -521,7 +521,7 @@ mod collation_flow_tests {
             .build();
 
         let start_time = Instant::now();
-        let result = align_template_with_content(&template, &index, None, None);
+        let result = align_template_with_content(&template, &index, None, None).expect("match execution failed");
         let elapsed = start_time.elapsed();
 
         // Should complete within reasonable time (no infinite recursion)
@@ -619,7 +619,7 @@ mod collation_flow_tests {
         let template = template_builder.build().build();
 
         let start_time = Instant::now();
-        let result = align_template_with_content(&template, &index, None, None);
+        let result = align_template_with_content(&template, &index, None, None).expect("match execution failed");
         let elapsed = start_time.elapsed();
 
         // Must complete within reasonable time
@@ -694,7 +694,7 @@ mod recursion_detection_tests {
 
         // Execute with timeout to catch infinite recursion
         let result = std::panic::catch_unwind(|| {
-            align_template_with_content(&template, &index, None, None)
+            align_template_with_content(&template, &index, None, None).expect("match execution failed")
         });
 
         let elapsed = start_time.elapsed();
@@ -737,7 +737,7 @@ mod recursion_detection_tests {
             .build();
 
         let start_time = Instant::now();
-        let result = align_template_with_content(&template, &index, None, None);
+        let result = align_template_with_content(&template, &index, None, None).expect("match execution failed");
         let elapsed = start_time.elapsed();
 
         // Should complete reasonably quickly
@@ -790,7 +790,7 @@ mod recursion_detection_tests {
             .build();
 
         let start_time = Instant::now();
-        let result = align_template_with_content(&template, &index, None, None);
+        let result = align_template_with_content(&template, &index, None, None).expect("match execution failed");
         let elapsed = start_time.elapsed();
 
         // Should terminate quickly even with confusing patterns
@@ -844,7 +844,7 @@ mod recursion_detection_tests {
                 .build()
             .build();
 
-        let result = align_template_with_content(&template, &index, None, None)
+        let result = align_template_with_content(&template, &index, None, None).expect("match execution failed")
             .expect("Should match sequential sections");
 
         assert_eq!(result.len(), 3, "Should find all three sections");
@@ -893,7 +893,7 @@ mod recursion_detection_tests {
             .build();
 
         let start_time = Instant::now();
-        let result = align_template_with_content(&template, &index, None, None);
+        let result = align_template_with_content(&template, &index, None, None).expect("match execution failed");
         let elapsed = start_time.elapsed();
 
         // Should handle nesting gracefully
@@ -951,7 +951,7 @@ mod recursion_detection_tests {
         
         // This should not hang or stack overflow
         let result = std::panic::catch_unwind(|| {
-            align_template_with_content(&template, &index, None, None)
+            align_template_with_content(&template, &index, None, None).expect("match execution failed")
         });
         
         let elapsed = start_time.elapsed();
@@ -988,7 +988,7 @@ mod recursion_detection_tests {
                 .end_match("Section 24")
             .build().build();
 
-        let matches = align_template_with_content(&template, &index, None, None)
+        let matches = align_template_with_content(&template, &index, None, None).expect("match execution failed")
             .expect("should match");
         assert_eq!(matches.len(), 1);
 

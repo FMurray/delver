@@ -1,6 +1,5 @@
 use delver_core::docql::{
-    parse_template, ComparisonOp, ComparisonValue, FunctionArg, FunctionArgValue, MatchExpression,
-    MatchType, Value,
+    parse_template, ComparisonOp, ComparisonValue, MatchExpression, MatchType, Value,
 };
 
 mod common;
@@ -90,46 +89,68 @@ fn test_match_definition_basic() -> std::io::Result<()> {
 }
 
 #[test]
-fn test_match_definition_with_multiple_functions() -> std::io::Result<()> {
+fn test_match_definition_with_first_match_combinator() -> std::io::Result<()> {
     common::setup();
 
+    // FirstMatch now converts to an executable MatchConfig whose alternatives
+    // are tried in order (D-014); it no longer parks as an inert FunctionCall.
     let template_str = r#"
         Match<Section> MDandA {
             FirstMatch(
                 Text("Management's Discussion", threshold=0.9),
                 Cosine("Management's Discussion"),
-                Heuristic(fontSize > 14, top_of_page=true)
+                Heuristic(fontSize > 14)
             )
-            Optional(Text("Quantitative and Qualitative", threshold=0.8))
         }
     "#;
 
     let root = parse_template(template_str)?;
 
     let md_def = &root.match_definitions["MDandA"];
-    assert_eq!(md_def.clauses.len(), 2);
+    assert_eq!(md_def.clauses.len(), 1);
 
-    // Test FirstMatch function with nested calls
-    if let MatchExpression::FunctionCall(first_match) = &md_def.clauses[0] {
-        assert_eq!(first_match.name, "FirstMatch");
-        assert_eq!(first_match.args.len(), 3);
-
-        // Check first nested function (Text)
-        if let FunctionArg::Positional(FunctionArgValue::Value(Value::Identifier(_func_ref))) =
-            &first_match.args[0]
-        {
-            // Note: This test assumes the parser handles nested function calls as identifiers
-            // In a real implementation, you might want to parse them as nested FunctionCall values
+    if let MatchExpression::MatchConfig(config) = &md_def.clauses[0] {
+        if let MatchType::FirstMatch(alternatives) = &config.match_type {
+            assert_eq!(alternatives.len(), 3);
+            assert_eq!(alternatives[0].match_type, MatchType::Text);
+            assert_eq!(alternatives[0].pattern, "Management's Discussion");
+            assert_eq!(alternatives[0].threshold, 0.9);
+            assert_eq!(alternatives[1].match_type, MatchType::EmbeddingSim);
+            assert!(matches!(
+                alternatives[2].match_type,
+                MatchType::Heuristic(ref comps) if comps.len() == 1
+            ));
+        } else {
+            panic!("Expected FirstMatch match type, got {:?}", config.match_type);
         }
-    }
-
-    // Test Optional function
-    if let MatchExpression::FunctionCall(optional) = &md_def.clauses[1] {
-        assert_eq!(optional.name, "Optional");
+    } else {
+        panic!("Expected FirstMatch clause to convert to MatchConfig");
     }
 
     common::cleanup_all();
     Ok(())
+}
+
+#[test]
+fn test_optional_combinator_is_a_compile_error() {
+    common::setup();
+
+    // D-006: Optional has no execution semantics yet, so it must error loudly
+    // instead of silently passing through.
+    let template_str = r#"
+        Match<Section> MDandA {
+            Optional(Text("Quantitative and Qualitative", threshold=0.8))
+        }
+    "#;
+
+    let err = parse_template(template_str).expect_err("Optional must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Optional") && msg.contains("not yet implemented"),
+        "unexpected error message: {msg}"
+    );
+
+    common::cleanup_all();
 }
 
 #[test]
@@ -144,32 +165,26 @@ fn test_comparison_expressions() -> std::io::Result<()> {
 
     let root = parse_template(template_str)?;
 
+    // Heuristic converts to an executable MatchConfig (D-014); the
+    // comparisons are stored as parsed (f64 literals, not fixed-point).
     let header_def = &root.match_definitions["Header"];
-    if let MatchExpression::FunctionCall(heuristic) = &header_def.clauses[0] {
-        assert_eq!(heuristic.name, "Heuristic");
-        assert_eq!(heuristic.args.len(), 2);
+    if let MatchExpression::MatchConfig(config) = &header_def.clauses[0] {
+        let MatchType::Heuristic(comps) = &config.match_type else {
+            panic!("Expected Heuristic match type, got {:?}", config.match_type);
+        };
+        assert_eq!(comps.len(), 2);
 
         // Check first comparison (fontSize >= 14)
-        if let FunctionArg::Positional(FunctionArgValue::Comparison(comp1)) = &heuristic.args[0] {
-            assert_eq!(comp1.left, "fontSize");
-            assert_eq!(comp1.op, ComparisonOp::GreaterThanOrEqual);
-            if let ComparisonValue::Number(n) = &comp1.right {
-                assert_eq!(*n, 14);
-            }
-        } else {
-            panic!("Expected comparison expression for fontSize");
-        }
+        assert_eq!(comps[0].left, "fontSize");
+        assert_eq!(comps[0].op, ComparisonOp::GreaterThanOrEqual);
+        assert_eq!(comps[0].right, ComparisonValue::Number(14.0));
 
         // Check second comparison (y_position > 700)
-        if let FunctionArg::Positional(FunctionArgValue::Comparison(comp2)) = &heuristic.args[1] {
-            assert_eq!(comp2.left, "y_position");
-            assert_eq!(comp2.op, ComparisonOp::GreaterThan);
-            if let ComparisonValue::Number(n) = &comp2.right {
-                assert_eq!(*n, 700);
-            }
-        } else {
-            panic!("Expected comparison expression for y_position");
-        }
+        assert_eq!(comps[1].left, "y_position");
+        assert_eq!(comps[1].op, ComparisonOp::GreaterThan);
+        assert_eq!(comps[1].right, ComparisonValue::Number(700.0));
+    } else {
+        panic!("Expected Heuristic clause to convert to MatchConfig");
     }
 
     common::cleanup_all();
@@ -177,47 +192,30 @@ fn test_comparison_expressions() -> std::io::Result<()> {
 }
 
 #[test]
-fn test_mixed_function_arguments() -> std::io::Result<()> {
+fn test_mixed_function_arguments_on_embedding_sim() -> std::io::Result<()> {
     common::setup();
 
+    // Canonical EmbeddingSim spec syntax (D-005/D-014) with mixed positional
+    // and named arguments: endpoint/model become typed fields, unknown named
+    // args land in options.
     let template_str = r#"
         Match<Section> ComplexMatch {
-            CustomFunction("pattern", 0.85, model="gpt-4", strict=true)
+            EmbeddingSim("pattern", 0.85, endpoint="databricks-bge", model="bge-large", strict=true)
         }
     "#;
 
     let root = parse_template(template_str)?;
 
     let complex_def = &root.match_definitions["ComplexMatch"];
-    if let MatchExpression::FunctionCall(func) = &complex_def.clauses[0] {
-        assert_eq!(func.name, "CustomFunction");
-        assert_eq!(func.args.len(), 4);
-
-        // Check positional string
-        if let FunctionArg::Positional(FunctionArgValue::Value(Value::String(s))) = &func.args[0] {
-            assert_eq!(s, "pattern");
-        }
-
-        // Check positional number
-        if let FunctionArg::Positional(FunctionArgValue::Value(Value::Number(n))) = &func.args[1] {
-            assert_eq!(*n, 850); // 0.85 * 1000
-        }
-
-        // Check named string argument
-        if let FunctionArg::Named { name, value } = &func.args[2] {
-            assert_eq!(name, "model");
-            if let FunctionArgValue::Value(Value::String(s)) = value {
-                assert_eq!(s, "gpt-4");
-            }
-        }
-
-        // Check named boolean argument
-        if let FunctionArg::Named { name, value } = &func.args[3] {
-            assert_eq!(name, "strict");
-            if let FunctionArgValue::Value(Value::Boolean(b)) = value {
-                assert_eq!(*b, true);
-            }
-        }
+    if let MatchExpression::MatchConfig(config) = &complex_def.clauses[0] {
+        assert_eq!(config.match_type, MatchType::EmbeddingSim);
+        assert_eq!(config.pattern, "pattern");
+        assert_eq!(config.threshold, 0.85); // positional threshold
+        assert_eq!(config.endpoint.as_deref(), Some("databricks-bge"));
+        assert_eq!(config.model.as_deref(), Some("bge-large"));
+        assert_eq!(config.options.get("strict"), Some(&Value::Boolean(true)));
+    } else {
+        panic!("Expected EmbeddingSim clause to convert to MatchConfig");
     }
 
     common::cleanup_all();
@@ -225,20 +223,47 @@ fn test_mixed_function_arguments() -> std::io::Result<()> {
 }
 
 #[test]
+fn test_unknown_match_function_is_a_compile_error() {
+    common::setup();
+
+    // D-006: an unknown function used to survive parsing as an inert
+    // FunctionCall clause and then be dropped silently at resolution.
+    let template_str = r#"
+        Match<Section> ComplexMatch {
+            CustomFunction("pattern", 0.85, model="gpt-4", strict=true)
+        }
+    "#;
+
+    let err = parse_template(template_str).expect_err("unknown function must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("CustomFunction") && msg.contains("supported"),
+        "error must name the function and list supported ones: {msg}"
+    );
+
+    common::cleanup_all();
+}
+
+#[test]
 fn test_all_comparison_operators() -> std::io::Result<()> {
     common::setup();
 
+    // All six operators across supported properties (unknown properties are
+    // a compile error now, D-006/D-014).
     let template_str = r#"
         Match<Section> AllOps {
-            Heuristic(a > 1, b < 2, c >= 3, d <= 4, e == 5, f != 6)
+            Heuristic(fontSize > 1, x0 < 2, y0 >= 3, x1 <= 4, page == 5, textLength != 6)
         }
     "#;
 
     let root = parse_template(template_str)?;
 
     let ops_def = &root.match_definitions["AllOps"];
-    if let MatchExpression::FunctionCall(func) = &ops_def.clauses[0] {
-        assert_eq!(func.args.len(), 6);
+    if let MatchExpression::MatchConfig(config) = &ops_def.clauses[0] {
+        let MatchType::Heuristic(comps) = &config.match_type else {
+            panic!("Expected Heuristic match type, got {:?}", config.match_type);
+        };
+        assert_eq!(comps.len(), 6);
 
         let expected_ops = [
             ComparisonOp::GreaterThan,
@@ -250,12 +275,10 @@ fn test_all_comparison_operators() -> std::io::Result<()> {
         ];
 
         for (i, expected_op) in expected_ops.iter().enumerate() {
-            if let FunctionArg::Positional(FunctionArgValue::Comparison(comp)) = &func.args[i] {
-                assert_eq!(comp.op, *expected_op);
-            } else {
-                panic!("Expected comparison at position {}", i);
-            }
+            assert_eq!(comps[i].op, *expected_op, "operator at position {}", i);
         }
+    } else {
+        panic!("Expected Heuristic clause to convert to MatchConfig");
     }
 
     common::cleanup_all();
@@ -266,12 +289,9 @@ fn test_all_comparison_operators() -> std::io::Result<()> {
 fn test_empty_match_definition() -> std::io::Result<()> {
     common::setup();
 
+    // Declaring an empty definition still parses…
     let template_str = r#"
         Match<Section> Empty {
-        }
-        
-        Section(match=Empty) {
-            TextChunk()
         }
     "#;
 
@@ -281,6 +301,23 @@ fn test_empty_match_definition() -> std::io::Result<()> {
     assert_eq!(empty_def.target_type, "Section");
     assert_eq!(empty_def.name, "Empty");
     assert_eq!(empty_def.clauses.len(), 0);
+
+    // …but referencing it is a compile error: the old code silently left the
+    // section configless so it never matched (D-006).
+    let referencing = r#"
+        Match<Section> Empty {
+        }
+
+        Section(match=Empty) {
+            TextChunk()
+        }
+    "#;
+    let err = parse_template(referencing).expect_err("empty definition reference must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Empty") && msg.contains("no executable match clause"),
+        "unexpected error message: {msg}"
+    );
 
     common::cleanup_all();
     Ok(())
@@ -359,20 +396,24 @@ fn test_match_config_conversion() {
         panic!("Expected first clause to be converted to MatchConfig");
     }
 
-    // Check that Cosine() was converted to MatchConfig
+    // Check that Cosine() was converted to MatchConfig (alias of EmbeddingSim, D-014)
     if let MatchExpression::MatchConfig(config) = &match_def.clauses[1] {
-        assert_eq!(config.match_type, MatchType::Semantic);
+        assert_eq!(config.match_type, MatchType::EmbeddingSim);
         assert_eq!(config.pattern, "financial analysis");
         assert_eq!(config.threshold, 0.75);
     } else {
         panic!("Expected second clause to be converted to MatchConfig");
     }
 
-    // Check that FirstMatch() remains as FunctionCall (not a direct match type)
-    if let MatchExpression::FunctionCall(func) = &match_def.clauses[2] {
-        assert_eq!(func.name, "FirstMatch");
-        assert_eq!(func.args.len(), 2);
+    // FirstMatch() converts to an executable alternatives config (D-014)
+    if let MatchExpression::MatchConfig(config) = &match_def.clauses[2] {
+        let MatchType::FirstMatch(alternatives) = &config.match_type else {
+            panic!("Expected FirstMatch match type, got {:?}", config.match_type);
+        };
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(alternatives[0].match_type, MatchType::Text);
+        assert_eq!(alternatives[1].match_type, MatchType::EmbeddingSim);
     } else {
-        panic!("Expected third clause to remain as FunctionCall");
+        panic!("Expected third clause to be converted to MatchConfig");
     }
 }

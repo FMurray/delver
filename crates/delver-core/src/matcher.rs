@@ -1,7 +1,11 @@
-use crate::docql::{Element, ElementType, MatchConfig, Value};
+use crate::docql::{
+    ComparisonExpr, ComparisonOp, ComparisonValue, Element, ElementType, HeuristicProperty,
+    MatchConfig, MatchType, Value,
+};
 use crate::layout::TextLine;
 use crate::parse::{ContentHandle, PageContent, TextElement};
-use crate::search_index::PdfIndex;
+use crate::search_index::{PdfIndex, TextElemRef, TextHandle};
+use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -121,13 +125,18 @@ impl<'a> TemplateContentMatch<'a> {
     }
 }
 
-/// Aligns template elements with document content sequentially
+/// Aligns template elements with document content sequentially.
+///
+/// `Ok(None)` means the template simply matched nothing; `Err` is a match
+/// execution failure (unconfigured embedder, unsupported match type, backend
+/// error) that must surface to the caller instead of degrading silently
+/// (D-006).
 pub fn align_template_with_content<'a>(
     template_elements: &'a [Element],
     index: &'a PdfIndex,
     inherited_metadata: Option<&HashMap<String, Value>>,
     parent_or_prev_sibling_match_context: Option<&TemplateContentMatch<'a>>,
-) -> Option<Vec<TemplateContentMatch<'a>>> {
+) -> Result<Option<Vec<TemplateContentMatch<'a>>>> {
     align_template_with_content_with_depth(
         template_elements,
         index,
@@ -144,9 +153,9 @@ fn align_template_with_content_with_depth<'a>(
     inherited_metadata: Option<&HashMap<String, Value>>,
     parent_or_prev_sibling_match_context: Option<&TemplateContentMatch<'a>>,
     recursion_depth: usize,
-) -> Option<Vec<TemplateContentMatch<'a>>> {
+) -> Result<Option<Vec<TemplateContentMatch<'a>>>> {
     if template_elements.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     eprintln!(
@@ -160,7 +169,7 @@ fn align_template_with_content_with_depth<'a>(
             "Recursion depth limit ({}) exceeded, terminating template matching to prevent runaway recursion",
             MAX_RECURSION_DEPTH
         );
-        return None;
+        return Ok(None);
     }
 
     let default_metadata = HashMap::new();
@@ -283,7 +292,7 @@ fn align_template_with_content_with_depth<'a>(
                 context_for_child,
                 effective_start_index,
                 recursion_depth,
-            ) {
+            )? {
                 eprintln!(
                     "  PASS 1: Found Section '{}' boundaries",
                     template_element.name
@@ -410,9 +419,9 @@ fn align_template_with_content_with_depth<'a>(
     }
 
     if all_results.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(all_results)
+        Ok(Some(all_results))
     }
 }
 
@@ -450,8 +459,10 @@ fn match_section<'a, 'map_lt>(
     prev_match_for_context: Option<&TemplateContentMatch<'a>>,
     current_search_start_index: usize,
     recursion_depth: usize,
-) -> Option<TemplateContentMatch<'a>> {
-    let match_config = template.match_config.as_ref()?;
+) -> Result<Option<TemplateContentMatch<'a>>> {
+    let Some(match_config) = template.match_config.as_ref() else {
+        return Ok(None);
+    };
 
     let effective_search_start_index = current_search_start_index;
 
@@ -466,16 +477,21 @@ fn match_section<'a, 'map_lt>(
         .filter(|&end_idx| end_idx > effective_search_start_index);
 
     // 1. Find start boundary candidates
-    let start_candidates = find_start_boundary_candidates(
+    let Some(start_candidates) = find_start_boundary_candidates(
         template,
         index,
         effective_search_start_index,
         match_config,
         prev_match_for_context,
         max_search_index,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
 
-    let selected_start_candidate = start_candidates.first()?.clone();
+    let Some(selected_start_candidate) = start_candidates.first().cloned() else {
+        return Ok(None);
+    };
     let start_marker: &PageContent = &selected_start_candidate.content;
 
     // 2. Find end boundary candidates
@@ -486,7 +502,7 @@ fn match_section<'a, 'map_lt>(
         &template.children,
         match_config, // Pass the match_config for consistent threshold handling
         prev_match_for_context,
-    );
+    )?;
 
     // Choose end marker:
     //   a) the best explicit/style candidate, OR
@@ -619,12 +635,22 @@ fn match_section<'a, 'map_lt>(
             Some(&result.metadata), // Pass the updated metadata including section info
             Some(&result),
             recursion_depth + 1, // Increment depth for child processing
-        ) {
+        )? {
             result.children = child_matches;
         }
     }
 
-    Some(result)
+    Ok(Some(result))
+}
+
+/// Diagnostic name for a match config: the match-definition name when the
+/// config came from one, otherwise the template element's name (D-006 errors
+/// must name the match block).
+fn match_owner(template: &Element, config: &MatchConfig) -> String {
+    config
+        .name
+        .clone()
+        .unwrap_or_else(|| template.name.clone())
 }
 
 /// Finds potential start boundary candidates using multiple indices
@@ -635,19 +661,20 @@ fn find_start_boundary_candidates<'a>(
     match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
     max_search_index: Option<usize>,
-) -> Option<Vec<BoundaryCandidate>> {
+) -> Result<Option<Vec<BoundaryCandidate>>> {
     let mut candidates = Vec::new();
 
     eprintln!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
-    // 1. Text-based candidates
-    let text_matches = index.find_text_matches(
-        &match_config.pattern,
-        match_config.threshold,
-        Some(start_index),
+    // 1. Match-config candidates (Text/Regex/Heuristic/EmbeddingSim/FirstMatch)
+    let text_matches = find_config_matches(
+        index,
+        match_config,
+        &match_owner(template, match_config),
+        start_index,
         max_search_index,
-    );
+    )?;
     eprintln!(
-        "[find_start_boundary_candidates] Text-based candidates found: {}",
+        "[find_start_boundary_candidates] Match-config candidates found: {}",
         text_matches.len()
     );
 
@@ -668,14 +695,14 @@ fn find_start_boundary_candidates<'a>(
 
     if candidates.is_empty() {
         eprintln!("[find_start_boundary_candidates] No candidates found. Returning None.");
-        None
+        Ok(None)
     } else {
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         eprintln!(
             "[find_start_boundary_candidates] Returning {} sorted candidates.",
             candidates.len()
         );
-        Some(candidates)
+        Ok(Some(candidates))
     }
 }
 
@@ -688,7 +715,7 @@ fn find_end_boundary_candidates<'a>(
     _children: &[Element],
     _match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
-) -> Option<Vec<BoundaryCandidate>> {
+) -> Result<Option<Vec<BoundaryCandidate>>> {
     let mut candidates = Vec::new();
 
     // Get the start marker's index so we can search after it
@@ -697,14 +724,15 @@ fn find_end_boundary_candidates<'a>(
     // 1. Template-based end markers
     if let Some(config) = template.end_match_config.as_ref() {
         // Start search after the start marker, not from the beginning of the document
-        let search_start_index = start_marker_index.map(|idx| idx + 1);
+        let search_start_index = start_marker_index.map(|idx| idx + 1).unwrap_or(0);
 
-        let end_text_matches = index.find_text_matches(
-            &config.pattern,
-            config.threshold,
-            search_start_index, // Use match_config.threshold instead of hardcoded value
+        let end_text_matches = find_config_matches(
+            index,
+            config,
+            &match_owner(template, config),
+            search_start_index,
             None,
-        );
+        )?;
         for (text_handle, score) in end_text_matches {
             let txt_ref = index.text(text_handle);
             let element = PageContent::Text(TextElement {
@@ -802,7 +830,7 @@ fn find_end_boundary_candidates<'a>(
     }
 
     if candidates.is_empty() {
-        None
+        Ok(None)
     } else {
         // Order by document position to pick the first valid boundary.
         candidates.sort_by(|a, b| {
@@ -816,8 +844,267 @@ fn find_end_boundary_candidates<'a>(
                 })
         });
 
-        Some(candidates)
+        Ok(Some(candidates))
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Match-config execution (D-014). Every MatchType either executes or errors;
+// nothing is silently skipped (D-006).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Execute one `MatchConfig` over the scoped document range, dispatching on
+/// its match type. Returns `(handle, score)` candidates; scores are the
+/// matcher's native confidence (Levenshtein / cosine similarity, or 1.0 for
+/// the exact Regex/Heuristic matchers).
+fn find_config_matches(
+    index: &PdfIndex,
+    config: &MatchConfig,
+    owner: &str,
+    start_index: usize,
+    max_index: Option<usize>,
+) -> Result<Vec<(TextHandle, f64)>> {
+    match &config.match_type {
+        MatchType::Text => Ok(index.find_text_matches(
+            &config.pattern,
+            config.threshold,
+            Some(start_index),
+            max_index,
+        )),
+        MatchType::Regex => {
+            // Compiled at template-compile time; fall back to compiling here
+            // for configs constructed programmatically (tests, embedders).
+            let re = match &config.compiled_regex {
+                Some(re) => re.clone(),
+                None => regex::Regex::new(&config.pattern).map_err(|e| {
+                    anyhow!(
+                        "match '{owner}': invalid regex pattern '{}': {e}",
+                        config.pattern
+                    )
+                })?,
+            };
+            Ok(index.find_regex_matches(&re, Some(start_index), max_index))
+        }
+        MatchType::Heuristic(comparisons) => {
+            find_heuristic_matches(index, comparisons, owner, start_index, max_index)
+        }
+        MatchType::EmbeddingSim => {
+            find_embedding_matches(index, config, owner, start_index, max_index)
+        }
+        MatchType::FirstMatch(alternatives) => {
+            for alternative in alternatives {
+                let matches = find_config_matches(index, alternative, owner, start_index, max_index)?;
+                if !matches.is_empty() {
+                    return Ok(matches);
+                }
+            }
+            Ok(Vec::new())
+        }
+        MatchType::Custom(name) => bail!(
+            "match '{owner}': unsupported match type '{name}' cannot execute (D-006: no \
+             silent skip)"
+        ),
+    }
+}
+
+/// `Heuristic(...)`: evaluate the comparisons (ANDed) against each scoped
+/// element's properties. Matching elements score 1.0, in document order.
+fn find_heuristic_matches(
+    index: &PdfIndex,
+    comparisons: &[ComparisonExpr],
+    owner: &str,
+    start_index: usize,
+    max_index: Option<usize>,
+) -> Result<Vec<(TextHandle, f64)>> {
+    let end = max_index.unwrap_or(index.doc_len());
+    let mut results = Vec::new();
+    for handle in index.text_handles_in_range(start_index, end) {
+        let element = index.text(handle);
+        if evaluate_heuristic(comparisons, &element, owner)? {
+            results.push((handle, 1.0));
+        }
+    }
+    Ok(results)
+}
+
+fn evaluate_heuristic(
+    comparisons: &[ComparisonExpr],
+    element: &TextElemRef<'_>,
+    owner: &str,
+) -> Result<bool> {
+    for comparison in comparisons {
+        if !evaluate_comparison(comparison, element, owner)? {
+            return Ok(false); // comparisons AND together
+        }
+    }
+    Ok(true)
+}
+
+fn evaluate_comparison(
+    comp: &ComparisonExpr,
+    element: &TextElemRef<'_>,
+    owner: &str,
+) -> Result<bool> {
+    let prop = HeuristicProperty::parse(&comp.left).ok_or_else(|| {
+        anyhow!(
+            "match '{owner}': Heuristic(...) references unknown property '{}'; supported \
+             properties: {}",
+            comp.left,
+            HeuristicProperty::supported_list()
+        )
+    })?;
+
+    if prop.is_string() {
+        let actual = match prop {
+            HeuristicProperty::FontName => crate::fonts::canonicalize::canonicalize_font_name(
+                element.font_name.unwrap_or_default(),
+            ),
+            HeuristicProperty::Text => element.text.to_string(),
+            _ => unreachable!("is_string() covers exactly FontName and Text"),
+        };
+        let expected = match &comp.right {
+            ComparisonValue::String(s) | ComparisonValue::Identifier(s) => s.clone(),
+            other => bail!(
+                "match '{owner}': string property '{}' compared with non-string {:?}",
+                comp.left,
+                other
+            ),
+        };
+        // Font names compare canonicalized + case-insensitively (raw PDF
+        // names carry subset prefixes like "ABCDEF+"); text compares exactly.
+        let equal = match prop {
+            HeuristicProperty::FontName => {
+                let expected =
+                    crate::fonts::canonicalize::canonicalize_font_name(expected.as_str());
+                actual.eq_ignore_ascii_case(&expected)
+            }
+            _ => actual == expected,
+        };
+        return match comp.op {
+            ComparisonOp::Equal => Ok(equal),
+            ComparisonOp::NotEqual => Ok(!equal),
+            _ => bail!(
+                "match '{owner}': property '{}' is a string; only == and != are supported",
+                comp.left
+            ),
+        };
+    }
+
+    let actual: f64 = match prop {
+        HeuristicProperty::FontSize => element.font_size as f64,
+        HeuristicProperty::Page => element.page_number as f64,
+        HeuristicProperty::X0 => element.bbox.0 as f64,
+        HeuristicProperty::Y0 => element.bbox.1 as f64,
+        HeuristicProperty::X1 => element.bbox.2 as f64,
+        HeuristicProperty::Y1 => element.bbox.3 as f64,
+        HeuristicProperty::TextLength => element.text.chars().count() as f64,
+        HeuristicProperty::FontName | HeuristicProperty::Text => {
+            unreachable!("string properties handled above")
+        }
+    };
+    let expected = match &comp.right {
+        ComparisonValue::Number(n) => *n,
+        other => bail!(
+            "match '{owner}': numeric property '{}' compared with non-number {:?}",
+            comp.left,
+            other
+        ),
+    };
+    Ok(match comp.op {
+        ComparisonOp::GreaterThan => actual > expected,
+        ComparisonOp::LessThan => actual < expected,
+        ComparisonOp::GreaterThanOrEqual => actual >= expected,
+        ComparisonOp::LessThanOrEqual => actual <= expected,
+        ComparisonOp::Equal => (actual - expected).abs() < f64::EPSILON,
+        ComparisonOp::NotEqual => (actual - expected).abs() >= f64::EPSILON,
+    })
+}
+
+/// `EmbeddingSim("query", threshold=..)`: embed the query once and the scoped
+/// candidates as one batch, keep candidates with cosine similarity >=
+/// threshold, ranked by similarity. No configured embedder is a hard error
+/// naming the match block (D-006).
+fn find_embedding_matches(
+    index: &PdfIndex,
+    config: &MatchConfig,
+    owner: &str,
+    start_index: usize,
+    max_index: Option<usize>,
+) -> Result<Vec<(TextHandle, f64)>> {
+    let Some(embedder) = index.embedder() else {
+        let endpoint_hint = config
+            .endpoint
+            .as_deref()
+            .map(|e| format!(" (template names endpoint \"{e}\")"))
+            .unwrap_or_default();
+        bail!(
+            "match '{owner}': template uses EmbeddingSim(\"{}\") but no embedder is \
+             configured{endpoint_hint}; pass --embed-endpoint <name-or-url> or set \
+             DELVER_EMBED_ENDPOINT (D-006: no silent skip)",
+            config.pattern
+        );
+    };
+
+    let end = max_index.unwrap_or(index.doc_len());
+    let handles = index.text_handles_in_range(start_index, end);
+    if handles.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_vec = embedder
+        .embed(&[&config.pattern])
+        .map_err(|e| anyhow!("match '{owner}': embedding the query failed: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("match '{owner}': embedder returned no vector for the query"))?;
+
+    let texts: Vec<&str> = handles.iter().map(|h| index.text(*h).text).collect();
+    let vectors = embedder
+        .embed(&texts)
+        .map_err(|e| anyhow!("match '{owner}': embedding {} candidates failed: {e}", texts.len()))?;
+    if vectors.len() != handles.len() {
+        bail!(
+            "match '{owner}': embedder returned {} vectors for {} texts",
+            vectors.len(),
+            handles.len()
+        );
+    }
+
+    let mut results = Vec::new();
+    for (handle, vector) in handles.into_iter().zip(vectors) {
+        let similarity = cosine_similarity(&query_vec, &vector).ok_or_else(|| {
+            anyhow!(
+                "match '{owner}': embedding dimension mismatch (query {} vs candidate {})",
+                query_vec.len(),
+                vector.len()
+            )
+        })?;
+        if similarity >= config.threshold {
+            results.push((handle, similarity));
+        }
+    }
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    Ok(results)
+}
+
+/// Cosine similarity in f64; `None` on dimension mismatch, 0.0 when either
+/// vector has zero norm.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += (*x as f64) * (*y as f64);
+        norm_a += (*x as f64) * (*x as f64);
+        norm_b += (*y as f64) * (*y as f64);
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return Some(0.0);
+    }
+    Some(dot / (norm_a.sqrt() * norm_b.sqrt()))
 }
 
 /// Scores a potential boundary candidate
