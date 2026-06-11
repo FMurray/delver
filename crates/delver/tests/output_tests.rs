@@ -53,7 +53,7 @@ fn test_nested_sections_parent_references() {
 
     // Process the matched content
     let matches = vec![main_section_match];
-    let outputs = process_matched_content(&matches, &index, None);
+    let outputs = process_matched_content(&matches, &index, None).expect("processing must succeed");
 
     // Verify the outputs
     assert!(!outputs.is_empty(), "Should produce some outputs");
@@ -157,7 +157,7 @@ fn test_top_level_elements_no_parent() {
 
     // Process the matched content
     let matches = vec![text_match];
-    let outputs = process_matched_content(&matches, &index, None);
+    let outputs = process_matched_content(&matches, &index, None).expect("processing must succeed");
 
     // Verify the output
     assert_eq!(outputs.len(), 1, "Should have exactly one output");
@@ -216,7 +216,7 @@ fn test_multiple_sibling_sections() {
     ];
 
     // Process the matched content
-    let outputs = process_matched_content(&matches, &index, None);
+    let outputs = process_matched_content(&matches, &index, None).expect("processing must succeed");
 
     // Verify both outputs have no parent (since they're siblings at top level)
     assert_eq!(outputs.len(), 2, "Should have exactly two outputs");
@@ -260,7 +260,7 @@ fn test_section_with_text_children() {
 
     // Process the matched content
     let matches = vec![section_match];
-    let outputs = process_matched_content(&matches, &index, None);
+    let outputs = process_matched_content(&matches, &index, None).expect("processing must succeed");
 
     // Section with no children should process its own content and have no parent
     assert_eq!(outputs.len(), 1, "Should have exactly one output");
@@ -338,7 +338,7 @@ fn test_parent_index_references_actual_output_position() {
     };
 
     let matches = vec![main_section_match];
-    let outputs = process_matched_content(&matches, &index, None);
+    let outputs = process_matched_content(&matches, &index, None).expect("processing must succeed");
 
     // Debug output to see the actual structure
     println!("=== Parent Index Reference Test ===");
@@ -476,7 +476,7 @@ fn test_hierarchical_parent_reference_inconsistency() {
     };
 
     let matches = vec![root_match];
-    let outputs = process_matched_content(&matches, &index, None);
+    let outputs = process_matched_content(&matches, &index, None).expect("processing must succeed");
 
     println!("=== Hierarchical Parent Reference Test ===");
     for (i, output) in outputs.iter().enumerate() {
@@ -618,7 +618,7 @@ fn test_real_nested_sections_parent_references() {
         .expect("Should find nested section matches");
 
     // Process the matched content to get the actual output with parent references
-    let processed_outputs = process_matched_content(&template_matches, &index, None);
+    let processed_outputs = process_matched_content(&template_matches, &index, None).expect("processing must succeed");
 
     // Debug: Print what we actually got
     println!("=== Real Template Matching Test ===");
@@ -801,7 +801,7 @@ fn test_10k_template_structure_parent_references() {
         .expect("Should find template matches");
 
     // Process the matched content to get the actual output with parent references
-    let processed_outputs = process_matched_content(&template_matches, &index, None);
+    let processed_outputs = process_matched_content(&template_matches, &index, None).expect("processing must succeed");
 
     // Debug: Print what we actually got (limit to first 10 to avoid spam)
     println!("=== 10K Template Structure Test ===");

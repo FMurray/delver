@@ -386,3 +386,55 @@ over EPIPE-tolerant write wrapping because every stdout/stderr writer (including
 inside libraries) is covered with one line and no error-path audit. `libc` added as a direct
 dependency (already Cargo.lock-pinned transitively — the firewalled index was never consulted).
 Verified: `query --doc … --pretty | head -5` exits silently, 0 bytes on stderr, no panic.
+
+**D-020 · 2026-06-11 · Stage B slice 4: `TextChunk(method="semantic")` executes (spec STRATEGY ← Token | Semantic).**
+`method="tokens"` is the pre-slice behavior and stays the default when the attribute is absent
+(token budget with a tokenizer, character budget without); `method="semantic"` is embedding-driven
+valley splitting (`chunker::chunk_semantic`). Unknown method values are a template-compile error
+listing the supported set (D-006); the same validation re-runs at processing time because Elements
+can be built programmatically. `method` is honored (and validated) wherever text is chunked:
+TextChunk/Paragraph elements and a Section's own direct content all route through the one chunking
+function.
+- **Segmentation (sentence-ish units, element-granular)**: elements accumulate into the current
+  segment; the segment closes after any element whose text — trailing ASCII whitespace trimmed,
+  trailing closing delimiters (`"`, `'`, `”`, `’`, `)`, `]`) stripped — ends with `.`, `!`, or `?`;
+  the final segment closes at end of input. Sentence boundaries strictly *inside* one element's
+  text are not split candidates: chunks stay contiguous element slices, so output assembly
+  (page stats, chunk text joining, parent links) is shared verbatim with the other strategies.
+  Abbreviation handling ("U.S.") is deliberately out of scope — deterministic approximation.
+- **Embedding + valley rule (percentile-based)**: segment text = element texts joined with a
+  single space (the chunk-text joiner); all segments embed in ONE batch call; vector-count
+  mismatch and dimension mismatch are hard errors. For adjacent-segment cosine similarities, the
+  breakpoint threshold is the P-th percentile (ascending sort, integer index `P*(len-1)/100`),
+  P = `breakpointPercentile` attr, **default 25**; a boundary breaks iff its similarity is
+  *strictly* below the threshold — all-equal similarities (homogeneous text) produce no breaks,
+  and P=0 disables valley splitting. Percentile over absolute threshold is deliberate: attribute
+  floats still parse via the legacy ×1000 fixed-point `Value::Number(i64)` encoding (only
+  ComparisonValue was fixed in D-014), so an integer 0..=100 attr is the only unambiguous knob.
+  Out-of-range/non-integer percentile, or `breakpointPercentile` without `method="semantic"`,
+  are template-compile errors (no silent no-op).
+- **Token-budget interplay**: `chunkSize` caps each chunk — token count when a tokenizer is
+  configured (the Tokens strategy's batch-encode path, helper now shared), else character count
+  (sum of element text lengths, joiner spaces uncounted — the Characters strategy's accounting).
+  Enforced at segment granularity: a segment that would overflow a non-empty chunk closes it
+  first; a single segment larger than the whole budget forms its own over-budget chunk (the
+  Tokens strategy's single-element overflow rule, one level up). `chunkOverlap` carries trailing
+  whole segments into the next chunk (step back while carried cost < overlap; the crossing
+  segment is included — the Tokens element rule at segment level), never past the closed chunk's
+  start; each valley closes at most one chunk (a watermark stops the overlap tail from
+  immediately re-splitting at the consumed boundary). Deterministic given a deterministic
+  embedder.
+- **Fail-loud shape (D-006)**: `method="semantic"` with no embedder configured errors at
+  processing time naming the element (`TextChunk 'name'` with the `as=` name when present) and
+  citing the remedies — `pass --embed-endpoint <name-or-url> or set DELVER_EMBED_ENDPOINT` —
+  mirroring the D-014 EmbeddingSim message. To propagate, `process_matched_content` (and its
+  recursion) now returns `Result`; the 10 direct test callers unwrap explicitly.
+- **Output shape**: identical ChunkOutput objects plus, on the semantic path only, metadata
+  `method: "semantic"` and `segment_count` (segments in the chunk, overlap-carried included).
+  The default/tokens path is byte-identical to pre-slice output — both 10-K regression
+  constants verified post-change (414 534 and 466 678 bytes, stderr 0, SIGPIPE clean).
+- Tests: crates/delver-core/tests/semantic_chunking.rs (7: valley split at a designed topic
+  break via MockEmbedder canned vectors, chunkSize cap, overlap carry incl. the no-re-split
+  watermark, no-embedder error naming the element, unknown-method compile error listing values,
+  percentile-without-semantic compile error, default ≡ explicit-tokens with no metadata
+  additions). PDF builder copied from match_exec.rs per the D-014 precedent.

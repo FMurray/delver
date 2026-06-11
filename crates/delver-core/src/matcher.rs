@@ -1128,8 +1128,8 @@ fn find_embedding_matches(
 }
 
 /// Cosine similarity in f64; `None` on dimension mismatch, 0.0 when either
-/// vector has zero norm.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
+/// vector has zero norm. Shared with semantic chunking (D-020).
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
     if a.len() != b.len() {
         return None;
     }

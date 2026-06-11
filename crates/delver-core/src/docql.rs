@@ -1,4 +1,4 @@
-use crate::chunker::{chunk_text_elements, ChunkingStrategy};
+use crate::chunker::{chunk_semantic, chunk_text_elements, ChunkMethod, ChunkingStrategy};
 use crate::matcher::{MatchedContent, TemplateContentMatch};
 use crate::parse::{PageContent, TextElement};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -662,6 +662,16 @@ fn compile_match_configs(elements: &mut [Element]) -> Result<(), Error> {
                 );
             }
         }
+        // Stage B slice 4 (D-020): chunking attributes fail loud at template
+        // compile. `method` selects the chunking strategy wherever text gets
+        // chunked — TextChunk/Paragraph elements and a Section's own direct
+        // content all route through process_text_chunk_elements_simple.
+        if matches!(
+            element.element_type,
+            ElementType::TextChunk | ElementType::Paragraph | ElementType::Section
+        ) {
+            validate_chunking_attributes(element)?;
+        }
         compile_match_configs(&mut element.children)?;
     }
     Ok(())
@@ -693,6 +703,69 @@ fn compile_match_config(owner: &str, config: &mut MatchConfig) -> Result<(), Err
         ))),
         MatchType::Text | MatchType::EmbeddingSim => Ok(()),
     }
+}
+
+/// Display label for chunking diagnostics: `TextChunk 'risk'` when an
+/// `as="risk"` name is present, else just the element identifier (the
+/// TableOutput naming convention, D-018).
+fn chunk_owner_label(element: &Element) -> String {
+    match element.attributes.get("as").and_then(|v| v.as_string()) {
+        Some(name) => format!("{} '{}'", element.name, name),
+        None => element.name.clone(),
+    }
+}
+
+/// Attribute value as the user wrote it, for error messages.
+fn format_attr_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("\"{s}\""),
+        Value::Identifier(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Array(_) => "[...]".to_string(),
+    }
+}
+
+/// Template-compile-time validation of chunking attributes (D-006/D-020):
+/// `method` must be a supported strategy name, and `breakpointPercentile`
+/// (semantic-only) must be an integer in 0..=100. An integer percentile is
+/// deliberate: attribute floats still parse via the legacy x1000 fixed-point
+/// encoding, so a fractional threshold attribute would be ambiguous.
+fn validate_chunking_attributes(element: &Element) -> Result<(), Error> {
+    let method = match element.attributes.get("method") {
+        None => None,
+        Some(value) => match value.as_string().as_deref().and_then(ChunkMethod::parse) {
+            Some(method) => Some(method),
+            None => {
+                return Err(template_error(format!(
+                    "{}: unknown method {}; supported values: {} (D-006: no silent skip)",
+                    chunk_owner_label(element),
+                    format_attr_value(value),
+                    ChunkMethod::SUPPORTED,
+                )))
+            }
+        },
+    };
+    if let Some(value) = element.attributes.get("breakpointPercentile") {
+        if method != Some(ChunkMethod::Semantic) {
+            return Err(template_error(format!(
+                "{}: breakpointPercentile is only meaningful with method=\"semantic\" \
+                 (D-006: no silent no-op)",
+                chunk_owner_label(element)
+            )));
+        }
+        match value.as_number() {
+            Some(p) if (0..=100).contains(&p) => {}
+            _ => {
+                return Err(template_error(format!(
+                    "{}: breakpointPercentile must be an integer percentile in 0..=100, got {}",
+                    chunk_owner_label(element),
+                    format_attr_value(value),
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn _parse_template(pair: Pair<Rule>) -> Root {
@@ -1278,11 +1351,14 @@ fn process_comparison_expr(pair: Pair<Rule>) -> ComparisonExpr {
 }
 
 // Process the matched content to generate chunks or image data
+/// Errors when a matched element cannot be processed (D-006) — today that is
+/// `method="semantic"` chunking without a configured embedder, or a semantic
+/// embedding batch failing.
 pub fn process_matched_content(
     matched_items: &Vec<TemplateContentMatch>,
     index: &crate::search_index::PdfIndex, // Add index parameter to resolve handles
     tokenizer: Option<&Tokenizer>,
-) -> Vec<ProcessedOutput> {
+) -> Result<Vec<ProcessedOutput>, Error> {
     let mut global_chunk_counter = 0;
     let mut all_outputs = Vec::new();
     let mut deferred_tables = Vec::new();
@@ -1297,7 +1373,7 @@ pub fn process_matched_content(
         &mut global_chunk_counter,
         None, // parent_info: Option<(String, usize)>
         &HashMap::new(),
-    );
+    )?;
 
     // TableOutputs append after all positional outputs (D-018): chunk
     // parent_index links are positions in this array, so inserting tables
@@ -1306,7 +1382,7 @@ pub fn process_matched_content(
     // match time, which stay valid because earlier positions never move.
     all_outputs.extend(deferred_tables);
 
-    all_outputs
+    Ok(all_outputs)
 }
 
 // Recursive function that builds the output list and tracks parent relationships
@@ -1320,7 +1396,7 @@ fn process_matched_content_recursive(
     global_chunk_counter: &mut usize,
     parent_info: Option<(String, usize)>, // (parent_name, parent_output_index)
     parent_metadata: &HashMap<String, Value>,
-) {
+) -> Result<(), Error> {
     for match_item in matched_items {
         // Combine parent metadata with the current item's metadata.
         // The current item's metadata will overwrite the parent's if keys conflict.
@@ -1361,7 +1437,8 @@ fn process_matched_content_recursive(
                         parent_info.clone(),
                         global_chunk_counter,
                         tokenizer,
-                    );
+                        index.embedder(),
+                    )?;
                     tracing::debug!("chunk outputs: {:?}", chunk_outputs);
                     for chunk_output in chunk_outputs {
                         all_outputs.push(ProcessedOutput::Text(chunk_output));
@@ -1403,7 +1480,8 @@ fn process_matched_content_recursive(
                         parent_info.clone(), // FIXED: Section's own content gets the parent info passed to this section
                         global_chunk_counter,
                         tokenizer,
-                    );
+                        index.embedder(),
+                    )?;
                     for chunk_output in chunk_outputs {
                         all_outputs.push(ProcessedOutput::Text(chunk_output));
                         section_has_content = true;
@@ -1452,7 +1530,7 @@ fn process_matched_content_recursive(
                                     global_chunk_counter,
                                     textchunk_parent_info,
                                     &current_metadata,
-                                );
+                                )?;
                             }
                             ElementType::Section => {
                                 // Section children always get this section as parent (regardless of nesting level)
@@ -1465,7 +1543,7 @@ fn process_matched_content_recursive(
                                     global_chunk_counter,
                                     child_parent_info.clone(),
                                     &current_metadata,
-                                );
+                                )?;
                             }
                             _ => {
                                 // Other types use the default logic
@@ -1478,7 +1556,7 @@ fn process_matched_content_recursive(
                                     global_chunk_counter,
                                     child_parent_info.clone(),
                                     &current_metadata,
-                                );
+                                )?;
                             }
                         }
                     }
@@ -1580,6 +1658,7 @@ fn process_matched_content_recursive(
             }
         }
     }
+    Ok(())
 }
 
 /// Convert one template attribute `Value` into JSON. Shared by the image,
@@ -1875,6 +1954,7 @@ fn process_image_element_simple(
     ProcessedOutput::Image(image_output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_text_chunk_elements_simple(
     elements: &[TextElement],
     template_element: &Element,
@@ -1882,7 +1962,8 @@ fn process_text_chunk_elements_simple(
     parent_info: Option<(String, usize)>,
     global_chunk_counter: &mut usize,
     tokenizer: Option<&Tokenizer>,
-) -> Vec<ChunkOutput> {
+    embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<Vec<ChunkOutput>, Error> {
     // -------- 1. resolve parameters once --------
     let chunk_size = template_element
         .attributes
@@ -1896,6 +1977,25 @@ fn process_text_chunk_elements_simple(
         .and_then(|v| v.as_number())
         .unwrap_or(150) as usize;
 
+    // method= selects the chunking strategy (D-020). Validated at template
+    // compile; re-checked here because Elements can also be built
+    // programmatically (D-006: an unknown method must never silently chunk).
+    let method = match template_element.attributes.get("method") {
+        None => ChunkMethod::Tokens,
+        Some(value) => value
+            .as_string()
+            .as_deref()
+            .and_then(ChunkMethod::parse)
+            .ok_or_else(|| {
+                template_error(format!(
+                    "{}: unknown method {}; supported values: {} (D-006: no silent skip)",
+                    chunk_owner_label(template_element),
+                    format_attr_value(value),
+                    ChunkMethod::SUPPORTED,
+                ))
+            })?,
+    };
+
     // -------- 2. static conversion of template‑level metadata --------
     // Transform once rather than for every chunk.
     let base_metadata: std::sync::Arc<HashMap<String, serde_json::Value>> = {
@@ -1906,19 +2006,69 @@ fn process_text_chunk_elements_simple(
         std::sync::Arc::new(out)
     };
 
-    let strategy = if let Some(tokenizer) = tokenizer {
-        ChunkingStrategy::Tokens {
-            max_tokens: chunk_size,
-            chunk_overlap,
-            tokenizer: tokenizer.clone(),
+    // -------- 3. chunk the elements --------
+    // Chunks are contiguous element slices under every method; Semantic
+    // additionally reports how many sentence-ish segments each chunk holds.
+    let chunks: Vec<(&[TextElement], Option<usize>)> = match method {
+        ChunkMethod::Tokens => {
+            let strategy = if let Some(tokenizer) = tokenizer {
+                ChunkingStrategy::Tokens {
+                    max_tokens: chunk_size,
+                    chunk_overlap,
+                    tokenizer: tokenizer.clone(),
+                }
+            } else {
+                ChunkingStrategy::Characters {
+                    max_chars: chunk_size,
+                }
+            };
+            chunk_text_elements(elements, &strategy, chunk_overlap)
+                .into_iter()
+                .map(|chunk| (chunk, None))
+                .collect()
         }
-    } else {
-        ChunkingStrategy::Characters {
-            max_chars: chunk_size,
+        ChunkMethod::Semantic => {
+            // Fail loud without an embedder, mirroring the EmbeddingSim
+            // matcher's error shape (D-006/D-014).
+            let Some(embedder) = embedder else {
+                return Err(template_error(format!(
+                    "{}: method=\"semantic\" requires an embedder but none is configured; \
+                     pass --embed-endpoint <name-or-url> or set DELVER_EMBED_ENDPOINT \
+                     (D-006: no silent skip)",
+                    chunk_owner_label(template_element)
+                )));
+            };
+            let percentile = template_element
+                .attributes
+                .get("breakpointPercentile")
+                .and_then(|v| v.as_number())
+                .unwrap_or(25);
+            if !(0..=100).contains(&percentile) {
+                return Err(template_error(format!(
+                    "{}: breakpointPercentile must be an integer percentile in 0..=100, got {}",
+                    chunk_owner_label(template_element),
+                    percentile,
+                )));
+            }
+            chunk_semantic(
+                elements,
+                embedder,
+                chunk_size,
+                chunk_overlap,
+                percentile as u8,
+                tokenizer,
+            )
+            .map_err(|e| {
+                template_error(format!(
+                    "{}: semantic chunking failed: {e}",
+                    chunk_owner_label(template_element)
+                ))
+            })?
+            .into_iter()
+            .map(|chunk| (chunk.elements, Some(chunk.segment_count)))
+            .collect()
         }
     };
-    // -------- 3. chunk the elements --------
-    let chunks = chunk_text_elements(elements, &strategy, chunk_overlap);
 
     // -------- 4. Extract parent information --------
     let (parent_name, parent_index) = if let Some((name, index)) = parent_info {
@@ -1930,7 +2080,7 @@ fn process_text_chunk_elements_simple(
     // -------- 5. build outputs --------
     let mut outputs = Vec::with_capacity(chunks.len());
 
-    for (_idx, chunk) in chunks.iter().enumerate() {
+    for (chunk, segment_count) in &chunks {
         // a) pre‑compute char capacity
         let est_chars: usize = chunk.iter().map(|e| e.text.len()).sum();
         let mut chunk_text = String::with_capacity(est_chars + chunk.len()); // +spaces
@@ -1989,6 +2139,20 @@ fn process_text_chunk_elements_simple(
             serde_json::Value::Number(serde_json::Number::from(chunk_text.len())),
         );
 
+        // Semantic-only metadata (D-020). The default/tokens path stays
+        // byte-identical to its pre-slice output, so these keys exist only
+        // when method="semantic".
+        if let Some(segment_count) = segment_count {
+            meta.insert(
+                "method".into(),
+                serde_json::Value::String("semantic".to_string()),
+            );
+            meta.insert(
+                "segment_count".into(),
+                serde_json::Value::Number(serde_json::Number::from(*segment_count)),
+            );
+        }
+
         // Note: We've simplified the parent tracking - no longer storing full ancestry path
 
         outputs.push(ChunkOutput {
@@ -2002,7 +2166,7 @@ fn process_text_chunk_elements_simple(
         *global_chunk_counter += 1;
     }
 
-    outputs
+    Ok(outputs)
 }
 
 fn decode_image_object(image_object: &Object) -> Result<Vec<u8>, String> {

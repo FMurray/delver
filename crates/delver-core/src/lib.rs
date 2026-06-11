@@ -102,7 +102,7 @@ fn run_template(
     let index = PdfIndex::new(pages_map, match_context);
 
     if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None)? {
-        let outputs = process_matched_content(&matched_content, &index, tokenizer);
+        let outputs = process_matched_content(&matched_content, &index, tokenizer)?;
         all_outputs.extend(outputs);
     }
 

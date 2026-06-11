@@ -346,7 +346,7 @@ mod collation_flow_tests {
         assert_eq!(textchunk_match.template_element.name, "MultiPageChunk");
 
         // Process the matched content to generate actual chunks with metadata
-        let processed_outputs = process_matched_content(&results, &index, None);
+        let processed_outputs = process_matched_content(&results, &index, None).expect("processing must succeed");
         
         // Verify we have multiple chunks (due to small chunk size)
         assert!(processed_outputs.len() > 1, "Should create multiple chunks due to small chunk size");
