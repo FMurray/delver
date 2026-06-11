@@ -1,265 +1,642 @@
+//! Viewer service layer over the persistent Postgres index (delver-store).
+//!
+//! The SQLite page-image store is retired (DV-001): Postgres is the source of
+//! truth for documents/elements, original PDF bytes live in a local byte-cache
+//! directory (`DELVER_DOC_CACHE`, DV-002), and page rasters are produced on
+//! demand with pdfium and held in a small in-process LRU (DV-003) — no page
+//! images are ever written to Postgres.
+//!
+//! Shapes shared with the WASM client (DTOs) live at the top of this module;
+//! everything that touches the database, the filesystem, or pdfium is gated
+//! behind the `ssr` feature.
+
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-#[cfg(feature = "ssr")]
-use {
-    sqlx::{Row, SqlitePool},
-    std::collections::HashMap,
-};
-
+/// One row of the document list: `documents` joined with `corpora`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DocumentPage {
-    pub page_index: usize,
-    pub image_data: Vec<u8>, // RGBA image data
-    pub width: f32,
-    pub height: f32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PdfDocument {
-    pub id: Uuid,
+pub struct DocumentSummary {
+    pub id: String,
+    pub corpus: String,
+    /// Display name: PDF Info title > URI basename > short id (DV-002).
     pub name: String,
-    pub total_pages: usize,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub pdf_data: Option<Vec<u8>>, // Raw PDF bytes for server-side processing
+    pub uri: Option<String>,
+    pub page_count: i32,
+    pub parse_version: i32,
+    pub parsed_at: chrono::DateTime<chrono::Utc>,
+    /// Whether the original bytes are reachable (uri set and file readable),
+    /// i.e. whether page rasters can be produced.
+    pub has_source: bool,
 }
 
-impl PdfDocument {
-    pub fn new(name: String) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            name,
-            total_pages: 0,
-            created_at: chrono::Utc::now(),
-            pdf_data: None,
-        }
-    }
+/// Receipt for an upload/ingest (mirrors the CLI `index` JSON, D-012).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UploadReceipt {
+    pub document_id: String,
+    pub corpus: String,
+    pub filename: String,
+    /// `false` when the identical (corpus, sha256, parse_version) document
+    /// already existed (D-008 dedup).
+    pub created: bool,
+    pub element_count: i64,
+    pub page_count: i32,
 }
 
-// Server-side database operations
+/// Layout metadata for one page raster (or why it cannot be rendered).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageMeta {
+    pub available: bool,
+    /// Raster pixel size (only when `available`).
+    pub width_px: u32,
+    pub height_px: u32,
+    /// Page size in PDF points (only when `available`).
+    pub width_pts: f32,
+    pub height_pts: f32,
+    /// Human-readable reason when `available == false`.
+    pub reason: Option<String>,
+}
+
+/// One element overlay: everything the viewer needs to draw a bbox and show
+/// the "discover mode" side panel. Payload bytes (image/blob) are never
+/// included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElementOverlay {
+    pub id: String,
+    /// `text` | `image` | `annotation` | `path` | `figure` | `blob`.
+    pub kind: String,
+    /// 1-based store page number.
+    pub page: i32,
+    pub order_idx: i32,
+    /// (x0, y0, x1, y1) in top-left PDF points.
+    pub bbox: Option<(f32, f32, f32, f32)>,
+    pub text: Option<String>,
+    pub font_size: Option<f32>,
+    pub font_name: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Result of executing a DocQL template against a stored document.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemplateRun {
+    pub ok: bool,
+    /// Outputs JSON (pretty) when `ok`.
+    pub output: Option<String>,
+    /// Readable error message (anyhow chain, no backtrace) when `!ok`.
+    pub error: Option<String>,
+}
+
+// ───────────────────────── server-side implementation ─────────────────────────
+
 #[cfg(feature = "ssr")]
-impl PdfDocument {
-    pub async fn create(
-        pool: &SqlitePool,
-        name: String,
-        pdf_data: Vec<u8>,
-        total_pages: usize,
-    ) -> Result<PdfDocument, sqlx::Error> {
-        let id = Uuid::new_v4();
-        let created_at = chrono::Utc::now();
+pub use server::*;
 
-        sqlx::query(
-            "INSERT INTO documents (id, name, total_pages, pdf_data, created_at) VALUES (?, ?, ?, ?, ?)"
-        )
-        .bind(id.to_string())
-        .bind(&name)
-        .bind(total_pages as i32)
-        .bind(&pdf_data)
-        .bind(created_at)
-        .execute(pool)
-        .await?;
+#[cfg(feature = "ssr")]
+mod server {
+    use super::{DocumentSummary, ElementOverlay, PageMeta, UploadReceipt};
+    use anyhow::{anyhow, Context, Result};
+    use delver_store::{DelverStore, DocumentId, ElementRow};
+    use sha2::{Digest, Sha256};
+    use sqlx::Row;
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use tokio::sync::OnceCell;
+    use uuid::Uuid;
 
-        Ok(PdfDocument {
+    /// The viewer's DEDICATED local dev database (DV-007): parallel worktrees
+    /// must not share a database — the migrations table is shared mutable
+    /// state, and the embedded migrator (correctly) refuses a database that
+    /// carries migrations this checkout doesn't know about.
+    pub const DEFAULT_DB_URL: &str = "postgres://delver:delver@localhost:5433/delver_viewer";
+    /// Default corpus for documents ingested through the viewer.
+    pub const DEFAULT_CORPUS: &str = "viewer-dev";
+    /// Raster DPI (PDF default is 72; 150 matches the previous SQLite store).
+    const RASTER_SCALE: f32 = 150.0 / 72.0;
+    /// Max page rasters held in memory (DV-003).
+    const RASTER_CACHE_CAP: usize = 32;
+    /// Viewer ingests are parse_version 1 (dedup key component, D-008).
+    const PARSE_VERSION: i32 = 1;
+
+    static STORE: OnceCell<DelverStore> = OnceCell::const_new();
+
+    /// Resolve the database URL: `DATABASE_URL` env > local dev default.
+    pub fn db_url() -> String {
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_string())
+    }
+
+    /// Shared store handle (connects once; `DelverStore::connect` runs the
+    /// embedded migrations).
+    pub async fn store() -> Result<&'static DelverStore> {
+        STORE
+            .get_or_try_init(|| async {
+                let url = db_url();
+                DelverStore::connect(&url)
+                    .await
+                    .with_context(|| format!("connecting to Postgres at {url}"))
+            })
+            .await
+    }
+
+    /// Byte-cache directory: `DELVER_DOC_CACHE` env > `~/.delver/doc-cache`.
+    pub fn doc_cache_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("DELVER_DOC_CACHE") {
+            return PathBuf::from(dir);
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        Path::new(&home).join(".delver").join("doc-cache")
+    }
+
+    /// Cache path for a document's original bytes: `<dir>/<sha256-hex>.pdf`.
+    pub fn doc_cache_path(dir: &Path, sha256_hex: &str) -> PathBuf {
+        dir.join(format!("{sha256_hex}.pdf"))
+    }
+
+    /// Display name precedence: PDF Info title > URI basename > short id.
+    pub fn display_name(title: Option<&str>, uri: Option<&str>, id: &str) -> String {
+        if let Some(title) = title {
+            let title = title.trim();
+            if !title.is_empty() {
+                return title.to_string();
+            }
+        }
+        if let Some(uri) = uri {
+            if let Some(base) = uri.rsplit('/').next() {
+                let base = base.trim();
+                if !base.is_empty() {
+                    return base.to_string();
+                }
+            }
+        }
+        format!("document {}", &id[..id.len().min(8)])
+    }
+
+    fn parse_doc_id(doc_id: &str) -> Result<DocumentId> {
+        Uuid::parse_str(doc_id)
+            .map(DocumentId)
+            .map_err(|e| anyhow!("invalid document id {doc_id:?}: {e}"))
+    }
+
+    // ── document listing ─────────────────────────────────────────────────
+
+    const SUMMARY_SELECT: &str = "SELECT d.id::text AS id, c.name AS corpus, d.uri, \
+            d.page_count, d.parse_version, d.parsed_at, \
+            d.metadata->>'title' AS title \
+       FROM documents d JOIN corpora c ON c.id = d.corpus_id";
+
+    fn summary_from_row(row: &sqlx::postgres::PgRow) -> Result<DocumentSummary> {
+        let id: String = row.try_get("id")?;
+        let uri: Option<String> = row.try_get("uri")?;
+        let title: Option<String> = row.try_get("title")?;
+        let has_source = uri
+            .as_deref()
+            .map(|u| Path::new(u).is_file())
+            .unwrap_or(false);
+        Ok(DocumentSummary {
+            name: display_name(title.as_deref(), uri.as_deref(), &id),
+            corpus: row.try_get("corpus")?,
+            page_count: row.try_get("page_count")?,
+            parse_version: row.try_get("parse_version")?,
+            parsed_at: row.try_get("parsed_at")?,
+            has_source,
+            uri,
             id,
-            name,
-            total_pages,
-            created_at,
-            pdf_data: Some(pdf_data),
         })
     }
 
-    pub async fn get_by_id(
-        pool: &SqlitePool,
-        id: Uuid,
-    ) -> Result<Option<PdfDocument>, sqlx::Error> {
-        let result = sqlx::query(
-            "SELECT id, name, total_pages, pdf_data, created_at FROM documents WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_optional(pool)
-        .await?;
-
-        if let Some(row) = result {
-            let id = Uuid::parse_str(&row.get::<String, _>("id"))
-                .map_err(|e| sqlx::Error::Protocol(format!("Invalid UUID: {}", e)))?;
-            Ok(Some(PdfDocument {
-                id,
-                name: row.get("name"),
-                total_pages: row.get::<i32, _>("total_pages") as usize,
-                created_at: row.get("created_at"),
-                pdf_data: Some(row.get("pdf_data")),
-            }))
-        } else {
-            Ok(None)
-        }
+    /// All documents (joined with corpus name), newest first.
+    pub async fn list_documents() -> Result<Vec<DocumentSummary>> {
+        let store = store().await?;
+        let sql = format!("{SUMMARY_SELECT} ORDER BY d.parsed_at DESC");
+        let rows = sqlx::query(&sql).fetch_all(store.pool()).await?;
+        rows.iter().map(summary_from_row).collect()
     }
 
-    pub async fn get_all(pool: &SqlitePool) -> Result<Vec<PdfDocument>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT id, name, total_pages, created_at FROM documents ORDER BY created_at DESC",
-        )
-        .fetch_all(pool)
-        .await?;
-
-        let mut documents = Vec::new();
-        for row in rows {
-            let id = Uuid::parse_str(&row.get::<String, _>("id"))
-                .map_err(|e| sqlx::Error::Protocol(format!("Invalid UUID: {}", e)))?;
-            documents.push(PdfDocument {
-                id,
-                name: row.get("name"),
-                total_pages: row.get::<i32, _>("total_pages") as usize,
-                created_at: row.get("created_at"),
-                pdf_data: None, // Don't load PDF data for list view
-            });
-        }
-        Ok(documents)
-    }
-
-    pub async fn delete(pool: &SqlitePool, id: Uuid) -> Result<bool, sqlx::Error> {
-        // Delete associated pages first
-        sqlx::query("DELETE FROM document_pages WHERE document_id = ?")
-            .bind(id.to_string())
-            .execute(pool)
+    /// One document summary by id.
+    pub async fn document_summary(doc_id: &str) -> Result<Option<DocumentSummary>> {
+        let store = store().await?;
+        let id = parse_doc_id(doc_id)?;
+        let sql = format!("{SUMMARY_SELECT} WHERE d.id = $1");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(store.pool())
             .await?;
-
-        // Delete the document
-        let result = sqlx::query("DELETE FROM documents WHERE id = ?")
-            .bind(id.to_string())
-            .execute(pool)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-}
-
-#[cfg(feature = "ssr")]
-impl DocumentPage {
-    pub async fn create(
-        pool: &SqlitePool,
-        document_id: Uuid,
-        page_index: usize,
-        image_data: Vec<u8>,
-        width: f32,
-        height: f32,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT OR REPLACE INTO document_pages (document_id, page_index, image_data, width, height) VALUES (?, ?, ?, ?, ?)"
-        )
-        .bind(document_id.to_string())
-        .bind(page_index as i32)
-        .bind(&image_data)
-        .bind(width)
-        .bind(height)
-        .execute(pool)
-        .await?;
-
-        Ok(())
+        row.as_ref().map(summary_from_row).transpose()
     }
 
-    pub async fn get_by_document_and_page(
-        pool: &SqlitePool,
-        document_id: Uuid,
-        page_index: usize,
-    ) -> Result<Option<DocumentPage>, sqlx::Error> {
-        let result = sqlx::query(
-            "SELECT page_index, image_data, width, height FROM document_pages WHERE document_id = ? AND page_index = ?"
-        )
-        .bind(document_id.to_string())
-        .bind(page_index as i32)
-        .fetch_optional(pool)
-        .await?;
+    // ── upload / ingest ──────────────────────────────────────────────────
 
-        let parsed_result = if let Some(row) = result {
-            Some(DocumentPage {
-                page_index: row.get::<i32, _>("page_index") as usize,
-                image_data: row.get("image_data"),
-                width: row.get("width"),
-                height: row.get("height"),
-            })
-        } else {
-            None
+    /// Write `bytes` to the byte-cache and ingest into `corpus` with the
+    /// cache path as the document URI (DV-002). Idempotent end to end:
+    /// the cache write is keyed by content hash and the store dedups on
+    /// (corpus, sha256, parse_version) (D-008).
+    pub async fn ingest_upload(
+        filename: &str,
+        corpus: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<UploadReceipt> {
+        if bytes.is_empty() {
+            return Err(anyhow!("no file content received"));
+        }
+        let corpus = match corpus.map(str::trim) {
+            Some(c) if !c.is_empty() => c.to_string(),
+            _ => DEFAULT_CORPUS.to_string(),
         };
-        Ok(parsed_result)
+        let sha_hex = format!("{:x}", Sha256::digest(&bytes));
+        let cache_dir = doc_cache_dir();
+        let cache_path = doc_cache_path(&cache_dir, &sha_hex);
+
+        // Persist original bytes locally so pages can be rasterized later.
+        let write_path = cache_path.clone();
+        let write_bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            std::fs::create_dir_all(write_path.parent().expect("cache path has parent"))?;
+            if !write_path.exists() {
+                std::fs::write(&write_path, &write_bytes)
+                    .with_context(|| format!("writing byte-cache {}", write_path.display()))?;
+            }
+            Ok(())
+        })
+        .await
+        .context("byte-cache task panicked")??;
+
+        let store = store().await?;
+        let corpus_id = store.ensure_corpus(&corpus).await?;
+        let uri = cache_path.to_string_lossy().to_string();
+        let outcome = store
+            .ingest_document(corpus_id, Some(&uri), &bytes, PARSE_VERSION)
+            .await
+            .context("ingesting document")?;
+        let element_count = store.element_count(outcome.document_id).await?;
+
+        let page_count: i32 =
+            sqlx::query_scalar("SELECT page_count FROM documents WHERE id = $1")
+                .bind(outcome.document_id)
+                .fetch_one(store.pool())
+                .await?;
+
+        Ok(UploadReceipt {
+            document_id: outcome.document_id.to_string(),
+            corpus,
+            filename: filename.to_string(),
+            created: outcome.created,
+            element_count,
+            page_count,
+        })
     }
 
-    pub async fn get_all_for_document(
-        pool: &SqlitePool,
-        document_id: Uuid,
-    ) -> Result<HashMap<usize, DocumentPage>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT page_index, image_data, width, height FROM document_pages WHERE document_id = ? ORDER BY page_index"
-        )
-        .bind(document_id.to_string())
-        .fetch_all(pool)
-        .await?;
+    // ── page elements (overlays) ─────────────────────────────────────────
 
-        let mut pages = HashMap::new();
-        for row in rows {
-            let page = DocumentPage {
-                page_index: row.get::<i32, _>("page_index") as usize,
-                image_data: row.get("image_data"),
-                width: row.get("width"),
-                height: row.get("height"),
-            };
-            pages.insert(page.page_index, page);
+    /// Elements on one page (0-based viewer index → 1-based store page),
+    /// payload bytes stripped. Uses the store's GiST page query with an
+    /// effectively-infinite rectangle — per-page element listing without
+    /// adding store API (boundary rule), see DV-004.
+    pub async fn page_elements(doc_id: &str, page_index: usize) -> Result<Vec<ElementOverlay>> {
+        let store = store().await?;
+        let id = parse_doc_id(doc_id)?;
+        let page = page_index as i32 + 1;
+        let rows = store
+            .elements_in_bbox(id, page, -1e9, -1e9, 1e9, 1e9)
+            .await?;
+        Ok(rows.iter().map(overlay_from_row).collect())
+    }
+
+    fn overlay_from_row(row: &ElementRow) -> ElementOverlay {
+        ElementOverlay {
+            id: row.id.to_string(),
+            kind: row.kind.as_str().to_string(),
+            page: row.page,
+            order_idx: row.order_idx,
+            bbox: row.bbox,
+            text: row.text.clone(),
+            font_size: row.font_size,
+            font_name: row.font_name.clone(),
+            metadata: row.metadata.clone(),
         }
-        Ok(pages)
     }
-}
 
-// Database initialization
-#[cfg(feature = "ssr")]
-pub async fn create_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    // Create documents table
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS documents (
-            id TEXT PRIMARY KEY NOT NULL,
-            name TEXT NOT NULL,
-            total_pages INTEGER NOT NULL,
-            pdf_data BLOB NOT NULL,
-            created_at DATETIME NOT NULL
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+    // ── page rasters ─────────────────────────────────────────────────────
 
-    // Create document_pages table
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS document_pages (
-            document_id TEXT NOT NULL,
-            page_index INTEGER NOT NULL,
-            image_data BLOB NOT NULL,
-            width REAL NOT NULL,
-            height REAL NOT NULL,
-            PRIMARY KEY (document_id, page_index),
-            FOREIGN KEY (document_id) REFERENCES documents (id) ON DELETE CASCADE
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+    /// A cached raster (or a cached "cannot render" verdict).
+    #[derive(Clone)]
+    pub enum PageRaster {
+        Rendered {
+            webp: Vec<u8>,
+            width_px: u32,
+            height_px: u32,
+            width_pts: f32,
+            height_pts: f32,
+        },
+        Unavailable {
+            reason: String,
+        },
+    }
 
-    Ok(())
-}
+    impl PageRaster {
+        pub fn meta(&self) -> PageMeta {
+            match self {
+                PageRaster::Rendered {
+                    width_px,
+                    height_px,
+                    width_pts,
+                    height_pts,
+                    ..
+                } => PageMeta {
+                    available: true,
+                    width_px: *width_px,
+                    height_px: *height_px,
+                    width_pts: *width_pts,
+                    height_pts: *height_pts,
+                    reason: None,
+                },
+                PageRaster::Unavailable { reason } => PageMeta {
+                    available: false,
+                    width_px: 0,
+                    height_px: 0,
+                    width_pts: 0.0,
+                    height_pts: 0.0,
+                    reason: Some(reason.clone()),
+                },
+            }
+        }
+    }
 
-// Connection pool utilities
-#[cfg(feature = "ssr")]
-pub async fn get_database_pool() -> Result<SqlitePool, sqlx::Error> {
-    use sqlx::sqlite::SqliteConnectOptions;
-    use std::str::FromStr;
+    /// Minimal LRU: HashMap + recency queue, capped at `cap` (DV-003).
+    pub struct LruCache<K, V> {
+        cap: usize,
+        map: HashMap<K, V>,
+        recency: VecDeque<K>,
+    }
 
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:delver.db".to_string());
+    impl<K: std::hash::Hash + Eq + Clone, V: Clone> LruCache<K, V> {
+        pub fn new(cap: usize) -> Self {
+            Self {
+                cap: cap.max(1),
+                map: HashMap::new(),
+                recency: VecDeque::new(),
+            }
+        }
 
-    // Parse the database URL and ensure the file is created if it doesn't exist
-    let connect_options = SqliteConnectOptions::from_str(&database_url)?.create_if_missing(true);
+        pub fn get(&mut self, key: &K) -> Option<V> {
+            if let Some(value) = self.map.get(key) {
+                let value = value.clone();
+                self.touch(key);
+                Some(value)
+            } else {
+                None
+            }
+        }
 
-    let pool = SqlitePool::connect_with(connect_options).await?;
-    create_tables(&pool).await?;
+        pub fn put(&mut self, key: K, value: V) {
+            if self.map.insert(key.clone(), value).is_none() && self.map.len() > self.cap {
+                if let Some(oldest) = self.recency.pop_front() {
+                    self.map.remove(&oldest);
+                }
+            }
+            self.touch(&key);
+        }
 
-    Ok(pool)
+        pub fn len(&self) -> usize {
+            self.map.len()
+        }
+
+        fn touch(&mut self, key: &K) {
+            self.recency.retain(|k| k != key);
+            self.recency.push_back(key.clone());
+        }
+    }
+
+    static RASTER_CACHE: Mutex<Option<LruCache<(Uuid, usize), PageRaster>>> = Mutex::new(None);
+
+    fn cache_get(key: &(Uuid, usize)) -> Option<PageRaster> {
+        let mut guard = RASTER_CACHE.lock().expect("raster cache poisoned");
+        guard
+            .get_or_insert_with(|| LruCache::new(RASTER_CACHE_CAP))
+            .get(key)
+    }
+
+    fn cache_put(key: (Uuid, usize), value: PageRaster) {
+        let mut guard = RASTER_CACHE.lock().expect("raster cache poisoned");
+        guard
+            .get_or_insert_with(|| LruCache::new(RASTER_CACHE_CAP))
+            .put(key, value);
+    }
+
+    /// Raster for one page, from cache or rendered on demand from the
+    /// byte-cache file referenced by the document's `uri`. Documents without
+    /// a usable `uri` yield `PageRaster::Unavailable` (never an error) so the
+    /// UI can show a placeholder (DV-002).
+    pub async fn page_raster(doc_id: &str, page_index: usize) -> Result<PageRaster> {
+        let id = parse_doc_id(doc_id)?;
+        let key = (id.into_uuid(), page_index);
+        if let Some(hit) = cache_get(&key) {
+            return Ok(hit);
+        }
+
+        let store = store().await?;
+        let row: Option<(Option<String>, i32)> =
+            sqlx::query_as("SELECT uri, page_count FROM documents WHERE id = $1")
+                .bind(id)
+                .fetch_optional(store.pool())
+                .await?;
+        let Some((uri, page_count)) = row else {
+            return Err(anyhow!("unknown document {doc_id}"));
+        };
+        if page_index as i32 >= page_count {
+            return Err(anyhow!(
+                "page {page_index} out of range (document has {page_count} pages)"
+            ));
+        }
+
+        let raster = match uri.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            None => PageRaster::Unavailable {
+                reason: "original bytes not available — re-ingest with the viewer \
+                         or pass --uri at index time"
+                    .to_string(),
+            },
+            Some(uri) if !Path::new(uri).is_file() => PageRaster::Unavailable {
+                reason: format!(
+                    "original bytes not available — uri {uri:?} is not a readable file; \
+                     re-ingest with the viewer or pass --uri at index time"
+                ),
+            },
+            Some(uri) => {
+                let path = uri.to_string();
+                tokio::task::spawn_blocking(move || render_pdf_page(&path, page_index))
+                    .await
+                    .context("raster task panicked")??
+            }
+        };
+
+        cache_put(key, raster.clone());
+        Ok(raster)
+    }
+
+    /// Rasterize one page with pdfium and encode it as WebP. Blocking; call
+    /// from `spawn_blocking`.
+    fn render_pdf_page(path: &str, page_index: usize) -> Result<PageRaster> {
+        use image::{ImageBuffer, ImageFormat, RgbaImage};
+        use pdfium_render::prelude::*;
+        use std::io::Cursor;
+
+        let pdfium = bind_pdfium()?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading byte-cache file {path}"))?;
+        let document = pdfium
+            .load_pdf_from_byte_slice(&bytes, None)
+            .map_err(|e| anyhow!("failed to load PDF {path}: {e}"))?;
+        let page = document
+            .pages()
+            .get(page_index as u16)
+            .map_err(|e| anyhow!("failed to get page {page_index}: {e}"))?;
+
+        let width_pts = page.width().value;
+        let height_pts = page.height().value;
+        let width_px = (width_pts * RASTER_SCALE) as i32;
+        let height_px = (height_pts * RASTER_SCALE) as i32;
+
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(width_px)
+            .set_target_height(height_px)
+            .use_lcd_text_rendering(true)
+            .render_annotations(true)
+            .render_form_data(false);
+        let bitmap = page
+            .render_with_config(&render_config)
+            .map_err(|e| anyhow!("failed to render page {page_index}: {e}"))?;
+        let rgba = bitmap.as_rgba_bytes();
+        let (width_px, height_px) = (bitmap.width() as u32, bitmap.height() as u32);
+
+        let img: RgbaImage = ImageBuffer::from_raw(width_px, height_px, rgba)
+            .ok_or_else(|| anyhow!("rendered page has inconsistent buffer size"))?;
+        let mut webp = Vec::new();
+        img.write_to(&mut Cursor::new(&mut webp), ImageFormat::WebP)
+            .context("encoding WebP")?;
+
+        Ok(PageRaster::Rendered {
+            webp,
+            width_px,
+            height_px,
+            width_pts,
+            height_pts,
+        })
+    }
+
+    /// Bind pdfium the same way the start scripts arrange it: runtime
+    /// `PDFIUM_LIBRARY_PATH` > compile-time path from build.rs > `./` >
+    /// system library (DV-005).
+    fn bind_pdfium() -> Result<pdfium_render::prelude::Pdfium> {
+        use pdfium_render::prelude::*;
+        let configured = std::env::var("PDFIUM_LIBRARY_PATH")
+            .ok()
+            .or_else(|| option_env!("PDFIUM_LIBRARY_PATH").map(str::to_string));
+        let bindings = match configured {
+            Some(dir) => {
+                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+                    .or_else(|_| {
+                        Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
+                    })
+                    .or_else(|_| Pdfium::bind_to_system_library())
+            }
+            None => Pdfium::bind_to_system_library(),
+        }
+        .map_err(|e| anyhow!("failed to bind pdfium library: {e}"))?;
+        Ok(Pdfium::new(bindings))
+    }
+
+    // ── template execution ───────────────────────────────────────────────
+
+    /// Execute DocQL template source against a stored document via the same
+    /// path the CLI `query --doc` uses: load rows → `hydrate_pages` →
+    /// `process_parsed` (D-012). Embedder comes from `DELVER_EMBED_ENDPOINT`
+    /// (DV-006); no tokenizer (character-based chunking) this slice.
+    pub async fn execute_template(doc_id: &str, template: &str) -> Result<String> {
+        let store = store().await?;
+        let id = parse_doc_id(doc_id)?;
+        let loaded = store.load_document(id).await?;
+        if loaded.elements.is_empty() {
+            return Err(anyhow!(
+                "document {doc_id} has no stored elements (unknown id or empty document)"
+            ));
+        }
+        let template = template.to_string();
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let pages = delver_store::hydrate_pages(&loaded.elements);
+            let mut match_context = delver_core::layout::MatchContext::default();
+            match_context.embedder = embedder_from_env()?.into();
+            delver_core::process_parsed(&pages, &match_context, &template, None)
+        })
+        .await
+        .context("template task panicked")?
+    }
+
+    /// `DELVER_EMBED_ENDPOINT` passthrough → Databricks serving embedder
+    /// (same env contract as the CLI's `build_embedder`, D-015). `None`
+    /// when unset, so EmbeddingSim templates fail loud (D-006).
+    fn embedder_from_env(
+    ) -> Result<Option<std::sync::Arc<dyn delver_core::embed::Embedder>>> {
+        match std::env::var("DELVER_EMBED_ENDPOINT") {
+            Err(_) => Ok(None),
+            Ok(endpoint) if endpoint.trim().is_empty() => Ok(None),
+            Ok(endpoint) => {
+                let embedder = delver_embed::DatabricksEmbedder::new(&endpoint)
+                    .map_err(|e| anyhow!("configuring embedding endpoint {endpoint:?}: {e}"))?;
+                Ok(Some(std::sync::Arc::new(embedder)))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn display_name_prefers_title_then_uri_basename_then_id() {
+            assert_eq!(
+                display_name(Some("3M 10-K"), Some("/x/y.pdf"), "abcdef12-3456"),
+                "3M 10-K"
+            );
+            assert_eq!(
+                display_name(Some("   "), Some("/x/deadbeef.pdf"), "abcdef12-3456"),
+                "deadbeef.pdf"
+            );
+            assert_eq!(
+                display_name(None, None, "abcdef12-3456"),
+                "document abcdef12"
+            );
+            assert_eq!(
+                display_name(None, Some("mem://synthetic.pdf"), "abcdef12-3456"),
+                "synthetic.pdf"
+            );
+        }
+
+        #[test]
+        fn doc_cache_path_is_sha_keyed() {
+            let p = doc_cache_path(Path::new("/tmp/cache"), "00ff");
+            assert_eq!(p, PathBuf::from("/tmp/cache/00ff.pdf"));
+        }
+
+        #[test]
+        fn lru_caps_and_evicts_least_recently_used() {
+            let mut lru: LruCache<u32, u32> = LruCache::new(2);
+            lru.put(1, 10);
+            lru.put(2, 20);
+            assert_eq!(lru.get(&1), Some(10)); // refresh 1 → 2 is now oldest
+            lru.put(3, 30); // evicts 2
+            assert_eq!(lru.len(), 2);
+            assert_eq!(lru.get(&2), None);
+            assert_eq!(lru.get(&1), Some(10));
+            assert_eq!(lru.get(&3), Some(30));
+        }
+
+        #[test]
+        fn lru_overwrite_does_not_evict() {
+            let mut lru: LruCache<u32, u32> = LruCache::new(2);
+            lru.put(1, 10);
+            lru.put(2, 20);
+            lru.put(2, 21); // overwrite, not insert
+            assert_eq!(lru.len(), 2);
+            assert_eq!(lru.get(&1), Some(10));
+            assert_eq!(lru.get(&2), Some(21));
+        }
+    }
 }

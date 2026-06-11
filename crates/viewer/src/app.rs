@@ -60,7 +60,9 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 pub fn App() -> impl IntoView {
     provide_meta_context();
 
-    let (show_sidebar, set_show_sidebar) = signal(false);
+    // Sidebar (document list) starts open; query panel opens on demand or
+    // via ?template=…&run=1 deep links (see QueryParamSync).
+    let (show_sidebar, set_show_sidebar) = signal(true);
     let (show_query, set_show_query) = signal(false);
 
     provide_context(SidebarContext(show_sidebar, set_show_sidebar));
@@ -68,6 +70,7 @@ pub fn App() -> impl IntoView {
 
     view! {
         <Router>
+            <QueryParamSync />
             <div class="h-screen flex flex-col bg-gray-50">
                 <MainNav />
                 <div class="flex flex-1 overflow-hidden">
@@ -86,6 +89,20 @@ pub fn App() -> impl IntoView {
             </div>
         </Router>
     }
+}
+
+/// Opens the query panel when the URL carries a template deep link
+/// (`?template=…[&run=1]`). Must live inside `<Router>` so the query map is
+/// available; runs during SSR so deep links render server-side.
+#[component]
+fn QueryParamSync() -> impl IntoView {
+    let QueryContext(_, set_show_query) =
+        use_context::<QueryContext>().expect("query context in QueryParamSync");
+    let params = leptos_router::hooks::use_query_map();
+    if params.get_untracked().get("template").is_some() {
+        set_show_query.set(true);
+    }
+    ().into_view()
 }
 
 #[component]

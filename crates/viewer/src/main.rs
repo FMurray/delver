@@ -1,6 +1,132 @@
+//! Viewer server: Leptos SSR app plus a small plain-JSON REST surface
+//! (`/api/v/...`) over the same service layer, so the store can be driven
+//! with curl and page images load as ordinary `<img>` requests (DV-004).
+
+#[cfg(feature = "ssr")]
+mod rest {
+    use axum::extract::{Path, Query};
+    use axum::http::{header, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use viewer::store;
+
+    fn json_error(status: StatusCode, message: String) -> Response {
+        let body = serde_json::json!({ "error": message }).to_string();
+        (
+            status,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    }
+
+    fn json_ok<T: serde::Serialize>(value: &T) -> Response {
+        match serde_json::to_string(value) {
+            Ok(body) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serializing response: {e}"),
+            ),
+        }
+    }
+
+    /// GET /api/v/docs — all documents joined with their corpus.
+    pub async fn list_documents() -> Response {
+        match store::list_documents().await {
+            Ok(docs) => json_ok(&docs),
+            Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        }
+    }
+
+    /// GET /api/v/docs/{doc_id} — one document summary.
+    pub async fn document(Path(doc_id): Path<String>) -> Response {
+        match store::document_summary(&doc_id).await {
+            Ok(Some(doc)) => json_ok(&doc),
+            Ok(None) => json_error(
+                StatusCode::NOT_FOUND,
+                format!("unknown document {doc_id}"),
+            ),
+            Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
+    }
+
+    /// GET /api/v/docs/{doc_id}/pages/{page}/elements — overlay JSON
+    /// (page is the 0-based viewer index).
+    pub async fn page_elements(Path((doc_id, page)): Path<(String, usize)>) -> Response {
+        match store::page_elements(&doc_id, page).await {
+            Ok(elements) => json_ok(&elements),
+            Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
+    }
+
+    /// GET /api/v/docs/{doc_id}/pages/{page}/image.webp — on-demand raster
+    /// from the byte-cache; 404 with a reason when the source is missing.
+    pub async fn page_image(Path((doc_id, page)): Path<(String, usize)>) -> Response {
+        match store::page_raster(&doc_id, page).await {
+            Ok(store::PageRaster::Rendered { webp, .. }) => (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "image/webp"),
+                    (header::CACHE_CONTROL, "private, max-age=300"),
+                ],
+                webp,
+            )
+                .into_response(),
+            Ok(store::PageRaster::Unavailable { reason }) => {
+                json_error(StatusCode::NOT_FOUND, reason)
+            }
+            Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
+    }
+
+    /// GET /api/v/docs/{doc_id}/pages/{page}/meta — raster layout metadata.
+    pub async fn page_meta(Path((doc_id, page)): Path<(String, usize)>) -> Response {
+        match store::page_raster(&doc_id, page).await {
+            Ok(raster) => json_ok(&raster.meta()),
+            Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
+    }
+
+    /// POST /api/v/docs/{doc_id}/template — body is DocQL source; returns the
+    /// outputs JSON, or 422 with a readable error (fail-loud matchers, D-006).
+    pub async fn run_template(Path(doc_id): Path<String>, template: String) -> Response {
+        match store::execute_template(&doc_id, &template).await {
+            Ok(output) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                output,
+            )
+                .into_response(),
+            Err(e) => json_error(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")),
+        }
+    }
+
+    /// POST /api/v/upload?corpus=viewer-dev&filename=doc.pdf — body is the
+    /// raw PDF bytes; ingests into the store + byte-cache (DV-002).
+    pub async fn upload(Query(params): Query<HashMap<String, String>>, body: Bytes) -> Response {
+        let filename = params
+            .get("filename")
+            .cloned()
+            .unwrap_or_else(|| "upload.pdf".to_string());
+        let corpus = params.get("corpus").map(String::as_str);
+        match store::ingest_upload(&filename, corpus, body.to_vec()).await {
+            Ok(receipt) => json_ok(&receipt),
+            Err(e) => json_error(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")),
+        }
+    }
+}
+
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
+    use axum::extract::DefaultBodyLimit;
+    use axum::routing::{get, post};
     use axum::Router;
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, LeptosRoutes};
@@ -13,214 +139,38 @@ async fn main() {
     let routes = generate_route_list(App);
 
     let app = Router::new()
+        .route("/api/v/docs", get(rest::list_documents))
+        .route("/api/v/docs/{doc_id}", get(rest::document))
+        .route(
+            "/api/v/docs/{doc_id}/pages/{page}/elements",
+            get(rest::page_elements),
+        )
+        .route(
+            "/api/v/docs/{doc_id}/pages/{page}/image.webp",
+            get(rest::page_image),
+        )
+        .route(
+            "/api/v/docs/{doc_id}/pages/{page}/meta",
+            get(rest::page_meta),
+        )
+        .route("/api/v/docs/{doc_id}/template", post(rest::run_template))
+        .route("/api/v/upload", post(rest::upload))
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())
         })
         .fallback(leptos_axum::file_and_error_handler(shell))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(leptos_options);
 
+    println!("viewer listening on http://{addr} (db: {})", viewer::store::db_url());
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
 }
 
-// async fn docql_lsp_handler(ws: WebSocketUpgrade) -> Response {
-//     ws.on_upgrade(handle_docql_lsp_socket)
-// }
-
-// async fn handle_docql_lsp_socket(socket: WebSocket) {
-//     log!("New DocQL LSP WebSocket connection established");
-
-//     let (mut sender, mut receiver) = socket.split();
-
-//     // Create channels for communication between WebSocket and LSP
-//     let (lsp_sender, mut lsp_receiver) = tokio::sync::mpsc::channel(100);
-//     let (response_sender, mut response_receiver) = tokio::sync::mpsc::channel(100);
-
-//     // Task to handle WebSocket messages and forward to LSP
-//     let ws_to_lsp = tokio::spawn(async move {
-//         while let Some(msg) = receiver.next().await {
-//             match msg {
-//                 Ok(Message::Text(text)) => {
-//                     log!("Received from WebSocket: {}", text);
-//                     if let Ok(request) = serde_json::from_str::<jsonrpc::Request>(&text) {
-//                         if let Err(e) = lsp_sender.send(request).await {
-//                             log!("Failed to send to LSP: {}", e);
-//                             break;
-//                         }
-//                     }
-//                 }
-//                 Ok(Message::Close(_)) => {
-//                     log!("WebSocket connection closed");
-//                     break;
-//                 }
-//                 Err(e) => {
-//                     log!("WebSocket error: {}", e);
-//                     break;
-//                 }
-//                 _ => {}
-//             }
-//         }
-//     });
-
-//     // Task to handle LSP responses and forward to WebSocket
-//     let lsp_to_ws = tokio::spawn(async move {
-//         while let Some(response) = response_receiver.recv().await {
-//             let json_str = serde_json::to_string(&response).unwrap_or_default();
-//             log!("Sending to WebSocket: {}", json_str);
-//             if let Err(e) = sender.send(Message::Text(json_str)).await {
-//                 log!("Failed to send WebSocket message: {}", e);
-//                 break;
-//             }
-//         }
-//     });
-
-//     // Simple LSP handler that processes requests manually
-//     tokio::spawn(async move {
-//         let server = DocQLLanguageServer::new(MockClient {
-//             sender: response_sender,
-//         });
-
-//         while let Some(request) = lsp_receiver.recv().await {
-//             log!("Processing LSP request: {}", request.method);
-
-//             let response = match request.method.as_str() {
-//                 "initialize" => {
-//                     if let Ok(params) = serde_json::from_value(request.params.unwrap_or_default()) {
-//                         match server.initialize(params).await {
-//                             Ok(result) => Some(jsonrpc::Response::ok(request.id, result)),
-//                             Err(e) => Some(jsonrpc::Response::error(request.id, e)),
-//                         }
-//                     } else {
-//                         Some(jsonrpc::Response::error(
-//                             request.id,
-//                             jsonrpc::Error::invalid_params(),
-//                         ))
-//                     }
-//                 }
-//                 "initialized" => {
-//                     if let Ok(params) = serde_json::from_value(request.params.unwrap_or_default()) {
-//                         server.initialized(params).await;
-//                     }
-//                     None // No response for notification
-//                 }
-//                 "textDocument/didOpen" => {
-//                     if let Ok(params) = serde_json::from_value(request.params.unwrap_or_default()) {
-//                         server.did_open(params).await;
-//                     }
-//                     None // No response for notification
-//                 }
-//                 "textDocument/didChange" => {
-//                     if let Ok(params) = serde_json::from_value(request.params.unwrap_or_default()) {
-//                         server.did_change(params).await;
-//                     }
-//                     None // No response for notification
-//                 }
-//                 "textDocument/completion" => {
-//                     if let Ok(params) = serde_json::from_value(request.params.unwrap_or_default()) {
-//                         match server.completion(params).await {
-//                             Ok(result) => Some(jsonrpc::Response::ok(request.id, result)),
-//                             Err(e) => Some(jsonrpc::Response::error(request.id, e)),
-//                         }
-//                     } else {
-//                         Some(jsonrpc::Response::error(
-//                             request.id,
-//                             jsonrpc::Error::invalid_params(),
-//                         ))
-//                     }
-//                 }
-//                 "textDocument/hover" => {
-//                     if let Ok(params) = serde_json::from_value(request.params.unwrap_or_default()) {
-//                         match server.hover(params).await {
-//                             Ok(result) => Some(jsonrpc::Response::ok(request.id, result)),
-//                             Err(e) => Some(jsonrpc::Response::error(request.id, e)),
-//                         }
-//                     } else {
-//                         Some(jsonrpc::Response::error(
-//                             request.id,
-//                             jsonrpc::Error::invalid_params(),
-//                         ))
-//                     }
-//                 }
-//                 "shutdown" => match server.shutdown().await {
-//                     Ok(result) => Some(jsonrpc::Response::ok(request.id, result)),
-//                     Err(e) => Some(jsonrpc::Response::error(request.id, e)),
-//                 },
-//                 _ => {
-//                     log!("Unhandled LSP method: {}", request.method);
-//                     Some(jsonrpc::Response::error(
-//                         request.id,
-//                         jsonrpc::Error::method_not_found(),
-//                     ))
-//                 }
-//             };
-
-//             if let Some(resp) = response {
-//                 if let Err(e) = server.client.sender.send(resp).await {
-//                     log!("Failed to send response: {}", e);
-//                     break;
-//                 }
-//             }
-//         }
-//     });
-
-//     // Wait for either task to complete
-//     tokio::select! {
-//         _ = ws_to_lsp => {},
-//         _ = lsp_to_ws => {},
-//     }
-// }
-
 #[cfg(not(feature = "ssr"))]
 pub fn main() {
     // no client-side main function
 }
-
-// When compiling to web using trunk:
-// #[cfg(target_arch = "wasm32")]
-// fn main() {
-// use eframe::wasm_bindgen::JsCast as _;
-
-// // Redirect `log` message to `console.log` and friends:
-// eframe::WebLogger::init(log::LevelFilter::Debug).ok();
-
-// let web_options = eframe::WebOptions::default();
-
-// wasm_bindgen_futures::spawn_local(async {
-//     let document = web_sys::window()
-//         .expect("No window")
-//         .document()
-//         .expect("No document");
-
-//     let canvas = document
-//         .get_element_by_id("the_canvas_id")
-//         .expect("Failed to find the_canvas_id")
-//         .dyn_into::<web_sys::HtmlCanvasElement>()
-//         .expect("the_canvas_id was not a HtmlCanvasElement");
-
-//     let start_result = eframe::WebRunner::new()
-//         .start(
-//             canvas,
-//             web_options,
-//             Box::new(|_cc| Ok(Box::new(viewer::app::AppWrapper::new()))),
-//         )
-//         .await;
-
-//     // Remove the loading text and spinner:
-//     if let Some(loading_text) = document.get_element_by_id("loading_text") {
-//         match start_result {
-//             Ok(_) => {
-//                 loading_text.remove();
-//             }
-//             Err(e) => {
-//                 loading_text.set_inner_html(
-//                     "<p> The app has crashed. See the developer console for details. </p>",
-//                 );
-//                 panic!("Failed to start eframe: {e:?}");
-//             }
-//         }
-//     }
-// });
-// }

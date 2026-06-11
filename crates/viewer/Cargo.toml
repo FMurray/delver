@@ -11,6 +11,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 delver-core = { path = "../delver-core" }
+delver-store = { path = "../delver-store", optional = true }
+delver-embed = { path = "../delver-embed", optional = true }
+sha2 = { version = "0.10", optional = true }
 anyhow = "1.0"
 eframe = { version = "0.32", features = ["persistence"] }
 egui = "0.32"
@@ -32,7 +35,7 @@ leptos-use = "0.16.2"
 axum = { version = "0.8.4", optional = true }
 leptos_axum = { version = "0.8.5", optional = true }
 leptos_meta = { version = "0.8.0" }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
 wasm-bindgen = { version = "=0.2.100"}
 console_error_panic_hook = "0.1"
 wasm-bindgen-futures = "0.4"
@@ -41,7 +44,9 @@ web-sys = { version = "0.3", features = ["CanvasRenderingContext2d", "HtmlCanvas
 server_fn = { version = "0.8.5", features = ["serde-lite", "rkyv", "multipart", "postcard"] }
 bytes = "1.6.1"
 chrono = { version = "0.4", features = ["serde"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"], optional = true }
+# Postgres only (SQLite store retired, DV-001). Feature set matches
+# delver-store's so no crates beyond the Cargo.lock pins are needed.
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-native-tls", "chrono", "uuid", "json"], optional = true }
 tower-lsp = "0.20.0"
 futures = "0.3"
 serde_derive = "1.0"
@@ -58,6 +63,9 @@ ssr = [
     "dep:tokio",
     "dep:leptos_axum",
     "dep:sqlx",
+    "dep:delver-store",
+    "dep:delver-embed",
+    "dep:sha2",
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",
@@ -70,8 +78,9 @@ lib-features = ["hydrate"]
 site-root = "crates/viewer/site"
 site-pkg-dir = "pkg"
 tailwind-input-file = "input.css"
-site-addr = "127.0.0.1:3000"
-reload-port = 3001
+# 3000 collides with other local dev servers; the viewer gets its own port.
+site-addr = "127.0.0.1:3017"
+reload-port = 3018
 
 # [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # rfd = "0.14"
