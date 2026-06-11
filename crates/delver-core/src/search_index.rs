@@ -1,7 +1,8 @@
 use crate::{
     layout::{MatchContext, TextLine},
     parse::{
-        ContentHandle, ImageElement, ImageStore, PageContent, PageContents, TextElement, TextStore,
+        AuxStore, ContentHandle, ImageElement, ImageStore, PageContent, PageContents, TextElement,
+        TextStore,
     },
 };
 use lopdf::Object;
@@ -176,6 +177,7 @@ pub struct PdfIndex {
     pub order: Vec<ContentHandle>, // document sequence (SoA handle)
     pub text_store: TextStore,     // SoA payload ‑ text
     pub image_store: ImageStore,   // SoA payload ‑ images
+    pub aux_store: AuxStore,       // annotation/path/figure/blob payload
     pub fonts: HashMap<(String, NotNan<f32>), FontUsage>,
     pub font_name_frequency_index: Vec<(u32, String)>,
     pub font_size_stats: FontSizeStats,
@@ -202,6 +204,7 @@ impl PdfIndex {
         let mut order: Vec<ContentHandle> = Vec::new();
         let mut text_store = TextStore::default();
         let mut image_store = ImageStore::default();
+        let mut aux_store = AuxStore::default();
 
         // NEW: Collect data for statistics
         let mut font_sizes = Vec::new();
@@ -257,6 +260,7 @@ impl PdfIndex {
             // Aggregate SoA data from PageContents
             let text_store_offset = text_store.id.len();
             let image_store_offset = image_store.id.len();
+            let aux_store_offset = aux_store.items.len();
 
             // Copy text and image stores first
             for i in 0..page_contents.text_store.id.len() {
@@ -269,6 +273,9 @@ impl PdfIndex {
                     image_store.push(elem);
                 }
             }
+            for elem in page_contents.aux_store.iter() {
+                aux_store.push(elem.clone());
+            }
 
             // Update ContentHandle indices and add to global order
             for handle in &page_contents.order {
@@ -278,6 +285,9 @@ impl PdfIndex {
                     }
                     ContentHandle::Image(local_idx) => {
                         ContentHandle::Image(image_store_offset + local_idx)
+                    }
+                    ContentHandle::Aux(local_idx) => {
+                        ContentHandle::Aux(aux_store_offset + local_idx)
                     }
                 };
                 order.push(updated_handle);
@@ -347,6 +357,7 @@ impl PdfIndex {
             order,
             text_store,
             image_store,
+            aux_store,
             fonts: fonts_map,
             font_name_frequency_index,
             font_size_stats,
@@ -370,7 +381,17 @@ impl PdfIndex {
             ContentHandle::Image(image_idx) => {
                 self.image_store.get(*image_idx).map(PageContent::Image)
             }
+            ContentHandle::Aux(aux_idx) => self.aux_store.get(*aux_idx).map(PageContent::Aux),
         })
+    }
+
+    /// Borrow the aux element (annotation/path/figure/blob) at a document
+    /// index, if that index holds one.
+    pub fn aux_at(&self, doc_idx: usize) -> Option<&crate::parse::AuxElement> {
+        match self.order.get(doc_idx)? {
+            ContentHandle::Aux(aux_idx) => self.aux_store.items.get(*aux_idx),
+            _ => None,
+        }
     }
 
     // Helper method to get multiple content items efficiently
@@ -664,7 +685,7 @@ impl PdfIndex {
                         // Check if we've exceeded the max_content_index limit
                         if let Some(max_idx) = max_content_index {
                             if doc_idx >= max_idx {
-                                eprintln!("[find_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
+                                tracing::debug!("[find_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
                                 break;
                             }
                         }
@@ -672,7 +693,7 @@ impl PdfIndex {
                         results.push((TextHandle(text_store_idx as u32), score));
                     }
                 } else {
-                    eprintln!(
+                    tracing::debug!(
                         "[find_text_matches] Match found but no doc_idx for text_idx {}",
                         text_store_idx
                     );
@@ -725,7 +746,7 @@ impl PdfIndex {
     pub fn get_text_at(&self, doc_idx: usize) -> Option<TextElement> {
         match self.order.get(doc_idx)? {
             ContentHandle::Text(text_idx) => self.text_store.get(*text_idx),
-            ContentHandle::Image(_) => None,
+            _ => None,
         }
     }
 
@@ -863,7 +884,7 @@ impl PdfIndex {
     fn text_row_to_text_idx(&self, doc_idx: usize) -> Option<usize> {
         match self.order.get(doc_idx)? {
             ContentHandle::Text(text_idx) => Some(*text_idx),
-            ContentHandle::Image(_) => None,
+            _ => None,
         }
     }
 
@@ -1087,34 +1108,34 @@ impl PdfIndex {
         let start_id = start_element.id();
         let end_id = end_element.map(|e| e.id());
 
-        eprintln!(
+        tracing::debug!(
             "[get_elements_between_markers] Looking for start_id: {}",
             start_id
         );
         if let Some(end_id) = end_id {
-            eprintln!(
+            tracing::debug!(
                 "[get_elements_between_markers] Looking for end_id: {}",
                 end_id
             );
         } else {
-            eprintln!("[get_elements_between_markers] No end element specified");
+            tracing::debug!("[get_elements_between_markers] No end element specified");
         }
 
-        eprintln!(
+        tracing::debug!(
             "[get_elements_between_markers] element_id_to_index contains {} mappings",
             self.element_id_to_index.len()
         );
 
         let start_idx_inclusive = match self.element_id_to_index.get(&start_id) {
             Some(&idx) => {
-                eprintln!(
+                tracing::debug!(
                     "[get_elements_between_markers] Found start_id at index: {}",
                     idx
                 );
                 idx
             }
             None => {
-                eprintln!(
+                tracing::debug!(
                     "[get_elements_between_markers] Start element ID {} not found in index",
                     start_id
                 );
@@ -1127,31 +1148,33 @@ impl PdfIndex {
                 let end_id = end.id();
                 match self.element_id_to_index.get(&end_id) {
                     Some(&idx) => {
-                        eprintln!(
+                        tracing::debug!(
                             "[get_elements_between_markers] Found end_id at index: {}",
                             idx
                         );
                         idx // This index is exclusive for the slice
                     }
                     None => {
-                        eprintln!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
+                        tracing::debug!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
                         self.order.len() // End element not found, go to end of document
                     }
                 }
             }
             None => {
-                eprintln!("[get_elements_between_markers] No end element, using document end");
+                tracing::debug!(
+                    "[get_elements_between_markers] No end element, using document end"
+                );
                 self.order.len() // No end element, go to end of document
             }
         };
 
-        eprintln!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
+        tracing::debug!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
                  start_idx_inclusive, end_idx_exclusive, self.order.len());
 
         // Now, start_idx_inclusive will be used directly for the slice start.
         // Ensure start_idx_inclusive is not past end_idx_exclusive or bounds.
         if start_idx_inclusive >= end_idx_exclusive || start_idx_inclusive >= self.order.len() {
-            eprintln!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
+            tracing::debug!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
                      start_idx_inclusive, end_idx_exclusive, self.order.len());
             return Vec::new();
         }
@@ -1159,15 +1182,16 @@ impl PdfIndex {
         // Ensure the slice end is within bounds.
         let effective_end_idx = std::cmp::min(end_idx_exclusive, self.order.len());
 
-        eprintln!(
+        tracing::debug!(
             "[get_elements_between_markers] Effective slice: [{}..{}]",
-            start_idx_inclusive, effective_end_idx
+            start_idx_inclusive,
+            effective_end_idx
         );
 
         // Use cache-efficient content_slice method
         let result = self.content_slice(start_idx_inclusive, effective_end_idx);
 
-        eprintln!(
+        tracing::debug!(
             "[get_elements_between_markers] Returning {} elements",
             result.len()
         );
@@ -1252,14 +1276,14 @@ impl PdfIndex {
     pub fn as_text_handle(&self, handle: ContentHandle) -> Option<TextHandle> {
         match handle {
             ContentHandle::Text(idx) => Some(TextHandle(idx as u32)),
-            ContentHandle::Image(_) => None,
+            _ => None,
         }
     }
 
     pub fn as_image_handle(&self, handle: ContentHandle) -> Option<ImageHandle> {
         match handle {
-            ContentHandle::Text(_) => None,
             ContentHandle::Image(idx) => Some(ImageHandle(idx as u32)),
+            _ => None,
         }
     }
 

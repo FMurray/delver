@@ -3,15 +3,13 @@
 //! Owns a private current-thread tokio runtime and forwards every call with
 //! `block_on`. Do not use from inside an async context.
 
-use std::collections::BTreeMap;
-
-use delver_core::parse::PageContents;
+use delver_core::parse::ParsedDocument;
 use tokio::runtime::{Builder, Runtime};
 
 use crate::error::StoreError;
 use crate::store::DelverStore;
 use crate::types::{
-    CorpusId, DocumentId, ElementRow, IngestOutcome, SearchScope, TextSearchHit,
+    CorpusId, DocumentId, ElementRow, IngestOutcome, LoadedDocument, SearchScope, TextSearchHit,
 };
 
 #[derive(Debug)]
@@ -44,8 +42,10 @@ impl DelverStoreBlocking {
         pdf_bytes: &[u8],
         parse_version: i32,
     ) -> Result<IngestOutcome, StoreError> {
-        self.runtime
-            .block_on(self.store.ingest_document(corpus, uri, pdf_bytes, parse_version))
+        self.runtime.block_on(
+            self.store
+                .ingest_document(corpus, uri, pdf_bytes, parse_version),
+        )
     }
 
     pub fn ingest_parsed(
@@ -53,20 +53,23 @@ impl DelverStoreBlocking {
         corpus: CorpusId,
         uri: Option<&str>,
         pdf_bytes: &[u8],
-        pages: &BTreeMap<u32, PageContents>,
+        parsed: &ParsedDocument,
         parse_version: i32,
     ) -> Result<IngestOutcome, StoreError> {
-        self.runtime.block_on(
-            self.store
-                .ingest_parsed(corpus, uri, pdf_bytes, pages, parse_version),
-        )
+        self.runtime.block_on(self.store.ingest_parsed(
+            corpus,
+            uri,
+            pdf_bytes,
+            parsed,
+            parse_version,
+        ))
     }
 
     pub fn element_count(&self, doc: DocumentId) -> Result<i64, StoreError> {
         self.runtime.block_on(self.store.element_count(doc))
     }
 
-    pub fn load_document(&self, doc: DocumentId) -> Result<Vec<ElementRow>, StoreError> {
+    pub fn load_document(&self, doc: DocumentId) -> Result<LoadedDocument, StoreError> {
         self.runtime.block_on(self.store.load_document(doc))
     }
 

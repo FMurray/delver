@@ -113,6 +113,10 @@ pub enum ElementType {
     TextChunk,
     Table,
     Image,
+    /// PDF page annotation selector (D-016)
+    Annotation,
+    /// Image + caption grouping selector (D-016)
+    Figure,
     // Image-specific processing children
     ImageSummary,
     ImageBytes,
@@ -153,11 +157,44 @@ pub struct ImageOutput {
     pub parent_index: Option<usize>, // Immediate containing section index
 }
 
+/// Output for a matched PDF page annotation (D-016); follows ImageOutput's
+/// shape: type tag, element data, page/bbox, merged metadata, parent link.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct AnnotationOutput {
+    pub id: String,
+    pub page_number: u32,
+    pub bbox: (f32, f32, f32, f32),
+    /// Annotation `Contents` text, when present.
+    pub text: Option<String>,
+    /// Inherited template metadata merged with the annotation's own
+    /// metadata (subtype, uri/dest).
+    pub metadata: HashMap<String, serde_json::Value>,
+    pub parent_name: Option<String>,
+    pub parent_index: Option<usize>,
+}
+
+/// Output for a matched figure grouping (D-016): an image plus its caption.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct FigureOutput {
+    pub id: String,
+    pub page_number: u32,
+    /// Union of the grouped image and caption bboxes.
+    pub bbox: (f32, f32, f32, f32),
+    pub caption: Option<String>,
+    /// Element id of the grouped image (the figure→image "contains" edge).
+    pub image_id: Option<String>,
+    pub metadata: HashMap<String, serde_json::Value>,
+    pub parent_name: Option<String>,
+    pub parent_index: Option<usize>,
+}
+
 #[derive(Debug, serde::Serialize, Clone)]
 #[serde(tag = "type")] // Add type field for distinguishing in JSON
 pub enum ProcessedOutput {
     Text(ChunkOutput),
     Image(ImageOutput),
+    Annotation(AnnotationOutput),
+    Figure(FigureOutput),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -665,6 +702,8 @@ fn process_element(pair: Pair<Rule>) -> Element {
         "TextChunk" => ElementType::TextChunk,
         "Table" => ElementType::Table,
         "Image" => ElementType::Image,
+        "Annotation" => ElementType::Annotation,
+        "Figure" => ElementType::Figure,
         "ImageSummary" => ElementType::ImageSummary,
         "ImageBytes" => ElementType::ImageBytes,
         "ImageCaption" => ElementType::ImageCaption,
@@ -1248,7 +1287,7 @@ fn process_matched_content_recursive(
                             if let Some(content) = index.content_at(*doc_idx) {
                                 match content {
                                     PageContent::Text(text_elem) => Some(text_elem),
-                                    PageContent::Image(_) => None,
+                                    _ => None,
                                 }
                             } else {
                                 None
@@ -1267,7 +1306,7 @@ fn process_matched_content_recursive(
                         global_chunk_counter,
                         tokenizer,
                     );
-                    eprintln!("chunk outputs: {:?}", chunk_outputs);
+                    tracing::debug!("chunk outputs: {:?}", chunk_outputs);
                     for chunk_output in chunk_outputs {
                         all_outputs.push(ProcessedOutput::Text(chunk_output));
                     }
@@ -1286,7 +1325,7 @@ fn process_matched_content_recursive(
                             if let Some(content) = index.content_at(*doc_idx) {
                                 match content {
                                     PageContent::Text(text_elem) => Some(text_elem),
-                                    PageContent::Image(_) => None,
+                                    _ => None,
                                 }
                             } else {
                                 None
@@ -1425,7 +1464,7 @@ fn process_matched_content_recursive(
                             if let Some(content) = index.content_at(*doc_idx) {
                                 match content {
                                     PageContent::Text(text_elem) => Some(text_elem),
-                                    PageContent::Image(_) => None,
+                                    _ => None,
                                 }
                             } else {
                                 None
@@ -1448,6 +1487,29 @@ fn process_matched_content_recursive(
                     }
                 }
             }
+            // Annotation / Figure selectors (D-016): every matched element of
+            // the right aux kind in the assigned range produces one output.
+            ElementType::Annotation | ElementType::Figure => {
+                let want_kind = match match_item.template_element.element_type {
+                    ElementType::Annotation => crate::parse::AuxKind::Annotation,
+                    _ => crate::parse::AuxKind::Figure,
+                };
+                for mc_ref in &match_item.matched_content {
+                    let MatchedContent::Index(doc_idx) = mc_ref else {
+                        continue;
+                    };
+                    let Some(aux) = index.aux_at(*doc_idx).filter(|aux| aux.kind == want_kind)
+                    else {
+                        continue;
+                    };
+                    all_outputs.push(process_aux_element_simple(
+                        aux,
+                        &match_item.template_element,
+                        &current_metadata,
+                        parent_info.clone(),
+                    ));
+                }
+            }
             ElementType::ImageSummary
             | ElementType::ImageBytes
             | ElementType::ImageCaption
@@ -1467,6 +1529,91 @@ fn process_matched_content_recursive(
     }
 }
 
+/// Convert one template attribute `Value` into JSON. Shared by the image,
+/// chunk, annotation, and figure output builders (identical semantics to the
+/// previously-inlined conversions: nested non-primitive array entries fall
+/// back to their Debug rendering).
+fn template_value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Array(arr) => {
+            let json_arr: Vec<serde_json::Value> = arr
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => serde_json::Value::String(s.clone()),
+                    Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+                    Value::Boolean(b) => serde_json::Value::Bool(*b),
+                    _ => serde_json::Value::String(format!("{:?}", v)),
+                })
+                .collect();
+            serde_json::Value::Array(json_arr)
+        }
+        Value::Identifier(s) => serde_json::Value::String(s.clone()),
+    }
+}
+
+/// Build the output for a matched aux element (Annotation / Figure
+/// selectors, D-016). Output metadata = inherited template metadata,
+/// overlaid with the element's own metadata (subtype/uri, caption ids, ...);
+/// `as="..."` surfaces as metadata key "name" (sections use "section").
+fn process_aux_element_simple(
+    aux: &crate::parse::AuxElement,
+    template_element: &Element,
+    metadata: &HashMap<String, Value>,
+    parent_info: Option<(String, usize)>,
+) -> ProcessedOutput {
+    let mut json_metadata: HashMap<String, serde_json::Value> = metadata
+        .iter()
+        .map(|(k, v)| (k.clone(), template_value_to_json(v)))
+        .collect();
+    if let Some(own) = aux.metadata.as_object() {
+        for (k, v) in own {
+            json_metadata.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(as_value) = template_element.attributes.get("as") {
+        json_metadata.insert("name".to_string(), template_value_to_json(as_value));
+    }
+
+    let (parent_name, parent_index) = match parent_info {
+        Some((name, index)) => (Some(name), Some(index)),
+        None => (None, None),
+    };
+    let bbox = (aux.bbox.x0, aux.bbox.y0, aux.bbox.x1, aux.bbox.y1);
+
+    match aux.kind {
+        crate::parse::AuxKind::Figure => ProcessedOutput::Figure(FigureOutput {
+            id: aux.id.to_string(),
+            page_number: aux.page_number,
+            bbox,
+            caption: aux
+                .metadata
+                .get("caption")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            image_id: aux
+                .metadata
+                .get("image_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            metadata: json_metadata,
+            parent_name,
+            parent_index,
+        }),
+        _ => ProcessedOutput::Annotation(AnnotationOutput {
+            id: aux.id.to_string(),
+            page_number: aux.page_number,
+            bbox,
+            text: aux.text.clone(),
+            metadata: json_metadata,
+            parent_name,
+            parent_index,
+        }),
+    }
+}
+
 // Helper function to process a matched Image element based on its children
 fn process_image_element_simple(
     image_element: &crate::parse::ImageElement,
@@ -1477,25 +1624,7 @@ fn process_image_element_simple(
     // Convert existing metadata from Value to serde_json::Value
     let mut json_metadata: HashMap<String, serde_json::Value> = HashMap::new();
     for (key, value) in metadata {
-        let json_value = match value {
-            Value::String(s) => serde_json::Value::String(s.clone()),
-            Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
-            Value::Boolean(b) => serde_json::Value::Bool(*b),
-            Value::Array(arr) => {
-                let json_arr: Vec<serde_json::Value> = arr
-                    .iter()
-                    .map(|v| match v {
-                        Value::String(s) => serde_json::Value::String(s.clone()),
-                        Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
-                        Value::Boolean(b) => serde_json::Value::Bool(*b),
-                        _ => serde_json::Value::String(format!("{:?}", v)),
-                    })
-                    .collect();
-                serde_json::Value::Array(json_arr)
-            }
-            Value::Identifier(s) => serde_json::Value::String(s.clone()),
-        };
-        json_metadata.insert(key.clone(), json_value);
+        json_metadata.insert(key.clone(), template_value_to_json(value));
     }
 
     // Extract parent information
@@ -1544,7 +1673,9 @@ fn process_image_element_simple(
                 match &image_bytes_result {
                     Ok(bytes) => {
                         image_output.bytes_base64 = Some(BASE64_STANDARD.encode(bytes));
-                        eprintln!("Successfully decoded and encoded image bytes for ImageBytes.");
+                        tracing::debug!(
+                            "Successfully decoded and encoded image bytes for ImageBytes."
+                        );
                     }
                     Err(e) => {
                         if e != "Bytes not needed" {
@@ -1559,7 +1690,7 @@ fn process_image_element_simple(
                 // TODO: Implement actual caption finding logic
                 // This likely involves searching nearby TextElements in the PdfIndex
                 // based on the image_element.bbox and page_number.
-                eprintln!("Placeholder: Need to implement caption finding for ImageCaption");
+                tracing::debug!("Placeholder: Need to implement caption finding for ImageCaption");
                 image_output.caption = Some("PLACEHOLDER_IMAGE_CAPTION".to_string());
             }
             ElementType::ImageSummary => {
@@ -1588,7 +1719,10 @@ fn process_image_element_simple(
                     Ok(_bytes) => {
                         // TODO: Implement actual call to external LLM for summary
                         // let summary = call_llm_summary(&config, bytes);
-                        eprintln!("Placeholder: Call external summary model ('{:?}')", config);
+                        tracing::debug!(
+                            "Placeholder: Call external summary model ('{:?}')",
+                            config
+                        );
                         image_output.summary =
                             Some(format!("PLACEHOLDER_SUMMARY_FROM_{}", config.model));
                     }
@@ -1614,7 +1748,7 @@ fn process_image_element_simple(
                         match generate_embedding(&embedding_model, bytes) {
                             Ok(embedding) => {
                                 image_output.embedding = Some(embedding);
-                                eprintln!(
+                                tracing::debug!(
                                     "Successfully generated placeholder embedding using {:?}.",
                                     embedding_model
                                 );
@@ -1669,27 +1803,7 @@ fn process_text_chunk_elements_simple(
     let base_metadata: std::sync::Arc<HashMap<String, serde_json::Value>> = {
         let mut out = HashMap::new();
         for (k, v) in metadata {
-            let json_value = match v {
-                Value::String(s) => serde_json::Value::String(s.clone()),
-                Value::Number(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
-                Value::Boolean(b) => serde_json::Value::Bool(*b),
-                Value::Array(arr) => {
-                    let json_arr: Vec<_> = arr
-                        .iter()
-                        .map(|vv| match vv {
-                            Value::String(s) => serde_json::Value::String(s.clone()),
-                            Value::Number(n) => {
-                                serde_json::Value::Number(serde_json::Number::from(*n))
-                            }
-                            Value::Boolean(b) => serde_json::Value::Bool(*b),
-                            _ => serde_json::Value::String(format!("{:?}", vv)),
-                        })
-                        .collect();
-                    serde_json::Value::Array(json_arr)
-                }
-                Value::Identifier(s) => serde_json::Value::String(s.clone()),
-            };
-            out.insert(k.clone(), json_value);
+            out.insert(k.clone(), template_value_to_json(v));
         }
         std::sync::Arc::new(out)
     };
@@ -1806,17 +1920,17 @@ fn generate_embedding(model: &EmbeddingModel, image_bytes: &[u8]) -> Result<Vec<
     match model {
         EmbeddingModel::Clip => {
             // --- Placeholder Logic ---
-            eprintln!(
+            tracing::debug!(
                 "Placeholder: Simulating CLIP embedding generation for image ({} bytes)",
                 image_bytes.len()
             );
             // Basic validation: Try to guess format and check dimensions (optional)
             match image::guess_format(image_bytes) {
                 Ok(format) => {
-                    eprintln!("Placeholder: Detected image format: {:?}", format);
+                    tracing::debug!("Placeholder: Detected image format: {:?}", format);
                     match image::load_from_memory(image_bytes) {
                         Ok(img) => {
-                            eprintln!(
+                            tracing::debug!(
                                 "Placeholder: Image dimensions {}x{}",
                                 img.width(),
                                 img.height()

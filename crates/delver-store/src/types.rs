@@ -52,12 +52,17 @@ uuid_newtype!(
     ElementId
 );
 
-/// Discriminant of an element row, mirroring `delver_core::parse::ContentHandle`.
+/// Discriminant of an element row, mirroring `delver_core::parse::ContentHandle`
+/// (`Aux` rows split into their `AuxKind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ElementKind {
     Text,
     Image,
+    Annotation,
+    Path,
+    Figure,
+    Blob,
 }
 
 impl ElementKind {
@@ -65,6 +70,10 @@ impl ElementKind {
         match self {
             ElementKind::Text => "text",
             ElementKind::Image => "image",
+            ElementKind::Annotation => "annotation",
+            ElementKind::Path => "path",
+            ElementKind::Figure => "figure",
+            ElementKind::Blob => "blob",
         }
     }
 
@@ -72,9 +81,34 @@ impl ElementKind {
         match s {
             "text" => Ok(ElementKind::Text),
             "image" => Ok(ElementKind::Image),
+            "annotation" => Ok(ElementKind::Annotation),
+            "path" => Ok(ElementKind::Path),
+            "figure" => Ok(ElementKind::Figure),
+            "blob" => Ok(ElementKind::Blob),
             other => Err(crate::StoreError::Corrupt(format!(
                 "unknown element kind {other:?}"
             ))),
+        }
+    }
+
+    pub(crate) fn from_aux(kind: delver_core::parse::AuxKind) -> Self {
+        use delver_core::parse::AuxKind;
+        match kind {
+            AuxKind::Annotation => ElementKind::Annotation,
+            AuxKind::Path => ElementKind::Path,
+            AuxKind::Figure => ElementKind::Figure,
+            AuxKind::Blob => ElementKind::Blob,
+        }
+    }
+
+    pub(crate) fn as_aux(self) -> Option<delver_core::parse::AuxKind> {
+        use delver_core::parse::AuxKind;
+        match self {
+            ElementKind::Annotation => Some(AuxKind::Annotation),
+            ElementKind::Path => Some(AuxKind::Path),
+            ElementKind::Figure => Some(AuxKind::Figure),
+            ElementKind::Blob => Some(AuxKind::Blob),
+            ElementKind::Text | ElementKind::Image => None,
         }
     }
 }
@@ -102,6 +136,36 @@ pub struct ImagePayload {
     pub data: Vec<u8>,
 }
 
+/// Embedded-file payload stored alongside a blob element row
+/// (`blobs` table, D-016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRow {
+    pub data: Vec<u8>,
+    pub mime: Option<String>,
+    pub filename: Option<String>,
+}
+
+/// One typed edge between two elements of a document (`element_refs`,
+/// D-016). Mirrors `delver_core::parse::RefEdge` with store ids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefEdgeRow {
+    pub from_element: ElementId,
+    pub to_element: ElementId,
+    pub kind: String,
+    pub metadata: serde_json::Value,
+}
+
+/// Everything `load_document` returns: the document's Info-dict metadata,
+/// its element rows in global order, and its ref edges (D-016).
+#[derive(Debug, Clone)]
+pub struct LoadedDocument {
+    pub document_id: DocumentId,
+    /// PDF Info dict subset captured at ingest (`documents.metadata`).
+    pub metadata: serde_json::Value,
+    pub elements: Vec<ElementRow>,
+    pub refs: Vec<RefEdgeRow>,
+}
+
 /// One stored element row, sufficient to rebuild the in-memory index.
 #[derive(Debug, Clone)]
 pub struct ElementRow {
@@ -123,6 +187,8 @@ pub struct ElementRow {
     pub metadata: serde_json::Value,
     /// Present only for `kind == Image` rows loaded with their payload.
     pub image: Option<ImagePayload>,
+    /// Present only for `kind == Blob` rows loaded with their payload.
+    pub blob: Option<BlobRow>,
 }
 
 /// Scope selector for [`crate::DelverStore::text_search`].

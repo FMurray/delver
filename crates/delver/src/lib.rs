@@ -132,11 +132,11 @@ pub fn run_template_on_doc(
     tokenizer: Option<&Tokenizer>,
     embedder: Option<Arc<dyn Embedder>>,
 ) -> Result<String> {
-    let rows = store.load_document(doc)?;
-    if rows.is_empty() {
+    let loaded = store.load_document(doc)?;
+    if loaded.elements.is_empty() {
         bail!("document {doc} has no stored elements (unknown id or empty document)");
     }
-    let pages = delver_store::hydrate_pages(&rows);
+    let pages = delver_store::hydrate_pages(&loaded.elements);
     let mut match_context = MatchContext::default();
     match_context.embedder = embedder.into();
     process_parsed(&pages, &match_context, template_str, tokenizer)

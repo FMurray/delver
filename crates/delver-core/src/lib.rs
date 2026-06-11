@@ -13,7 +13,7 @@ pub mod search_index;
 use crate::docql::{parse_template, process_matched_content, ProcessedOutput, Root};
 use crate::layout::{group_text_into_lines_and_blocks, MatchContext, TextBlock};
 use crate::matcher::align_template_with_content;
-use crate::parse::{get_page_content, get_refs, PageContents, TextElement};
+use crate::parse::{get_refs, parse_document, PageContents, TextElement};
 use anyhow::Result;
 use lopdf::Document;
 use search_index::PdfIndex;
@@ -40,7 +40,9 @@ pub fn process_pdf(
     let dom = parse_template(template_str)?;
 
     let doc = Document::load_mem(pdf_bytes)?;
-    let pages_map = get_page_content(&doc)?;
+    // Full parse (D-016): content-stream walk plus annotations, paths,
+    // figure grouping, and embedded files — identical to the ingest path.
+    let pages_map = parse_document(&doc)?.pages;
 
     let mut text_pages_map: BTreeMap<u32, Vec<TextElement>> = BTreeMap::new();
     for (page_num, page_contents) in &pages_map {

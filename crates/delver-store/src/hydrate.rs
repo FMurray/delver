@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use delver_core::geo::Rect;
 use delver_core::layout::MatchContext;
-use delver_core::parse::{ImageElement, PageContents, TextElement};
+use delver_core::parse::{AuxElement, BlobPayload, ImageElement, PageContents, TextElement};
 use delver_core::search_index::PdfIndex;
 use lopdf::{dictionary, Object, Stream};
 
@@ -49,6 +49,30 @@ pub fn hydrate_pages(rows: &[ElementRow]) -> BTreeMap<u32, PageContents> {
                     y1: bbox.3,
                 },
                 image_object: rebuild_image_object(row),
+            }),
+            // Aux kinds (annotation/path/figure/blob, D-016) round-trip
+            // verbatim: bbox/text/metadata from the element row, blob bytes
+            // from the blobs table payload.
+            ElementKind::Annotation
+            | ElementKind::Path
+            | ElementKind::Figure
+            | ElementKind::Blob => page.add_aux(AuxElement {
+                id: row.id.into_uuid(),
+                kind: row.kind.as_aux().expect("aux kinds matched above"),
+                page_number,
+                bbox: Rect {
+                    x0: bbox.0,
+                    y0: bbox.1,
+                    x1: bbox.2,
+                    y1: bbox.3,
+                },
+                text: row.text.clone(),
+                metadata: row.metadata.clone(),
+                blob: row.blob.as_ref().map(|b| BlobPayload {
+                    data: b.data.clone(),
+                    mime: b.mime.clone(),
+                    filename: b.filename.clone(),
+                }),
             }),
         }
     }

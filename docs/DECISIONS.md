@@ -202,3 +202,90 @@ New workspace member `delver-embed` (NOT a delver-core dependency) implements th
   `DelverStore.run_template(doc_id, template, tokenizer_model=None, embed_endpoint=None)`.
   Verified: the 3M 10-K `query --doc` output is byte-identical to the pre-change baseline
   (no behavior change without embedding configs).
+
+**D-016 · 2026-06-11 · Stage B slice 2: non-TABLE spec types end to end (ANNOTATION, PATH, FIGURE+refs, BLOB, DOCUMENT metadata).**
+TABLE structure is deliberately deferred to the next slice. New parse entry point
+`delver_core::parse::parse_document(doc) -> ParsedDocument { pages, refs, metadata }`; both
+`process_pdf` (fresh query) and `DelverStore::ingest_document` route through it, so fresh and
+ingested element sets stay identical. `get_page_content` keeps its signature (now also
+emitting paths/annotations/page blobs); figure grouping, document-level blobs, and Info
+metadata exist only via `parse_document`. Hydration never re-runs any extraction — rows
+round-trip verbatim, so pre-slice documents (the 414534-byte 10-K regression) are untouched.
+- **Core model — one kind-tagged aux store, not four**: `AuxElement { id, kind: AuxKind
+  {Annotation|Path|Figure|Blob}, page_number, bbox, text, metadata: serde_json::Value,
+  blob: Option<BlobPayload> }`, `ContentHandle::Aux`, `PageContent::Aux`, row-oriented
+  `AuxStore` (these kinds are sparse and never on a hot loop; four SoA stores would be
+  near-identical plumbing ×4). `TextElement`/`ImageElement` untouched. Aux elements are
+  **transparent to all existing matching**: TextChunk collection, boundary candidates, the
+  section-end font-similarity fallback, and `top_k_similar_text` all skip them — verified by
+  the 10-K re-index: `query --doc` over the v2 document (14 977 interleaved paths, 79
+  annotations) is byte-identical to the v1 output.
+- **ANNOTATION**: per-page `Annots` entries → kind=annotation elements; text = `Contents`
+  (decoded UTF-16BE/lossy-UTF-8; lands in `elements.text`, so it is FTS-able), bbox = `Rect`
+  flipped to top-left coordinates, metadata `{subtype, uri?, dest?}` (`A`/URI action, `A`/D
+  or `Dest` names). Appearance streams are not rendered. `FileAttachment` annotations become
+  kind=blob elements instead (the attached file is the payload of interest).
+- **PATH**: captured during the existing content-stream walk (page streams only; paths
+  inside Form XObjects are out of scope). Construction ops m/l/c/v/y/re/h accumulate points
+  (curve control points included — conservative envelope), each point CTM-transformed and
+  flipped at capture; painting ops S/s/f/F/f*/B/B*/b/b* emit one element per painted path
+  (`n` discards, clip-only paths are not elements). bbox = point envelope; metadata
+  `{op_count, stroke, fill, point_count, points: first 32 [x,y] pairs}` — the points are the
+  hook for future table-rule detection. **Cap**: 512 paths/page; past it, painted paths are
+  counted, not captured, and the overflow note `{path_overflow: {cap, skipped}}` is merged
+  into the metadata of the page's last captured path (there is no page-level metadata slot
+  anywhere in the model or schema — sentinel-free and queryable). Real 10-K: the cap engaged
+  on 6 of 158 pages.
+- **FIGURE + Ref edges**: conservative grouping — image + caption text line matching
+  `(?i)^\s*(figure|fig\.|table|chart|exhibit)\b`, same page, horizontal overlap required,
+  vertical gap ≤ 50pt; nearest such line below the image, else nearest above. Emits
+  kind=figure (bbox = union) plus document-level `RefEdge { from, to, kind, metadata }`
+  edges figure→image ("contains") and figure→caption ("caption-of") carried alongside pages
+  (never inside elements). No caption ⇒ no figure (additive, never destructive). Caption
+  text/ids are also denormalized into figure metadata `{caption, image_id, caption_id,
+  caption_position}` so template output needs no edge lookup at match time.
+- **BLOB**: embedded files from the catalog `EmbeddedFiles` name tree (Names+Kids walk,
+  depth-capped) and `FileAttachment` annotations. Bytes/mime/filename live in a
+  `BlobPayload` beside the element (not in metadata JSON); metadata carries
+  `{source, filename, mime, size}`. Document-level blobs sit on **synthetic page 0** (they
+  belong to no page; page 0 orders ahead of all real pages); `ParsedDocument::page_count()`
+  excludes it, so `documents.page_count` stays the real page count.
+- **DOCUMENT metadata**: PDF Info dict subset `{title, author, subject, creation_date}` (all
+  strings) captured at ingest into a new `documents.metadata jsonb`; exposed via
+  `load_document`.
+- **Persistence (migration 0002_types.sql, SCHEMA_VERSION=2)**: `element_refs(from_element,
+  to_element, kind, metadata, PK(from,to,kind))` + reverse index; `blobs(element_id PK, data,
+  mime, filename)`; `documents.metadata jsonb not null default '{}'`. Elements now persist
+  their `metadata` jsonb at ingest (was always-default). `ingest_parsed` takes
+  `&ParsedDocument` (shared insert path with `ingest_document` per D-011);
+  `load_document` returns `LoadedDocument { document_id, metadata, elements, refs }` and
+  element rows of kind=blob carry their payload (blobs LEFT JOIN). Round-trip (D-003) extended:
+  counts by kind, figure edges, blob bytes, and document metadata all survive
+  persist → load → hydrate (delver-store/tests/roundtrip.rs::roundtrip_new_kinds_refs_and_metadata).
+- **Template queryability (minimal)**: `Annotation(as="…")` and `Figure(as="…")` are element
+  selectors. No .pest change was needed — element names are generic identifiers in the
+  grammar; the two names map to `ElementType::Annotation/Figure` in `process_element`
+  (deviation from the "add to the grammar" instruction, with the same effect). They join
+  Pass-2 content assignment exactly like TextChunk (full document when no sections; the
+  section partition when nested; section-boundary scoping verified by test). Every matched
+  element of the kind produces one output: `AnnotationOutput { id, page_number, bbox, text,
+  metadata, parent_* }` / `FigureOutput { …, caption, image_id, … }` (`type` tags
+  "Annotation"/"Figure"); output metadata = inherited template metadata overlaid with the
+  element's own, plus `name` = the `as=` value (sections keep using `section`).
+- Tests: crates/delver/tests/spec_types.rs (9 tests: parse-level per kind, figure-negative,
+  Info metadata, selectors top-level / inside section / boundary-scoped) and the extended
+  store round-trip. Real-document evidence (3M 10-K re-indexed at `--parse-version 2`,
+  document 1d983d90-1042-4b6e-a70a-cfb690265afc): text 11 476 (identical to v1 — text
+  pipeline untouched), annotation 79 (all Link, dest-style), path 14 977, no images detected
+  in this PDF (same as v1) hence no figures, no embedded files. Document metadata captured
+  `{title: "10-K - 02/11/2016 - 3M Company", creation_date: …}`.
+
+**D-017 · 2026-06-11 · Matcher/collation debug output gated behind tracing (default stderr: quiet).**
+Slice-1 verification found ~200KB of unconditional stderr per real-document query
+(`align_template_with_content_with_depth: …`, boundary-candidate traces, chunk dumps) from
+the D-013 `eprintln!` conversion. All 50 of those call sites in matcher.rs, search_index.rs,
+layout.rs, and docql.rs are now `tracing::debug!` — quiet unless a subscriber is installed
+(the `process` subcommand's `init_debug_logging`/`--debug-ops` pathway; `index`/`query`/
+`search` install none). stdout untouched. Measured on the 10-K regression query: stderr
+204 849 → 0 bytes, stdout byte-identical (414 534). Intentional user-facing warnings (e.g.
+the tokenizer fallback in the service layer) stay on stderr.

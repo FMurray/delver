@@ -16,6 +16,6 @@ pub use error::StoreError;
 pub use hydrate::{hydrate_index, hydrate_pages};
 pub use store::{DelverStore, SCHEMA_VERSION};
 pub use types::{
-    CorpusId, DocumentId, ElementId, ElementKind, ElementRow, ImagePayload, IngestOutcome,
-    SearchScope, TextSearchHit,
+    BlobRow, CorpusId, DocumentId, ElementId, ElementKind, ElementRow, ImagePayload, IngestOutcome,
+    LoadedDocument, RefEdgeRow, SearchScope, TextSearchHit,
 };

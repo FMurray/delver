@@ -72,6 +72,9 @@ fn test_nested_sections_parent_references() {
             ProcessedOutput::Image(img) => {
                 println!("Output {}: Image - {}", i, img.id);
             }
+            other => {
+                println!("Output {}: {:?}", i, other);
+            }
         }
     }
 
@@ -350,6 +353,9 @@ fn test_parent_index_references_actual_output_position() {
             ProcessedOutput::Image(img) => {
                 println!("Output[{}]: Image {}", i, img.id);
             }
+            other => {
+                println!("Output[{}]: {:?}", i, other);
+            }
         }
     }
 
@@ -483,6 +489,9 @@ fn test_hierarchical_parent_reference_inconsistency() {
             }
             ProcessedOutput::Image(img) => {
                 println!("Output[{}]: Image {}", i, img.id);
+            }
+            other => {
+                println!("Output[{}]: {:?}", i, other);
             }
         }
     }
@@ -626,6 +635,9 @@ fn test_real_nested_sections_parent_references() {
             }
             delver_core::docql::ProcessedOutput::Image(img) => {
                 println!("Output[{}]: Image {}", i, img.id);
+            }
+            other => {
+                println!("Output[{}]: {:?}", i, other);
             }
         }
     }
@@ -806,6 +818,9 @@ fn test_10k_template_structure_parent_references() {
             }
             delver_core::docql::ProcessedOutput::Image(img) => {
                 println!("Output[{}]: Image {}", i, img.id);
+            }
+            other => {
+                println!("Output[{}]: {:?}", i, other);
             }
         }
     }

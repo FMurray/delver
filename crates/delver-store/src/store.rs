@@ -4,11 +4,10 @@
 //! rebuilt by [`crate::hydrate_index`]. All queries are runtime-checked
 //! (`sqlx::query`) by design: builds must not require a live database.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use delver_core::layout::MatchContext;
-use delver_core::parse::{get_page_content, ContentHandle, PageContents};
+use delver_core::parse::{parse_document, ContentHandle, ParsedDocument};
 use delver_core::search_index::PdfIndex;
 use lopdf::{Document, Object};
 use sha2::{Digest, Sha256};
@@ -17,12 +16,12 @@ use sqlx::Row;
 
 use crate::error::StoreError;
 use crate::types::{
-    CorpusId, DocumentId, ElementId, ElementKind, ElementRow, ImagePayload, IngestOutcome,
-    SearchScope, TextSearchHit,
+    BlobRow, CorpusId, DocumentId, ElementId, ElementKind, ElementRow, ImagePayload, IngestOutcome,
+    LoadedDocument, RefEdgeRow, SearchScope, TextSearchHit,
 };
 
 /// Bump when migrations change the logical schema.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Shared projection used everywhere element rows are returned: box corners
 /// are decomposed into floats so no geometric-type decoding is needed
@@ -31,9 +30,11 @@ const ELEMENT_SELECT: &str = "SELECT e.id, e.document_id, e.page, e.kind, e.orde
        e.font_size, e.font_name, e.style_key, e.metadata, \
        (e.bbox[1])[0] AS bx0, (e.bbox[1])[1] AS by0, \
        (e.bbox[0])[0] AS bx1, (e.bbox[0])[1] AS by1, \
-       i.width AS image_width, i.height AS image_height, i.data AS image_data \
+       i.width AS image_width, i.height AS image_height, i.data AS image_data, \
+       b.data AS blob_data, b.mime AS blob_mime, b.filename AS blob_filename \
   FROM elements e \
-  LEFT JOIN images i ON i.element_id = e.id";
+  LEFT JOIN images i ON i.element_id = e.id \
+  LEFT JOIN blobs b ON b.element_id = e.id";
 
 /// Service layer for the persistent document index.
 #[derive(Debug, Clone)]
@@ -107,20 +108,23 @@ impl DelverStore {
         }
 
         let doc = Document::load_mem(pdf_bytes).map_err(|e| StoreError::Pdf(e.to_string()))?;
-        let pages = get_page_content(&doc).map_err(|e| StoreError::Pdf(e.to_string()))?;
-        self.insert_parsed(corpus, uri, &sha, &pages, parse_version)
+        // Full parse (D-016): identical pipeline to the fresh-query path —
+        // content stream plus annotations, paths, figures, embedded files,
+        // and the Info-dict document metadata.
+        let parsed = parse_document(&doc).map_err(|e| StoreError::Pdf(e.to_string()))?;
+        self.insert_parsed(corpus, uri, &sha, &parsed, parse_version)
             .await
     }
 
     /// Persist an already-parsed document (same dedup contract as
-    /// [`Self::ingest_document`]). Element ids from `pages` are stored
+    /// [`Self::ingest_document`]). Element ids from `parsed` are stored
     /// verbatim, so a hydrated index is id-identical to the caller's parse.
     pub async fn ingest_parsed(
         &self,
         corpus: CorpusId,
         uri: Option<&str>,
         pdf_bytes: &[u8],
-        pages: &BTreeMap<u32, PageContents>,
+        parsed: &ParsedDocument,
         parse_version: i32,
     ) -> Result<IngestOutcome, StoreError> {
         let sha = sha256(pdf_bytes);
@@ -130,7 +134,7 @@ impl DelverStore {
                 created: false,
             });
         }
-        self.insert_parsed(corpus, uri, &sha, pages, parse_version)
+        self.insert_parsed(corpus, uri, &sha, parsed, parse_version)
             .await
     }
 
@@ -143,11 +147,51 @@ impl DelverStore {
         Ok(count)
     }
 
-    /// Load all element rows of a document in global document order.
-    pub async fn load_document(&self, doc: DocumentId) -> Result<Vec<ElementRow>, StoreError> {
+    /// Load a document: Info-dict metadata, all element rows in global
+    /// document order, and the document's ref edges (D-016). Unknown ids
+    /// yield an empty `LoadedDocument` (callers treat no elements as
+    /// "unknown or empty", matching the pre-slice contract).
+    pub async fn load_document(&self, doc: DocumentId) -> Result<LoadedDocument, StoreError> {
+        let metadata: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM documents WHERE id = $1")
+                .bind(doc)
+                .fetch_optional(&self.pool)
+                .await?;
+
         let sql = format!("{ELEMENT_SELECT} WHERE e.document_id = $1 ORDER BY e.order_idx");
         let rows = sqlx::query(&sql).bind(doc).fetch_all(&self.pool).await?;
-        rows.iter().map(element_from_row).collect()
+        let elements: Vec<ElementRow> = rows
+            .iter()
+            .map(element_from_row)
+            .collect::<Result<_, _>>()?;
+
+        let refs = sqlx::query(
+            "SELECT r.from_element, r.to_element, r.kind, r.metadata \
+               FROM element_refs r \
+               JOIN elements e ON e.id = r.from_element \
+              WHERE e.document_id = $1 \
+              ORDER BY r.from_element, r.to_element, r.kind",
+        )
+        .bind(doc)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(RefEdgeRow {
+                from_element: row.try_get("from_element")?,
+                to_element: row.try_get("to_element")?,
+                kind: row.try_get("kind")?,
+                metadata: row.try_get("metadata")?,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+
+        Ok(LoadedDocument {
+            document_id: doc,
+            metadata: metadata.unwrap_or_else(|| serde_json::json!({})),
+            elements,
+            refs,
+        })
     }
 
     /// Full-text search (`tsvector` + `ts_rank`) over a corpus or one document.
@@ -194,7 +238,9 @@ impl DelverStore {
                     document_id: row.try_get("document_id")?,
                     page: row.try_get("page")?,
                     order_idx: row.try_get("order_idx")?,
-                    text: row.try_get::<Option<String>, _>("text")?.unwrap_or_default(),
+                    text: row
+                        .try_get::<Option<String>, _>("text")?
+                        .unwrap_or_default(),
                     rank: row.try_get("rank")?,
                 })
             })
@@ -254,27 +300,29 @@ impl DelverStore {
         corpus: CorpusId,
         uri: Option<&str>,
         sha: &[u8],
-        pages: &BTreeMap<u32, PageContents>,
+        parsed: &ParsedDocument,
         parse_version: i32,
     ) -> Result<IngestOutcome, StoreError> {
         // Build the in-memory index once: it defines the global element order
         // (order_idx) and the per-row style keys we persist.
-        let index = PdfIndex::new(pages, &MatchContext::default());
+        let index = PdfIndex::new(&parsed.pages, &MatchContext::default());
         let flat = FlatElements::from_index(&index);
 
         let mut tx = self.pool.begin().await?;
 
         let inserted: Option<DocumentId> = sqlx::query_scalar(
-            "INSERT INTO documents (corpus_id, content_sha256, uri, page_count, parse_version) \
-             VALUES ($1, $2, $3, $4, $5) \
+            "INSERT INTO documents \
+               (corpus_id, content_sha256, uri, page_count, parse_version, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (corpus_id, content_sha256, parse_version) DO NOTHING \
              RETURNING id",
         )
         .bind(corpus)
         .bind(sha)
         .bind(uri)
-        .bind(pages.len() as i32)
+        .bind(parsed.page_count() as i32)
         .bind(parse_version)
+        .bind(&parsed.metadata)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -298,13 +346,14 @@ impl DelverStore {
         if !flat.ids.is_empty() {
             sqlx::query(
                 "INSERT INTO elements \
-                   (id, document_id, page, kind, order_idx, text, font_size, font_name, style_key, bbox) \
+                   (id, document_id, page, kind, order_idx, text, font_size, font_name, style_key, bbox, metadata) \
                  SELECT u.id, $1, u.page, u.kind, u.order_idx, u.text, u.font_size, u.font_name, \
-                        u.style_key, box(point(u.x0, u.y0), point(u.x1, u.y1)) \
+                        u.style_key, box(point(u.x0, u.y0), point(u.x1, u.y1)), u.metadata \
                    FROM UNNEST($2::uuid[], $3::int4[], $4::text[], $5::int4[], $6::text[], \
                                $7::float4[], $8::text[], $9::int8[], \
-                               $10::float8[], $11::float8[], $12::float8[], $13::float8[]) \
-                     AS u(id, page, kind, order_idx, text, font_size, font_name, style_key, x0, y0, x1, y1)",
+                               $10::float8[], $11::float8[], $12::float8[], $13::float8[], \
+                               $14::jsonb[]) \
+                     AS u(id, page, kind, order_idx, text, font_size, font_name, style_key, x0, y0, x1, y1, metadata)",
             )
             .bind(document_id)
             .bind(&flat.ids)
@@ -319,6 +368,7 @@ impl DelverStore {
             .bind(&flat.y0s)
             .bind(&flat.x1s)
             .bind(&flat.y1s)
+            .bind(&flat.metadatas)
             .execute(&mut *tx)
             .await?;
         }
@@ -334,6 +384,41 @@ impl DelverStore {
             .bind(&flat.image_widths)
             .bind(&flat.image_heights)
             .bind(&flat.image_datas)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if !flat.blob_ids.is_empty() {
+            sqlx::query(
+                "INSERT INTO blobs (element_id, data, mime, filename) \
+                 SELECT u.element_id, u.data, u.mime, u.filename \
+                   FROM UNNEST($1::uuid[], $2::bytea[], $3::text[], $4::text[]) \
+                     AS u(element_id, data, mime, filename)",
+            )
+            .bind(&flat.blob_ids)
+            .bind(&flat.blob_datas)
+            .bind(&flat.blob_mimes)
+            .bind(&flat.blob_filenames)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        if !parsed.refs.is_empty() {
+            let from: Vec<uuid::Uuid> = parsed.refs.iter().map(|r| r.from).collect();
+            let to: Vec<uuid::Uuid> = parsed.refs.iter().map(|r| r.to).collect();
+            let kinds: Vec<String> = parsed.refs.iter().map(|r| r.kind.clone()).collect();
+            let metas: Vec<serde_json::Value> =
+                parsed.refs.iter().map(|r| r.metadata.clone()).collect();
+            sqlx::query(
+                "INSERT INTO element_refs (from_element, to_element, kind, metadata) \
+                 SELECT u.from_element, u.to_element, u.kind, u.metadata \
+                   FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[]) \
+                     AS u(from_element, to_element, kind, metadata)",
+            )
+            .bind(&from)
+            .bind(&to)
+            .bind(&kinds)
+            .bind(&metas)
             .execute(&mut *tx)
             .await?;
         }
@@ -366,11 +451,17 @@ struct FlatElements {
     y0s: Vec<f64>,
     x1s: Vec<f64>,
     y1s: Vec<f64>,
+    metadatas: Vec<serde_json::Value>,
 
     image_ids: Vec<uuid::Uuid>,
     image_widths: Vec<Option<i32>>,
     image_heights: Vec<Option<i32>>,
     image_datas: Vec<Vec<u8>>,
+
+    blob_ids: Vec<uuid::Uuid>,
+    blob_datas: Vec<Vec<u8>>,
+    blob_mimes: Vec<Option<String>>,
+    blob_filenames: Vec<Option<String>>,
 }
 
 impl FlatElements {
@@ -399,6 +490,7 @@ impl FlatElements {
                         .push(index.style_key_bits(th).map(|bits| bits as i64));
                     let (x0, y0, x1, y1) = text.bbox;
                     flat.push_bbox(x0, y0, x1, y1);
+                    flat.metadatas.push(serde_json::json!({}));
                 }
                 ContentHandle::Image(_) => {
                     let ih = index
@@ -414,12 +506,37 @@ impl FlatElements {
                     flat.font_names.push(None);
                     flat.style_keys.push(None);
                     flat.push_bbox(image.bbox.x0, image.bbox.y0, image.bbox.x1, image.bbox.y1);
+                    flat.metadatas.push(serde_json::json!({}));
 
                     let (width, height, data) = image_payload(image.image_object);
                     flat.image_ids.push(image.id);
                     flat.image_widths.push(width);
                     flat.image_heights.push(height);
                     flat.image_datas.push(data);
+                }
+                ContentHandle::Aux(_) => {
+                    let aux = index
+                        .aux_at(order_idx)
+                        .expect("aux element for aux content");
+                    flat.ids.push(aux.id);
+                    flat.pages.push(aux.page_number as i32);
+                    flat.kinds
+                        .push(ElementKind::from_aux(aux.kind).as_str().to_string());
+                    flat.order_idxs.push(order_idx as i32);
+                    // Annotation Contents lands in elements.text → FTS-able.
+                    flat.texts.push(aux.text.clone());
+                    flat.font_sizes.push(None);
+                    flat.font_names.push(None);
+                    flat.style_keys.push(None);
+                    flat.push_bbox(aux.bbox.x0, aux.bbox.y0, aux.bbox.x1, aux.bbox.y1);
+                    flat.metadatas.push(aux.metadata.clone());
+
+                    if let Some(blob) = &aux.blob {
+                        flat.blob_ids.push(aux.id);
+                        flat.blob_datas.push(blob.data.clone());
+                        flat.blob_mimes.push(blob.mime.clone());
+                        flat.blob_filenames.push(blob.filename.clone());
+                    }
                 }
             }
         }
@@ -478,7 +595,18 @@ fn element_from_row(row: &PgRow) -> Result<ElementRow, StoreError> {
                 .try_get::<Option<Vec<u8>>, _>("image_data")?
                 .unwrap_or_default(),
         }),
-        ElementKind::Text => None,
+        _ => None,
+    };
+
+    let blob = match kind {
+        ElementKind::Blob => Some(BlobRow {
+            data: row
+                .try_get::<Option<Vec<u8>>, _>("blob_data")?
+                .unwrap_or_default(),
+            mime: row.try_get("blob_mime")?,
+            filename: row.try_get("blob_filename")?,
+        }),
+        _ => None,
     };
 
     Ok(ElementRow {
@@ -494,5 +622,6 @@ fn element_from_row(row: &PgRow) -> Result<ElementRow, StoreError> {
         bbox,
         metadata: row.try_get("metadata")?,
         image,
+        blob,
     })
 }

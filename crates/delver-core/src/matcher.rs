@@ -3,7 +3,7 @@ use crate::docql::{
     MatchConfig, MatchType, Value,
 };
 use crate::layout::TextLine;
-use crate::parse::{ContentHandle, PageContent, TextElement};
+use crate::parse::{AuxKind, ContentHandle, PageContent, TextElement};
 use crate::search_index::{PdfIndex, TextElemRef, TextHandle};
 use anyhow::{anyhow, bail, Result};
 use rayon::prelude::*;
@@ -158,7 +158,7 @@ fn align_template_with_content_with_depth<'a>(
         return Ok(None);
     }
 
-    eprintln!(
+    tracing::debug!(
         "align_template_with_content_with_depth: {:?}",
         template_elements
     );
@@ -201,9 +201,10 @@ fn align_template_with_content_with_depth<'a>(
                     .and_then(|end| index.element_id_to_index.get(&end.id()).copied())
                     .unwrap_or(index.doc_len());
 
-                eprintln!(
+                tracing::debug!(
                     "MATCHER: Processing children within section boundaries {} to {}",
-                    start_idx, end_idx
+                    start_idx,
+                    end_idx
                 );
                 (start_idx, end_idx)
             } else {
@@ -224,7 +225,7 @@ fn align_template_with_content_with_depth<'a>(
 
     for template_element in template_elements {
         if template_element.element_type == ElementType::Section {
-            eprintln!("  PASS 1: Processing Section '{:#?}'", template_element);
+            tracing::debug!("  PASS 1: Processing Section '{:#?}'", template_element);
 
             // Determine which context to pass: previous sibling for most sections,
             // but for the *last* section pass the parent so it can inherit the
@@ -293,7 +294,7 @@ fn align_template_with_content_with_depth<'a>(
                 effective_start_index,
                 recursion_depth,
             )? {
-                eprintln!(
+                tracing::debug!(
                     "  PASS 1: Found Section '{}' boundaries",
                     template_element.name
                 );
@@ -323,14 +324,17 @@ fn align_template_with_content_with_depth<'a>(
         }
     }
 
-    // PASS 2: Assign TextChunks to appropriate content partitions
-    let mut textchunk_matches = Vec::new();
+    // PASS 2: Assign non-structural elements (TextChunk, Annotation, Figure)
+    // to appropriate content partitions
+    let mut pass2_matches = Vec::new();
 
     for (template_idx, template_element) in template_elements.iter().enumerate() {
-        if template_element.element_type == ElementType::TextChunk {
-            eprintln!(
-                "  PASS 2: Processing TextChunk '{}' (template order: {})",
-                template_element.name, template_idx
+        if is_pass2_element(&template_element.element_type) {
+            tracing::debug!(
+                "  PASS 2: Processing {:?} '{}' (template order: {})",
+                template_element.element_type,
+                template_element.name,
+                template_idx
             );
 
             // Determine which content partition this TextChunk should process
@@ -347,9 +351,11 @@ fn align_template_with_content_with_depth<'a>(
                     if template_idx < first_section_idx {
                         // TextChunk comes before first section - process content before first section
                         let first_partition_start = content_partitions[0].0;
-                        eprintln!(
-                            "    TextChunk '{}' processes content BEFORE first section: {} to {}",
-                            template_element.name, start_search_index, first_partition_start
+                        tracing::debug!(
+                            "    '{}' processes content BEFORE first section: {} to {}",
+                            template_element.name,
+                            start_search_index,
+                            first_partition_start
                         );
                         (start_search_index, first_partition_start)
                     } else {
@@ -365,8 +371,8 @@ fn align_template_with_content_with_depth<'a>(
                             } else {
                                 last_partition_end
                             };
-                        eprintln!(
-                            "    TextChunk '{}' processes content AFTER sections: {} to {}",
+                        tracing::debug!(
+                            "    '{}' processes content AFTER sections: {} to {}",
                             template_element.name,
                             content_start_after_section,
                             max_content_boundary
@@ -379,21 +385,41 @@ fn align_template_with_content_with_depth<'a>(
                 }
             };
 
-            // Match TextChunk with determined content boundaries
-            if let Some(textchunk_match) = match_text_chunk_with_boundaries(
-                template_element,
-                index,
-                actual_inherited_metadata,
-                content_start,
-                content_end,
-            ) {
-                eprintln!("    SUCCESS: Matched TextChunk '{}'", template_element.name);
-                textchunk_matches.push(textchunk_match);
+            // Match the element against the determined content boundaries
+            let pass2_match = match template_element.element_type {
+                ElementType::TextChunk => match_text_chunk_with_boundaries(
+                    template_element,
+                    index,
+                    actual_inherited_metadata,
+                    content_start,
+                    content_end,
+                ),
+                // Annotation / Figure selectors collect every aux element of
+                // their kind in the assigned range (D-016).
+                ElementType::Annotation => match_aux_kind_with_boundaries(
+                    template_element,
+                    index,
+                    actual_inherited_metadata,
+                    content_start,
+                    content_end,
+                    AuxKind::Annotation,
+                ),
+                ElementType::Figure => match_aux_kind_with_boundaries(
+                    template_element,
+                    index,
+                    actual_inherited_metadata,
+                    content_start,
+                    content_end,
+                    AuxKind::Figure,
+                ),
+                _ => unreachable!("is_pass2_element gates the variants above"),
+            };
+
+            if let Some(pass2_match) = pass2_match {
+                tracing::debug!("    SUCCESS: Matched '{}'", template_element.name);
+                pass2_matches.push(pass2_match);
             } else {
-                eprintln!(
-                    "    FAILURE: No match for TextChunk '{}'",
-                    template_element.name
-                );
+                tracing::debug!("    FAILURE: No match for '{}'", template_element.name);
             }
         }
     }
@@ -408,12 +434,12 @@ fn align_template_with_content_with_depth<'a>(
             {
                 all_results.push(section_match.clone());
             }
-        } else if template_element.element_type == ElementType::TextChunk {
-            if let Some(textchunk_match) = textchunk_matches
+        } else if is_pass2_element(&template_element.element_type) {
+            if let Some(pass2_match) = pass2_matches
                 .iter()
                 .find(|m| std::ptr::eq(m.template_element, template_element))
             {
-                all_results.push(textchunk_match.clone());
+                all_results.push(pass2_match.clone());
             }
         }
     }
@@ -538,12 +564,15 @@ fn match_section<'a, 'map_lt>(
             .unwrap_or(0);
         let next_boundary_idx = start_idx + 1;
 
-        // Look for the next element that has similar characteristics to the start marker
-        if let Some(next_content) = index
-            .content_slice(next_boundary_idx, index.doc_len())
-            .first()
-        {
-            if let PageContent::Text(next_text) = next_content {
+        // Look for the next element that has similar characteristics to the
+        // start marker. Aux elements (annotations/paths/figures/blobs) are
+        // transparent here: they never participate in boundary heuristics,
+        // so text/image-only documents behave exactly as before (D-016).
+        let next_content = (next_boundary_idx..index.doc_len())
+            .find(|&i| !matches!(index.get_handle(i), Some(ContentHandle::Aux(_))))
+            .and_then(|i| index.content_at(i));
+        if let Some(next_content) = next_content {
+            if let PageContent::Text(next_text) = &next_content {
                 if let PageContent::Text(start_text) = start_marker {
                     // If next element has similar font size, use it as boundary
                     if (next_text.font_size - start_text.font_size).abs() < 2.0 {
@@ -664,7 +693,7 @@ fn find_start_boundary_candidates<'a>(
 ) -> Result<Option<Vec<BoundaryCandidate>>> {
     let mut candidates = Vec::new();
 
-    eprintln!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
+    tracing::debug!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
     // 1. Match-config candidates (Text/Regex/Heuristic/EmbeddingSim/FirstMatch)
     let text_matches = find_config_matches(
         index,
@@ -673,7 +702,7 @@ fn find_start_boundary_candidates<'a>(
         start_index,
         max_search_index,
     )?;
-    eprintln!(
+    tracing::debug!(
         "[find_start_boundary_candidates] Match-config candidates found: {}",
         text_matches.len()
     );
@@ -694,11 +723,11 @@ fn find_start_boundary_candidates<'a>(
     }
 
     if candidates.is_empty() {
-        eprintln!("[find_start_boundary_candidates] No candidates found. Returning None.");
+        tracing::debug!("[find_start_boundary_candidates] No candidates found. Returning None.");
         Ok(None)
     } else {
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        eprintln!(
+        tracing::debug!(
             "[find_start_boundary_candidates] Returning {} sorted candidates.",
             candidates.len()
         );
@@ -752,7 +781,7 @@ fn find_end_boundary_candidates<'a>(
             candidates.push(bc);
         }
     } else {
-        eprintln!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");
+        tracing::debug!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");
         // If no end_match is specified, we might want a default behavior,
         // for example, consider all elements after start_content on the same page,
         // or up to the start of a *next* identifiable section if one exists soon.
@@ -760,11 +789,11 @@ fn find_end_boundary_candidates<'a>(
     }
 
     // 2. Natural boundaries (Currently Commented Out)
-    // eprintln!("[find_end_boundary_candidates] Considering natural boundaries...");
+    // tracing::debug!("[find_end_boundary_candidates] Considering natural boundaries...");
     // candidates.extend(find_natural_boundaries(start_content, index, children));
 
     // 3. Filter based on child elements (Currently Commented Out)
-    // eprintln!("[find_end_boundary_candidates] Validating boundary candidates based on children...");
+    // tracing::debug!("[find_end_boundary_candidates] Validating boundary candidates based on children...");
     // candidates = validate_boundary_candidates(&candidates, children, index);
 
     // --- Structural similarity driven candidates ---------------------------
@@ -893,7 +922,8 @@ fn find_config_matches(
         }
         MatchType::FirstMatch(alternatives) => {
             for alternative in alternatives {
-                let matches = find_config_matches(index, alternative, owner, start_index, max_index)?;
+                let matches =
+                    find_config_matches(index, alternative, owner, start_index, max_index)?;
                 if !matches.is_empty() {
                     return Ok(matches);
                 }
@@ -1167,6 +1197,9 @@ fn score_candidate<'a>(
             score += 0.4;
             reasons.push("Image content".to_string());
         }
+        // Aux elements (annotations/paths/figures/blobs) never become
+        // boundary candidates; no score adjustment.
+        PageContent::Aux(_) => {}
     }
 
     BoundaryCandidate {
@@ -1182,7 +1215,8 @@ fn content_types_compatible(a: &PageContent, b: &PageContent) -> bool {
     match (a, b) {
         (PageContent::Text(_), PageContent::Text(_)) => true,
         (PageContent::Image(_), PageContent::Image(_)) => true,
-        (PageContent::Image(_), _) | (_, PageContent::Image(_)) => false,
+        (PageContent::Aux(x), PageContent::Aux(y)) => x.kind == y.kind,
+        _ => false,
     }
 }
 
@@ -1208,6 +1242,46 @@ fn maintains_document_flow<'a>(
     }
 }
 
+/// Non-structural template types assigned in Pass 2 (within section
+/// boundaries / between section partitions): TextChunk plus the Annotation
+/// and Figure selectors (D-016).
+fn is_pass2_element(element_type: &ElementType) -> bool {
+    matches!(
+        element_type,
+        ElementType::TextChunk | ElementType::Annotation | ElementType::Figure
+    )
+}
+
+/// Collect every aux element of `kind` inside `[content_start_idx,
+/// content_end_idx)` — the aux mirror of `match_text_chunk_with_boundaries`.
+fn match_aux_kind_with_boundaries<'a>(
+    template: &'a Element,
+    index: &'a PdfIndex,
+    inherited_metadata: &HashMap<String, Value>,
+    content_start_idx: usize,
+    content_end_idx: usize,
+    kind: AuxKind,
+) -> Option<TemplateContentMatch<'a>> {
+    let matched: Vec<MatchedContent> = (content_start_idx..content_end_idx.min(index.doc_len()))
+        .filter(|&i| index.aux_at(i).map_or(false, |aux| aux.kind == kind))
+        .map(MatchedContent::Index)
+        .collect();
+
+    if matched.is_empty() {
+        tracing::debug!(
+            "[match_aux_kind_with_boundaries] No {:?} content in [{}, {})",
+            kind,
+            content_start_idx,
+            content_end_idx
+        );
+        return None;
+    }
+
+    let mut result = TemplateContentMatch::with_content(template, matched);
+    result.metadata = inherited_metadata.clone();
+    Some(result)
+}
+
 /// Matches a TextChunk element with explicit content boundaries
 fn match_text_chunk_with_boundaries<'a>(
     template: &'a Element,
@@ -1226,15 +1300,15 @@ fn match_text_chunk_with_boundaries<'a>(
                     matched_content_for_chunk.push(MatchedContent::Index(i));
                     has_text_content = true;
                 }
-                ContentHandle::Image(_) => {
-                    // TextChunk specifically ignores images
+                ContentHandle::Image(_) | ContentHandle::Aux(_) => {
+                    // TextChunk specifically ignores images and aux elements
                 }
             }
         }
     }
 
     if !has_text_content {
-        eprintln!("[match_text_chunk_with_boundaries] No text content found");
+        tracing::debug!("[match_text_chunk_with_boundaries] No text content found");
         return None;
     }
 
@@ -1336,17 +1410,15 @@ pub fn extract_section_content_handles<'a>(
     index: &'a PdfIndex,
 ) -> Vec<ContentHandle> {
     // Debugging output
-    let start_debug_info = match start_marker {
+    let describe = |content: &PageContent| match content {
         PageContent::Text(t) => format!("Text('{}', ID: {})", t.text, t.id),
         PageContent::Image(i) => format!("Image(ID: {})", i.id),
+        PageContent::Aux(a) => format!("Aux({:?}, ID: {})", a.kind, a.id),
     };
-    let end_debug_info = end_marker_option.map_or("None".to_string(), |em| match em {
-        PageContent::Text(t) => format!("Text('{}', ID: {})", t.text, t.id),
-        PageContent::Image(i) => format!("Image(ID: {})", i.id),
-    });
-    eprintln!(
+    tracing::debug!(
         "[extract_section_content] Start: {}, End: {}",
-        start_debug_info, end_debug_info
+        describe(start_marker),
+        end_marker_option.map_or("None".to_string(), describe)
     );
 
     // Get the start and end indices in the document
@@ -1376,7 +1448,7 @@ pub fn extract_section_content_handles<'a>(
 //     _page_map_view: &'map_lt BTreeMap<u32, Vec<&'a PageContent>>,
 //     inherited_metadata: &HashMap<String, Value>,
 // ) -> Option<TemplateContentMatch<'a>> {
-//     eprintln!("MATCHER: Processing Table template element");
+//     tracing::debug!("MATCHER: Processing Table template element");
 
 //     let _match_config = template.attributes.get("match")?.as_match_config()?;
 
@@ -1400,7 +1472,7 @@ pub fn extract_section_content_handles<'a>(
 //         let start_marker = potential_table_elements.first().copied()?;
 //         let end_marker = potential_table_elements.last().copied();
 
-//         eprintln!(
+//         tracing::debug!(
 //             "MATCHER: Found potential table starting with element: {:?}",
 //             start_marker.text()
 //         );
@@ -1437,13 +1509,13 @@ pub fn extract_section_content_handles<'a>(
 //     inherited_metadata: &HashMap<String, Value>,
 //     start_image_index: usize,
 // ) -> Option<TemplateContentMatch<'a>> {
-//     eprintln!(
+//     tracing::debug!(
 //         "MATCHER: Processing Image template element, starting search from index {}",
 //         start_image_index
 //     );
 
 //     index.images.get(start_image_index).map(|image_elem| {
-//         eprintln!("MATCHER: Found image with ID {}", image_elem.id);
+//         tracing::debug!("MATCHER: Found image with ID {}", image_elem.id);
 //         let mut result =
 //             TemplateContentMatch::with_content(template, MatchedContent::Image(image_elem.clone()));
 //         result.metadata = inherited_metadata.clone();

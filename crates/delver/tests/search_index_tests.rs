@@ -371,6 +371,9 @@ mod pdf_index_tests {
                         image_object: image_ref.image_object.clone(),
                     }));
                 }
+                delver_core::parse::ContentHandle::Aux(_) => {
+                    // No aux elements in this fixture.
+                }
             }
         }
 
@@ -458,6 +461,9 @@ mod pdf_index_tests {
                         // Test accessing the element
                         let image_ref = index.image(image_handle);
                         assert!(image_ref.page_number > 0);
+                    }
+                    delver_core::parse::ContentHandle::Aux(_) => {
+                        // No aux elements in this fixture.
                     }
                 }
             }
