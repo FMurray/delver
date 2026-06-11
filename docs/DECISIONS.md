@@ -438,3 +438,71 @@ function.
   watermark, no-embedder error naming the element, unknown-method compile error listing values,
   percentile-without-semantic compile error, default ≡ explicit-tokens with no metadata
   additions). PDF builder copied from match_exec.rs per the D-014 precedent.
+
+**D-021 · 2026-06-11 · Stage C slice 1a: `TYPE … AS TABLE` user-defined types + typed table extraction.**
+The final D-004 stage begins. Grammar: new pest rules `type_definition = "TYPE" ~ identifier ~
+"AS" ~ "TABLE" ~ "(" ~ field_list ~ ")" ~ ";"`, `field_decl = identifier ~ identifier` (keywords
+case-sensitive uppercase, the spec's SQL-ish shape; the field type parses as a generic identifier
+and is validated at template compile). v1 field types: TEXT, INT, DECIMAL (the spec example's
+set), in `delver_core::udt`. Declarations compile into a registry (`Root::types`); a Table's
+`type="Name"` resolves at template compile onto the element (`Element::table_type`,
+`Arc<TableTypeDef>` — the match_config resolved-at-compile pattern). Both `type="Name"` and the
+bare-identifier `type=Name` are accepted; a *positional* type argument is rejected by the grammar
+(attributes are strictly `key=value`) — documented choice per the slice spec.
+- **Data-quality vs fail-loud (the D-006 boundary, stated explicitly)**: TYPE/template *misuse* is
+  a hard compile-time error — duplicate TYPE name, duplicate field name, unsupported field type
+  (message lists TEXT/INT/DECIMAL), `type=` referencing an undefined TYPE (message lists defined
+  types), `type=` on any non-Table element. A *cell* that fails coercion is a DATA issue — the
+  field becomes null, the record's `errors` array gains `{row, col, raw, reason}` (grid
+  coordinates, matching `table_cells` addressing), table-level `coerced_ok`/`coerced_err` counts
+  move, and the run continues. Live proof: 3M p26 "Acquisitions / 2014" holds an em dash (SEC nil
+  convention, not in the strip set) → null + one errors entry, everything else extracted.
+- **Column mapping** (`udt::extract_typed_records`): (1) *filler columns* are excluded — every
+  body cell empty or consisting solely of `$ % ( )`/whitespace (the `$` columns SEC HTML-to-PDF
+  filings interleave; on p26 those columns hold "$" in two rows and "" elsewhere); (2) *header
+  pass* (only when a header row was detected): fields claim columns in declared order, best
+  normalized-Levenshtein match wins with threshold similarity >= 0.8 evaluated as
+  `5*dist <= max_len` in integer arithmetic — exact at the boundary, where f64 `1 - 1/5 < 0.8`
+  would wrongly reject `y2015`↔"2015" (normalization: lowercase, alphanumerics only; ties →
+  leftmost); (3) *positional fallback*: unmatched fields take remaining unclaimed non-filler
+  columns left-to-right (headerless tables map fully positionally); (4) a field with no column
+  left → null in every record + one table-level errors entry (row/col null); extra columns are
+  ignored.
+- **Cell coercion**: TEXT verbatim; INT/DECIMAL strip conventions in order — trailing `%` (it
+  sits outside the parens in "(6.0)%"), surrounding parens = negative, then `$`/`,`/whitespace
+  removed; remainder parses as i64/f64. Empty cell → null for every type (counts as ok);
+  symbol-only residue or unparseable remainder → error. `%`-stripped cells are recorded in output
+  metadata `percent_cells: [{row, field}]`. Invariant: `coerced_ok + coerced_err = records ×
+  mapped fields`.
+- **Output**: `ProcessedOutput::TypedTable` (serde tag `"TypedTable"`): `{name, type_name,
+  records: [{field: value}], errors, coerced_ok, coerced_err, provenance: {element_id, page,
+  bbox, source_rows}, metadata, parent_name, parent_index}` — `source_rows[i]` is record i's grid
+  row, `element_id` the kind=table aux element (typed extraction is the first output that carries
+  it). Typed outputs join the D-018 deferred-tables tail. Tables WITHOUT `type=` emit plain
+  TableOutput on the untouched code path — both 10-K baselines re-verified byte-identical
+  (414 534 / 466 678, stderr 0, SIGPIPE clean).
+- Marquee evidence (template in the verify log): `TYPE SegmentPerformance AS TABLE ( metric TEXT,
+  y2015 DECIMAL, y2014 DECIMAL, y2013 DECIMAL );` over the p26 10x7 "PERFORMANCE BY BUSINESS
+  SEGMENT" table → 9 records, $-filler columns skipped, header `2015/2014/2013` fuzzy-matched to
+  `y2015/y2014/y2013`, label column positional → `metric`; Sales 10328/10990/10657 as decimals,
+  four percent rows carrying `percent_cells` metadata, ok/err = 35/1 (the em dash).
+- Tests: crates/delver/tests/udt_spec.rs (happy-path coercion incl. `$1,234`/`(56)`/`7.8 %`/one
+  uncoercible cell, positional fallback + filler skip, untyped-output control, the fail-loud
+  matrix) + udt unit tests (coercion conventions, integer threshold boundary, filler heuristic).
+
+**D-022 · 2026-06-11 · Stage C slice 1b: SubCorpus + TextChunk `template=` interpolation.**
+`SubCorpus(description="…", as="CA_auto_loans")` needs no .pest change (generic element names,
+the D-016 route): a new `ElementType::SubCorpus` is collected into `Root::sub_corpora`
+(name → description) at template compile and stripped from the element tree — declarations never
+match content. Fail-loud shape: missing `as=`/`description=`, a body, duplicate names, or a
+non-top-level declaration are compile errors.
+- **Interpolation semantics** (scope: the TextChunk `template=` attribute only, per the slice
+  spec): `{name}` → the SubCorpus description, substituted **at template compile** (descriptions
+  are constants); `{text}` → the chunk text, substituted at output time (`str::replace`, all
+  occurrences); unknown `{var}` → compile error listing known variables (all SubCorpus names +
+  `text`); unterminated `{` → compile error; no escaping in v1 (a literal `{` always opens a
+  placeholder). `template=` on any non-TextChunk element is a compile error (mirrors the D-021
+  `type=` placement rule). A template without `{text}` produces constant chunk text — the
+  author's choice. Chunk metadata (`chunk_char_count`, page stats) keeps describing the *source*
+  chunk, independent of interpolation.
+

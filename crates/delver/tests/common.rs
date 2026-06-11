@@ -129,6 +129,7 @@ impl TemplateBuilder {
             next_sibling: None,
             match_config: None,
             end_match_config: None,
+            table_type: None,
         };
 
         self.elements.push(element);
@@ -201,6 +202,7 @@ impl SectionBuilder {
             next_sibling: None,
             match_config: None,
             end_match_config: None,
+            table_type: None,
         };
 
         self.children.push(child);
@@ -240,6 +242,7 @@ impl SectionBuilder {
             next_sibling: None,
             match_config,
             end_match_config,
+            table_type: None,
         };
 
         self.parent.elements.push(element);
@@ -299,6 +302,7 @@ impl ChildSectionBuilder {
             next_sibling: None,
             match_config,
             end_match_config,
+            table_type: None,
         };
 
         self.parent.children.push(child);

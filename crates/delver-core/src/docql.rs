@@ -46,6 +46,13 @@ pub struct TemplateParser;
 pub struct Root {
     pub elements: Vec<Element>,
     pub match_definitions: HashMap<String, MatchDefinition>,
+    /// User-defined table types (Stage C, D-021): `TYPE Name AS TABLE (...);`
+    /// declarations, validated (duplicates, field types) at template compile.
+    pub types: HashMap<String, Arc<crate::udt::TableTypeDef>>,
+    /// SubCorpus registry (Stage C, D-022): `as` name -> `description`.
+    /// SubCorpus declarations are extracted from the element tree at template
+    /// compile; they never participate in matching.
+    pub sub_corpora: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +66,11 @@ pub struct Element {
     pub next_sibling: Option<Weak<Element>>,
     pub match_config: Option<MatchConfig>,
     pub end_match_config: Option<MatchConfig>,
+    /// Resolved `type="Name"` attribute of a Table element (Stage C, D-021):
+    /// the user-defined type the matched tables coerce into. Resolved at
+    /// template compile (undefined name / non-Table carrier are hard errors),
+    /// mirroring the `match_config` resolved-at-compile pattern.
+    pub table_type: Option<Arc<crate::udt::TableTypeDef>>,
 }
 
 impl Element {
@@ -73,6 +85,7 @@ impl Element {
             next_sibling: None,
             match_config: None,
             end_match_config: None,
+            table_type: None,
         }
     }
 
@@ -122,6 +135,9 @@ pub enum ElementType {
     ImageBytes,
     ImageCaption,
     ImageEmbedding,
+    /// Corpus-context declaration (Stage C, D-022). Extracted into
+    /// `Root::sub_corpora` at template compile; never matched.
+    SubCorpus,
     Unknown,
     // Add other types as needed
 }
@@ -212,6 +228,39 @@ pub struct TableOutput {
     pub parent_index: Option<usize>,
 }
 
+/// Where a typed table's records came from (Stage C, D-021): the detected
+/// table element (id/page/bbox) plus the grid row index of every record
+/// (parallel to `records`; rows address the same grid `table_cells` uses).
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct TypedTableProvenance {
+    pub element_id: String,
+    pub page: u32,
+    pub bbox: (f32, f32, f32, f32),
+    pub source_rows: Vec<u32>,
+}
+
+/// Output for a matched table coerced into a user-defined type (Stage C,
+/// D-021): `Table(as="...", type="TypeName")`. `records` are `{field: value}`
+/// objects (fields in declared order, null where the cell was empty or
+/// uncoercible); `errors` + `coerced_ok`/`coerced_err` carry the data-quality
+/// signal (a failed cell never aborts the run — template misuse does, at
+/// compile time). Cells whose trailing `%` was stripped are listed in
+/// metadata `percent_cells` as `{row, field}`. Tables without `type=` keep
+/// emitting plain [`TableOutput`], byte-identically.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct TypedTableOutput {
+    pub name: String,
+    pub type_name: String,
+    pub records: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub errors: Vec<crate::udt::CellError>,
+    pub coerced_ok: u32,
+    pub coerced_err: u32,
+    pub provenance: TypedTableProvenance,
+    pub metadata: HashMap<String, serde_json::Value>,
+    pub parent_name: Option<String>,
+    pub parent_index: Option<usize>,
+}
+
 #[derive(Debug, serde::Serialize, Clone)]
 #[serde(tag = "type")] // Add type field for distinguishing in JSON
 pub enum ProcessedOutput {
@@ -220,6 +269,7 @@ pub enum ProcessedOutput {
     Annotation(AnnotationOutput),
     Figure(FigureOutput),
     Table(TableOutput),
+    TypedTable(TypedTableOutput),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -488,15 +538,265 @@ pub fn parse_template(template_str: &str) -> Result<Root, Error> {
             return Err(Error::new(ErrorKind::InvalidData, e.to_string()));
         }
     };
-    let mut root = _parse_template(pairs);
-    // Template-compile-time fail-loud (D-006/D-014): every declared match
-    // clause must be executable, every referenced definition must exist, and
-    // regex patterns / heuristic properties are checked (and regexes cached)
-    // before any matching starts.
+    let (mut root, raw_types) = _parse_template(pairs);
+    // Template-compile-time fail-loud (D-006/D-014/D-021/D-022): every
+    // declared match clause must be executable, every referenced definition
+    // must exist, regex patterns / heuristic properties are checked (and
+    // regexes cached), TYPE declarations are validated and resolved onto
+    // their Table elements, and SubCorpus declarations are extracted and
+    // interpolated into TextChunk template attributes — all before any
+    // matching starts.
+    root.types = compile_type_definitions(raw_types)?;
+    collect_sub_corpora(&mut root)?;
     validate_match_definitions(&root.match_definitions)?;
     resolve_match_configs(&mut root.elements, &root.match_definitions)?;
+    resolve_table_types(&mut root.elements, &root.types)?;
+    resolve_chunk_templates(&mut root.elements, &root.sub_corpora)?;
     compile_match_configs(&mut root.elements)?;
     Ok(root)
+}
+
+/// Raw `TYPE Name AS TABLE ( field TYPE, ... );` declaration as parsed;
+/// validated into a [`crate::udt::TableTypeDef`] by
+/// [`compile_type_definitions`].
+#[derive(Debug)]
+struct RawTypeDef {
+    name: String,
+    fields: Vec<(String, String)>,
+}
+
+/// Validate TYPE declarations (Stage C, D-021): duplicate names and
+/// unsupported field types are hard template-compile errors (D-006).
+fn compile_type_definitions(
+    raw: Vec<RawTypeDef>,
+) -> Result<HashMap<String, Arc<crate::udt::TableTypeDef>>, Error> {
+    let mut types = HashMap::new();
+    for def in raw {
+        let mut fields = Vec::with_capacity(def.fields.len());
+        let mut seen_fields = std::collections::HashSet::new();
+        for (field_name, type_name) in def.fields {
+            let Some(field_type) = crate::udt::FieldType::parse(&type_name) else {
+                return Err(template_error(format!(
+                    "TYPE {}: field '{}' has unsupported type '{}'; supported types: {}",
+                    def.name,
+                    field_name,
+                    type_name,
+                    crate::udt::FieldType::SUPPORTED
+                )));
+            };
+            if !seen_fields.insert(field_name.clone()) {
+                return Err(template_error(format!(
+                    "TYPE {}: duplicate field name '{}'",
+                    def.name, field_name
+                )));
+            }
+            fields.push(crate::udt::FieldDef {
+                name: field_name,
+                field_type,
+            });
+        }
+        if types
+            .insert(
+                def.name.clone(),
+                Arc::new(crate::udt::TableTypeDef {
+                    name: def.name.clone(),
+                    fields,
+                }),
+            )
+            .is_some()
+        {
+            return Err(template_error(format!(
+                "duplicate TYPE definition '{}'",
+                def.name
+            )));
+        }
+    }
+    Ok(types)
+}
+
+/// Extract `SubCorpus(description="...", as="name")` declarations into
+/// `Root::sub_corpora` (Stage C, D-022). Declarations must sit at template
+/// top level, carry both attributes, take no body, and use unique names —
+/// anything else is a template-compile error (D-006).
+fn collect_sub_corpora(root: &mut Root) -> Result<(), Error> {
+    let mut kept = Vec::with_capacity(root.elements.len());
+    for element in root.elements.drain(..) {
+        if element.element_type != ElementType::SubCorpus {
+            // Nested SubCorpus declarations are scope creep with unclear
+            // semantics; reject them where they hide (D-006).
+            fn find_nested(children: &[Element]) -> Option<&Element> {
+                children.iter().find_map(|c| {
+                    if c.element_type == ElementType::SubCorpus {
+                        Some(c)
+                    } else {
+                        find_nested(&c.children)
+                    }
+                })
+            }
+            if find_nested(std::slice::from_ref(&element)).is_some() {
+                return Err(template_error(
+                    "SubCorpus(...) must be declared at template top level".to_string(),
+                ));
+            }
+            kept.push(element);
+            continue;
+        }
+        if !element.children.is_empty() {
+            return Err(template_error(
+                "SubCorpus(...) does not take a body".to_string(),
+            ));
+        }
+        let name = element
+            .attributes
+            .get("as")
+            .and_then(|v| v.as_string())
+            .ok_or_else(|| {
+                template_error(
+                    "SubCorpus(...) requires an as=\"name\" attribute".to_string(),
+                )
+            })?;
+        let description = element
+            .attributes
+            .get("description")
+            .and_then(|v| v.as_string())
+            .ok_or_else(|| {
+                template_error(format!(
+                    "SubCorpus '{name}': requires a description=\"...\" attribute"
+                ))
+            })?;
+        if root.sub_corpora.insert(name.clone(), description).is_some() {
+            return Err(template_error(format!(
+                "duplicate SubCorpus definition '{name}'"
+            )));
+        }
+    }
+    root.elements = kept;
+    Ok(())
+}
+
+/// Resolve `type="Name"` attributes onto Table elements (Stage C, D-021).
+/// Both `type="Name"` and the bare-identifier form `type=Name` are accepted
+/// (the grammar's attributes are strictly `key=value`, so a positional
+/// identifier cannot carry the type — documented choice). `type=` on any
+/// non-Table element and references to undefined TYPEs are template misuse:
+/// hard compile-time errors (D-006), as opposed to per-cell coercion
+/// failures, which are data-quality issues handled at extraction time.
+fn resolve_table_types(
+    elements: &mut [Element],
+    types: &HashMap<String, Arc<crate::udt::TableTypeDef>>,
+) -> Result<(), Error> {
+    for element in elements {
+        if let Some(value) = element.attributes.get("type") {
+            if element.element_type != ElementType::Table {
+                return Err(template_error(format!(
+                    "element '{}': type= is only supported on Table elements",
+                    element.name
+                )));
+            }
+            let name = value.as_string().ok_or_else(|| {
+                template_error(format!(
+                    "Table '{}': type= must be a TYPE name (string or identifier)",
+                    element.name
+                ))
+            })?;
+            let def = types.get(&name).ok_or_else(|| {
+                let mut known: Vec<&str> = types.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                template_error(format!(
+                    "Table '{}': type=\"{}\" references undefined TYPE; defined types: {}",
+                    element.name,
+                    name,
+                    if known.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ))
+            })?;
+            element.table_type = Some(Arc::clone(def));
+        }
+        resolve_table_types(&mut element.children, types)?;
+    }
+    Ok(())
+}
+
+/// Validate and pre-resolve `template="..."` interpolation on TextChunk
+/// elements (Stage C, D-022). `{name}` placeholders referencing a SubCorpus
+/// resolve to its description **at template compile** (they are constants);
+/// `{text}` stays for chunk time. Unknown `{var}`s and `template=` on any
+/// other element type are hard compile errors (D-006). Scope is deliberately
+/// TextChunk-only.
+fn resolve_chunk_templates(
+    elements: &mut [Element],
+    sub_corpora: &HashMap<String, String>,
+) -> Result<(), Error> {
+    for element in elements {
+        if let Some(value) = element.attributes.get("template") {
+            if element.element_type != ElementType::TextChunk {
+                return Err(template_error(format!(
+                    "element '{}': template= interpolation is only supported on TextChunk \
+                     elements",
+                    element.name
+                )));
+            }
+            let Value::String(template) = value else {
+                return Err(template_error(format!(
+                    "{}: template= must be a string",
+                    chunk_owner_label(element)
+                )));
+            };
+            let resolved =
+                interpolate_subcorpus_vars(&chunk_owner_label(element), template, sub_corpora)?;
+            element
+                .attributes
+                .insert("template".to_string(), Value::String(resolved));
+        }
+        resolve_chunk_templates(&mut element.children, sub_corpora)?;
+    }
+    Ok(())
+}
+
+/// Substitute `{name}` -> SubCorpus description, leaving `{text}` verbatim
+/// for chunk-time substitution. Unknown variables and unterminated `{` are
+/// compile errors listing the known variables (D-006). No escaping in v1: a
+/// literal `{` always opens a placeholder.
+fn interpolate_subcorpus_vars(
+    owner: &str,
+    template: &str,
+    sub_corpora: &HashMap<String, String>,
+) -> Result<String, Error> {
+    let known_vars = || {
+        let mut known: Vec<&str> = sub_corpora.keys().map(String::as_str).collect();
+        known.push("text");
+        known.sort_unstable();
+        known.join(", ")
+    };
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            return Err(template_error(format!(
+                "{owner}: template= has an unterminated '{{' placeholder"
+            )));
+        };
+        let var = &after[..close];
+        if var == "text" {
+            out.push_str("{text}");
+        } else if let Some(description) = sub_corpora.get(var) {
+            out.push_str(description);
+        } else {
+            return Err(template_error(format!(
+                "{owner}: template= references unknown variable '{{{var}}}'; known \
+                 variables: {}",
+                known_vars()
+            )));
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn template_error(msg: String) -> Error {
@@ -768,9 +1068,10 @@ fn validate_chunking_attributes(element: &Element) -> Result<(), Error> {
     Ok(())
 }
 
-fn _parse_template(pair: Pair<Rule>) -> Root {
+fn _parse_template(pair: Pair<Rule>) -> (Root, Vec<RawTypeDef>) {
     let mut elements = Vec::new();
     let mut match_definitions = HashMap::new();
+    let mut raw_types = Vec::new();
 
     match pair.as_rule() {
         Rule::template => {
@@ -784,6 +1085,9 @@ fn _parse_template(pair: Pair<Rule>) -> Root {
                         let match_def = process_match_definition(inner_pair);
                         match_definitions.insert(match_def.name.clone(), match_def);
                     }
+                    Rule::type_definition => {
+                        raw_types.push(process_type_definition(inner_pair));
+                    }
                     Rule::EOI => {}
                     rule => {
                         error!("Unexpected rule in template: {:?}", rule);
@@ -796,10 +1100,34 @@ fn _parse_template(pair: Pair<Rule>) -> Root {
         }
     }
 
-    Root {
-        elements,
-        match_definitions,
+    (
+        Root {
+            elements,
+            match_definitions,
+            types: HashMap::new(),
+            sub_corpora: HashMap::new(),
+        },
+        raw_types,
+    )
+}
+
+/// `TYPE Name AS TABLE ( field TYPE, ... );` — collect name and raw field
+/// pairs; semantic validation happens in [`compile_type_definitions`].
+fn process_type_definition(pair: Pair<Rule>) -> RawTypeDef {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let mut fields = Vec::new();
+    if let Some(field_list) = inner.next() {
+        for field_decl in field_list.into_inner() {
+            if field_decl.as_rule() == Rule::field_decl {
+                let mut parts = field_decl.into_inner();
+                let field_name = parts.next().unwrap().as_str().to_string();
+                let type_name = parts.next().unwrap().as_str().to_string();
+                fields.push((field_name, type_name));
+            }
+        }
     }
+    RawTypeDef { name, fields }
 }
 
 fn process_element(pair: Pair<Rule>) -> Element {
@@ -822,6 +1150,7 @@ fn process_element(pair: Pair<Rule>) -> Element {
         "Image" => ElementType::Image,
         "Annotation" => ElementType::Annotation,
         "Figure" => ElementType::Figure,
+        "SubCorpus" => ElementType::SubCorpus,
         "ImageSummary" => ElementType::ImageSummary,
         "ImageBytes" => ElementType::ImageBytes,
         "ImageCaption" => ElementType::ImageCaption,
@@ -859,6 +1188,7 @@ fn process_element(pair: Pair<Rule>) -> Element {
         next_sibling: None,
         match_config: None,
         end_match_config: None,
+        table_type: None,
     }
 }
 
@@ -1610,12 +1940,26 @@ fn process_matched_content_recursive(
                         );
                         continue;
                     };
-                    deferred_tables.push(process_table_element_simple(
-                        table,
-                        &match_item.template_element,
-                        &current_metadata,
-                        parent_info.clone(),
-                    ));
+                    // type="Name" coerces into the user-defined type (Stage
+                    // C, D-021); without it the plain TableOutput path is
+                    // untouched, byte-identically.
+                    let output = match match_item.template_element.table_type.as_deref() {
+                        Some(type_def) => process_typed_table_element(
+                            aux,
+                            table,
+                            type_def,
+                            &match_item.template_element,
+                            &current_metadata,
+                            parent_info.clone(),
+                        ),
+                        None => process_table_element_simple(
+                            table,
+                            &match_item.template_element,
+                            &current_metadata,
+                            parent_info.clone(),
+                        ),
+                    };
+                    deferred_tables.push(output);
                 }
             }
             // Annotation / Figure selectors (D-016): every matched element of
@@ -1648,6 +1992,15 @@ fn process_matched_content_recursive(
                 warn!(
                     "Encountered {:?} as a top-level matched element. These are typically processed as children of an Image element.",
                     match_item.template_element.element_type
+                );
+            }
+            ElementType::SubCorpus => {
+                // Stripped from the element tree at template compile
+                // (collect_sub_corpora); only programmatically built trees
+                // can reach here.
+                warn!(
+                    "SubCorpus element '{}' reached matching; declarations are registry-only",
+                    match_item.template_element.name
                 );
             }
             ElementType::Unknown => {
@@ -1785,6 +2138,72 @@ fn process_table_element_simple(
         cells: table.cells.clone(),
         strategy: table.strategy,
         confidence: table.confidence,
+        metadata: json_metadata,
+        parent_name,
+        parent_index,
+    })
+}
+
+/// Build the output for a matched table carrying a `type="Name"` attribute
+/// (Stage C, D-021): coerce the detected grid into typed records. Naming,
+/// inherited metadata, and parent links follow `process_table_element_simple`;
+/// the table element id rides in `provenance` (typed extraction is the first
+/// consumer that needs it). Cells whose trailing `%` was stripped surface as
+/// metadata `percent_cells`.
+fn process_typed_table_element(
+    aux: &crate::parse::AuxElement,
+    table: &crate::table::TableStructure,
+    type_def: &crate::udt::TableTypeDef,
+    template_element: &Element,
+    metadata: &HashMap<String, Value>,
+    parent_info: Option<(String, usize)>,
+) -> ProcessedOutput {
+    let extraction = crate::udt::extract_typed_records(table, type_def);
+
+    let mut json_metadata: HashMap<String, serde_json::Value> = metadata
+        .iter()
+        .map(|(k, v)| (k.clone(), template_value_to_json(v)))
+        .collect();
+    if !extraction.percent_cells.is_empty() {
+        json_metadata.insert(
+            "percent_cells".to_string(),
+            serde_json::Value::Array(
+                extraction
+                    .percent_cells
+                    .iter()
+                    .map(|(row, field)| serde_json::json!({ "row": row, "field": field }))
+                    .collect(),
+            ),
+        );
+    }
+    let name = match template_element.attributes.get("as") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => format!("{other:?}"),
+        None => template_element.name.clone(),
+    };
+    let (parent_name, parent_index) = match parent_info {
+        Some((name, index)) => (Some(name), Some(index)),
+        None => (None, None),
+    };
+
+    ProcessedOutput::TypedTable(TypedTableOutput {
+        name,
+        type_name: type_def.name.clone(),
+        records: extraction.records,
+        errors: extraction.errors,
+        coerced_ok: extraction.coerced_ok,
+        coerced_err: extraction.coerced_err,
+        provenance: TypedTableProvenance {
+            element_id: aux.id.to_string(),
+            page: table.page,
+            bbox: (
+                table.bbox.x0,
+                table.bbox.y0,
+                table.bbox.x1,
+                table.bbox.y1,
+            ),
+            source_rows: extraction.source_rows,
+        },
         metadata: json_metadata,
         parent_name,
         parent_index,
@@ -1996,6 +2415,18 @@ fn process_text_chunk_elements_simple(
             })?,
     };
 
+    // template="..." interpolation (Stage C, D-022, TextChunk only):
+    // SubCorpus {name} placeholders were already substituted at template
+    // compile, so the only chunk-time variable left is {text}.
+    let chunk_template = if template_element.element_type == ElementType::TextChunk {
+        template_element
+            .attributes
+            .get("template")
+            .and_then(|v| v.as_string())
+    } else {
+        None
+    };
+
     // -------- 2. static conversion of template‑level metadata --------
     // Transform once rather than for every chunk.
     let base_metadata: std::sync::Arc<HashMap<String, serde_json::Value>> = {
@@ -2155,8 +2586,15 @@ fn process_text_chunk_elements_simple(
 
         // Note: We've simplified the parent tracking - no longer storing full ancestry path
 
+        // {text} substitution happens last: metadata char/page statistics
+        // describe the source chunk, independent of interpolation (D-022).
+        let text = match &chunk_template {
+            Some(template) => template.replace("{text}", &chunk_text),
+            None => chunk_text,
+        };
+
         outputs.push(ChunkOutput {
-            text: chunk_text,
+            text,
             metadata: meta,
             chunk_index: *global_chunk_counter,
             parent_name: parent_name.clone(),

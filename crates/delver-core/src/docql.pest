@@ -1,7 +1,16 @@
 WHITESPACE          = _{ " " | "\t" | "\r" | "\n" }
 NEWLINE             = _{ "\r\n" | "\n" }
 
-template            =  { SOI ~ (match_definition | expression)* ~ EOI }
+template            =  { SOI ~ (type_definition | match_definition | expression)* ~ EOI }
+
+// User-defined types (Stage C, docs/DECISIONS.md D-021):
+//   TYPE BalanceSheet AS TABLE ( account TEXT, year INT, amount DECIMAL );
+// Keywords are case-sensitive uppercase (the spec's SQL-ish shape). The field
+// type is parsed as a generic identifier and validated at template compile so
+// unsupported types fail with a message listing the supported set (D-006).
+type_definition     =  { "TYPE" ~ identifier ~ "AS" ~ "TABLE" ~ "(" ~ field_list ~ ")" ~ ";" }
+field_list          =  { field_decl ~ ("," ~ field_decl)* ~ ","? }
+field_decl          =  { identifier ~ identifier }
 
 // Match configuration definitions
 match_definition    =  { "Match" ~ "<" ~ identifier ~ ">" ~ identifier ~ match_body }
