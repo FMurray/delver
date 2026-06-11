@@ -17,5 +17,5 @@ pub use hydrate::{hydrate_index, hydrate_pages};
 pub use store::{DelverStore, SCHEMA_VERSION};
 pub use types::{
     BlobRow, CorpusId, DocumentId, ElementId, ElementKind, ElementRow, ImagePayload, IngestOutcome,
-    LoadedDocument, RefEdgeRow, SearchScope, TextSearchHit,
+    LoadedDocument, RefEdgeRow, SearchScope, TableCellRow, TextSearchHit,
 };

@@ -1,11 +1,11 @@
 #!/bin/sh
 # Dev launcher for the Delver viewer (crates/viewer) against the local
-# Postgres store. See docs/DECISIONS-viewer.md (DV-001..DV-007).
+# Postgres store. See docs/DECISIONS-viewer.md (DV-001..DV-010).
 #
-#   DATABASE_URL      Postgres store (default: the viewer's DEDICATED dev
-#                     database, DV-007 — parallel worktrees must not share a
-#                     database, the embedded migrator refuses migrations
-#                     applied by other branches)
+#   DATABASE_URL      Postgres store (default: the SHARED dev database, DV-010 —
+#                     the viewer branch is merged and its embedded migrator
+#                     matches the shared schema (v3); the old dedicated
+#                     delver_viewer database is legacy/disposable)
 #   DELVER_DOC_CACHE  byte-cache for original PDFs (default ~/.delver/doc-cache)
 #   PDFIUM_LIBRARY_PATH  where libpdfium.dylib lives at runtime
 #   DELVER_EMBED_ENDPOINT  optional, forwarded to template execution (DV-006)
@@ -18,7 +18,7 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-export DATABASE_URL="${DATABASE_URL:-postgres://delver:delver@localhost:5433/delver_viewer}"
+export DATABASE_URL="${DATABASE_URL:-postgres://delver:delver@localhost:5433/delver}"
 export DELVER_DOC_CACHE="${DELVER_DOC_CACHE:-$HOME/.delver/doc-cache}"
 mkdir -p "$DELVER_DOC_CACHE"
 

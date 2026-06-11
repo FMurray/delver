@@ -61,7 +61,7 @@ pub struct PageMeta {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ElementOverlay {
     pub id: String,
-    /// `text` | `image` | `annotation` | `path` | `figure` | `blob`.
+    /// `text` | `image` | `annotation` | `path` | `figure` | `table` | `blob`.
     pub kind: String,
     /// 1-based store page number.
     pub page: i32,
@@ -72,6 +72,25 @@ pub struct ElementOverlay {
     pub font_size: Option<f32>,
     pub font_name: Option<String>,
     pub metadata: serde_json::Value,
+    /// Cell grid for `kind == "table"` rows (D-018), ordered by (row, col);
+    /// `None` for every other kind. delver-store attaches cells on both
+    /// `load_document` and `elements_in_bbox`, so this is a pure DTO mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<CellOverlay>>,
+}
+
+/// One stored table cell of a `kind == "table"` overlay (mirrors
+/// delver-store's `TableCellRow`, D-018).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CellOverlay {
+    pub row: i32,
+    pub col: i32,
+    pub row_span: i32,
+    pub col_span: i32,
+    /// (x0, y0, x1, y1) in top-left PDF points.
+    pub bbox: Option<(f32, f32, f32, f32)>,
+    pub text: Option<String>,
+    pub is_header: bool,
 }
 
 /// Result of executing a DocQL template against a stored document.
@@ -91,7 +110,7 @@ pub use server::*;
 
 #[cfg(feature = "ssr")]
 mod server {
-    use super::{DocumentSummary, ElementOverlay, PageMeta, UploadReceipt};
+    use super::{CellOverlay, DocumentSummary, ElementOverlay, PageMeta, UploadReceipt};
     use anyhow::{anyhow, Context, Result};
     use delver_store::{DelverStore, DocumentId, ElementRow};
     use sha2::{Digest, Sha256};
@@ -103,11 +122,10 @@ mod server {
     use tokio::sync::OnceCell;
     use uuid::Uuid;
 
-    /// The viewer's DEDICATED local dev database (DV-007): parallel worktrees
-    /// must not share a database — the migrations table is shared mutable
-    /// state, and the embedded migrator (correctly) refuses a database that
-    /// carries migrations this checkout doesn't know about.
-    pub const DEFAULT_DB_URL: &str = "postgres://delver:delver@localhost:5433/delver_viewer";
+    /// The SHARED local dev database (DV-010): the viewer branch is merged,
+    /// its embedded migrator matches the shared schema (v3), so the DV-007
+    /// split-database rule no longer applies — `delver_viewer` is legacy.
+    pub const DEFAULT_DB_URL: &str = "postgres://delver:delver@localhost:5433/delver";
     /// Default corpus for documents ingested through the viewer.
     pub const DEFAULT_CORPUS: &str = "viewer-dev";
     /// Raster DPI (PDF default is 72; 150 matches the previous SQLite store).
@@ -311,6 +329,20 @@ mod server {
             font_size: row.font_size,
             font_name: row.font_name.clone(),
             metadata: row.metadata.clone(),
+            cells: row.table_cells.as_ref().map(|cells| {
+                cells
+                    .iter()
+                    .map(|c| CellOverlay {
+                        row: c.row,
+                        col: c.col,
+                        row_span: c.row_span,
+                        col_span: c.col_span,
+                        bbox: c.bbox,
+                        text: c.text.clone(),
+                        is_header: c.is_header,
+                    })
+                    .collect()
+            }),
         }
     }
 
@@ -607,6 +639,57 @@ mod server {
                 display_name(None, Some("mem://synthetic.pdf"), "abcdef12-3456"),
                 "synthetic.pdf"
             );
+        }
+
+        #[test]
+        fn overlay_from_row_maps_table_cells() {
+            let id = Uuid::new_v4();
+            let row = ElementRow {
+                id: delver_store::ElementId(id),
+                document_id: DocumentId(Uuid::new_v4()),
+                page: 26,
+                kind: delver_store::ElementKind::Table,
+                order_idx: 7,
+                text: None,
+                font_size: None,
+                font_name: None,
+                style_key: None,
+                bbox: Some((10.0, 20.0, 110.0, 80.0)),
+                metadata: serde_json::json!({
+                    "n_rows": 1, "n_cols": 2, "strategy": "ruled", "confidence": 0.9
+                }),
+                image: None,
+                blob: None,
+                table_cells: Some(vec![
+                    delver_store::TableCellRow {
+                        row: 0,
+                        col: 0,
+                        row_span: 1,
+                        col_span: 1,
+                        text: Some("Sales".to_string()),
+                        bbox: Some((10.0, 20.0, 60.0, 40.0)),
+                        is_header: true,
+                    },
+                    delver_store::TableCellRow {
+                        row: 0,
+                        col: 1,
+                        row_span: 1,
+                        col_span: 1,
+                        text: None,
+                        bbox: None,
+                        is_header: false,
+                    },
+                ]),
+            };
+            let overlay = overlay_from_row(&row);
+            assert_eq!(overlay.kind, "table");
+            let cells = overlay.cells.expect("table overlay carries cells");
+            assert_eq!(cells.len(), 2);
+            assert_eq!(cells[0].text.as_deref(), Some("Sales"));
+            assert!(cells[0].is_header);
+            assert_eq!(cells[0].bbox, Some((10.0, 20.0, 60.0, 40.0)));
+            assert_eq!((cells[1].row, cells[1].col), (0, 1));
+            assert!(!cells[1].is_header);
         }
 
         #[test]

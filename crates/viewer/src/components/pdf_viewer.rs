@@ -7,7 +7,7 @@ use leptos_router::hooks::{use_params_map, use_query_map};
 use uuid::Uuid;
 
 use crate::components::file_upload::get_document_by_id;
-use crate::store::{ElementOverlay, PageMeta};
+use crate::store::{CellOverlay, ElementOverlay, PageMeta};
 
 /// Raster layout metadata for one page (placeholder info when the original
 /// bytes are unavailable).
@@ -38,11 +38,67 @@ fn kind_colors(kind: &str) -> (&'static str, &'static str) {
         "figure" => ("rgba(16,185,129,0.9)", "rgba(16,185,129,0.12)"),
         "path" => ("rgba(168,85,247,0.8)", "rgba(168,85,247,0.07)"),
         "image" => ("rgba(236,72,153,0.9)", "rgba(236,72,153,0.10)"),
+        "table" => ("rgba(220,38,38,0.95)", "rgba(220,38,38,0.04)"),
         _ => ("rgba(107,114,128,0.9)", "rgba(107,114,128,0.10)"),
     }
 }
 
-const TOGGLE_KINDS: [&str; 5] = ["text", "annotation", "figure", "path", "image"];
+/// Inner cell-grid styling for table overlays (D-018 cells).
+const CELL_BORDER: &str = "rgba(220,38,38,0.45)";
+const HEADER_FILL: &str = "rgba(220,38,38,0.16)";
+
+const TOGGLE_KINDS: [&str; 6] = ["text", "annotation", "figure", "path", "image", "table"];
+
+/// Dense (row, col)-addressable text grid built from a table's cells:
+/// `grid[row][col] = (text, is_header)`. Sized from the element metadata's
+/// n_rows/n_cols when present (D-018 writes them at detection time), else
+/// from the cells' max indices; out-of-range cells are dropped.
+fn cell_text_grid(
+    metadata: &serde_json::Value,
+    cells: &[CellOverlay],
+) -> Vec<Vec<(String, bool)>> {
+    let from_meta = |key: &str| metadata.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    let n_rows = (from_meta("n_rows").max(cells.iter().map(|c| c.row as i64 + 1).max().unwrap_or(0)))
+        .max(0) as usize;
+    let n_cols = (from_meta("n_cols").max(cells.iter().map(|c| c.col as i64 + 1).max().unwrap_or(0)))
+        .max(0) as usize;
+    let mut grid = vec![vec![(String::new(), false); n_cols]; n_rows];
+    for cell in cells {
+        if let Some(slot) = grid
+            .get_mut(cell.row.max(0) as usize)
+            .and_then(|row| row.get_mut(cell.col.max(0) as usize))
+        {
+            *slot = (cell.text.clone().unwrap_or_default(), cell.is_header);
+        }
+    }
+    grid
+}
+
+/// "n_rows × n_cols • strategy • confidence" from a table element's
+/// metadata (the exact keys D-018 persists).
+fn table_summary(metadata: &serde_json::Value) -> String {
+    let int = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(|v| v.as_i64())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let strategy = metadata
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let confidence = metadata
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "?".to_string());
+    format!(
+        "{} rows × {} cols • {strategy} • confidence {confidence}",
+        int("n_rows"),
+        int("n_cols"),
+    )
+}
 
 /// Pager link styling; disabled state is cosmetic (`pointer-events-none`).
 fn nav_button_class(disabled: bool) -> &'static str {
@@ -218,11 +274,6 @@ pub fn PdfViewer() -> impl IntoView {
                                         </label>
                                     }
                                 }).collect::<Vec<_>>()}
-                                <label class="flex items-center space-x-1 text-xs text-gray-400" title="TABLE structure lands in Stage B3">
-                                    <input type="checkbox" disabled />
-                                    <span class="inline-block w-3 h-3 rounded-sm bg-gray-300"></span>
-                                    <span class="italic">"table (coming in B3)"</span>
-                                </label>
                             </div>
                         </header>
                         <div class="flex-1 flex overflow-hidden">
@@ -343,6 +394,30 @@ fn page_view(
                         (y1 - y0).max(1.0) * scale,
                     );
                     let title = format!("{} #{}", element.kind, element.order_idx);
+                    // Table cell grid (D-018): thin inner borders from each
+                    // cell's bbox, positioned relative to the table overlay
+                    // (so the kind toggle's display:none hides them too);
+                    // header cells get a fill tint. pointer-events:none keeps
+                    // clicks landing on the table element itself.
+                    let cell_grid = element.cells.as_deref().unwrap_or_default().iter()
+                        .filter_map(|cell| {
+                            let (cx0, cy0, cx1, cy1) = cell.bbox?;
+                            let header_fill = if cell.is_header {
+                                format!("background:{HEADER_FILL};")
+                            } else {
+                                String::new()
+                            };
+                            let style = format!(
+                                "left:{:.1}px;top:{:.1}px;width:{:.1}px;height:{:.1}px;\
+                                 border:1px solid {CELL_BORDER};{header_fill}pointer-events:none",
+                                (cx0 - x0) * scale,
+                                (cy0 - y0) * scale,
+                                (cx1 - cx0).max(1.0) * scale,
+                                (cy1 - cy0).max(1.0) * scale,
+                            );
+                            Some(view! { <div class="absolute" style=style></div> })
+                        })
+                        .collect::<Vec<_>>();
                     let style = move || {
                         if enabled.get() {
                             base_style.clone()
@@ -356,7 +431,7 @@ fn page_view(
                             style=style
                             title=title
                             on:click=move |_| selected.set(Some(element.clone()))
-                        ></div>
+                        >{cell_grid}</div>
                     })
                 }).collect::<Vec<_>>()}
             </div>
@@ -380,6 +455,42 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
         (None, Some(size)) => format!("{size:.1}pt"),
         (None, None) => "—".to_string(),
     };
+
+    // Table structure section (kind=table, D-018): n_rows × n_cols, strategy,
+    // confidence from element metadata + the cell text grid.
+    let table_section = element.cells.as_ref().map(|cells| {
+        let summary = table_summary(&element.metadata);
+        let grid = cell_text_grid(&element.metadata, cells);
+        view! {
+            <div>
+                <div class="text-xs font-medium text-gray-500 uppercase mb-1">"Table structure"</div>
+                <div class="text-xs text-gray-700 mb-2">{summary}</div>
+                <div class="bg-gray-50 rounded p-2" style="max-height:18rem;overflow:auto">
+                    <table class="text-xs text-gray-800 border-collapse">
+                        <tbody>
+                            {grid.into_iter().map(|row| view! {
+                                <tr>
+                                    {row.into_iter().map(|(text, is_header)| {
+                                        let class = if is_header {
+                                            "border border-gray-300 px-1.5 py-0.5 align-top font-semibold"
+                                        } else {
+                                            "border border-gray-300 px-1.5 py-0.5 align-top"
+                                        };
+                                        let style = if is_header {
+                                            format!("background:{HEADER_FILL}")
+                                        } else {
+                                            String::new()
+                                        };
+                                        view! { <td class=class style=style>{text}</td> }
+                                    }).collect::<Vec<_>>()}
+                                </tr>
+                            }).collect::<Vec<_>>()}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        }
+    });
 
     view! {
         <aside class="bg-white border-l border-gray-200 shadow-lg" style="width:24rem;overflow-y:auto">
@@ -409,6 +520,7 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
                     <div class="text-xs font-medium text-gray-500 uppercase mb-1">"Font"</div>
                     <div class="text-xs text-gray-700">{font}</div>
                 </div>
+                {table_section}
                 <div>
                     <div class="text-xs font-medium text-gray-500 uppercase mb-1">"Text"</div>
                     <div class="text-xs text-gray-800 whitespace-pre-wrap bg-gray-50 rounded p-2" style="max-height:12rem;overflow-y:auto">
@@ -421,5 +533,65 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
                 </div>
             </div>
         </aside>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cell_text_grid, table_summary};
+    use crate::store::CellOverlay;
+
+    fn cell(row: i32, col: i32, text: &str, is_header: bool) -> CellOverlay {
+        CellOverlay {
+            row,
+            col,
+            row_span: 1,
+            col_span: 1,
+            bbox: Some((0.0, 0.0, 1.0, 1.0)),
+            text: if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            },
+            is_header,
+        }
+    }
+
+    #[test]
+    fn grid_is_sized_from_metadata_and_placed_by_row_col() {
+        let metadata = serde_json::json!({"n_rows": 2, "n_cols": 3});
+        // Sparse cells: (0,0) header, (1,2) body; everything else empty.
+        let grid = cell_text_grid(
+            &metadata,
+            &[cell(0, 0, "Sales", true), cell(1, 2, "10,328", false)],
+        );
+        assert_eq!(grid.len(), 2);
+        assert_eq!(grid[0].len(), 3);
+        assert_eq!(grid[0][0], ("Sales".to_string(), true));
+        assert_eq!(grid[0][1], (String::new(), false));
+        assert_eq!(grid[1][2], ("10,328".to_string(), false));
+    }
+
+    #[test]
+    fn grid_grows_to_cell_extent_when_metadata_is_absent() {
+        let grid = cell_text_grid(&serde_json::json!({}), &[cell(2, 1, "x", false)]);
+        assert_eq!(grid.len(), 3);
+        assert_eq!(grid[0].len(), 2);
+        assert_eq!(grid[2][1], ("x".to_string(), false));
+    }
+
+    #[test]
+    fn summary_renders_d018_metadata_keys() {
+        let metadata = serde_json::json!({
+            "n_rows": 10, "n_cols": 7, "strategy": "ruled", "confidence": 1.0
+        });
+        assert_eq!(
+            table_summary(&metadata),
+            "10 rows × 7 cols • ruled • confidence 1.00"
+        );
+        assert_eq!(
+            table_summary(&serde_json::json!({})),
+            "? rows × ? cols • ? • confidence ?"
+        );
     }
 }

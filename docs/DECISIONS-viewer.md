@@ -115,3 +115,45 @@ permanently in the tree with the kind toggle driving a reactive
 resources you render from directly in the suspense closure, and prefer
 attribute-level reactivity over structural conditionals for server-rendered
 collections.
+
+**DV-010 · 2026-06-11 · DB reunification: viewer back on the shared `delver` database; `delver_viewer` is legacy/disposable.**
+The merge (9062694) converged the branches: this checkout's embedded migrator
+(delver-store 0001+0002+0003) now matches the shared database's applied
+migrations exactly, so the DV-007 one-database-per-worktree rule no longer
+applies *to this checkout* — the defaults in `store::DEFAULT_DB_URL`,
+`crates/viewer/.env`, and `scripts/dev-viewer.sh` are flipped to
+`postgres://delver:delver@localhost:5433/delver`. The stopgap `delver_viewer`
+database is legacy/disposable: nothing reads it anymore; its only real content
+(a viewer-dev ingest of the 3M 10-K) was re-ingested into the shared DB (the
+byte-cache file is content-hash keyed, so it was already shared). DV-007's
+rule still stands for any future worktree that diverges on migrations. Note:
+the shared DB accumulates synthetic test corpora (`idempotent-…`,
+`roundtrip-…`, two-page fixtures) — the store integration tests create
+uniquely named corpora and do not delete them, so the viewer's newest-first
+document list shows real documents interleaved with that residue.
+
+**DV-011 · 2026-06-11 · Table overlays: cells ride the element DTO; grid drawn inside the table overlay; demo document.**
+The table toggle is live (the greyed-out "coming in B3" placeholder is gone).
+`ElementOverlay` gains `cells: Option<Vec<CellOverlay>>` (row, col, spans,
+bbox, text, is_header — the D-018 cell shape), mapped 1:1 from
+`ElementRow.table_cells`, which delver-store already attaches on both
+`load_document` and `elements_in_bbox` — per-page REST and server-fn element
+payloads carry cells with zero new store queries (`TableCellRow` is now
+re-exported from delver-store's lib.rs, an additive fix: the public
+`ElementRow.table_cells` field's type was un-nameable downstream).
+Rendering: table bboxes draw in their own color (red family, distinct from
+the five Stage-B kinds); the cell grid renders as absolutely positioned
+children *inside* the table overlay div (each cell's bbox offset by the table
+origin), 1px inner borders, fill tint where `is_header`, and
+`pointer-events:none` so clicks land on the table element — nesting means the
+kind toggle's attribute-level `display:none` (DV-009) hides the grid for
+free, and SSR/hydration stay structurally identical. Clicking a table opens
+the side panel with "n rows × m cols • strategy • confidence" (exactly the
+D-018 metadata keys) plus a dense per-(row, col) text grid sized from
+metadata with cell-extent fallback (header cells tinted).
+Demo document: `~/datasets/3M_2015_10K.pdf` ingested through the running
+server's upload path into corpus `viewer-dev` on the shared DB → document
+`c5bd3aa0-d6e3-49ca-aae0-82eb3a05f3c3` (created, 158 pages, 26 657 elements,
+125 tables / 11 615 cells, byte-cache uri set so rasters render). Store page
+26 (viewer page index 25) carries the 10×7 ruled segment-performance table
+(confidence 0.88) used for the overlay evidence.
