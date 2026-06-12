@@ -58,7 +58,12 @@ pub fn QueryPalette() -> impl IntoView {
     );
 
     view! {
-        <div class="mt-6 border-t border-gray-200 pt-4">
+        // Only render with a document open (the palette is doc-aware), and
+        // ABOVE the upload/doc-list block — mounted after it, the header sat
+        // below the fold of the scrollable sidebar whenever the store had
+        // more than a handful of documents.
+        <Show when=move || current_doc.get().is_some()>
+        <div class="mb-6 border-b border-gray-200 pb-4">
             <button
                 class="w-full flex items-center justify-between text-sm font-semibold text-gray-900"
                 on:click=move |_| open.update(|v| *v = !*v)
@@ -87,6 +92,7 @@ pub fn QueryPalette() -> impl IntoView {
                 </Suspense>
             </Show>
         </div>
+        </Show>
     }
 }
 

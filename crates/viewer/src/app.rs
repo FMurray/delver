@@ -179,8 +179,8 @@ pub fn SidePanel() -> impl IntoView {
                     <p class="text-sm text-gray-600 mt-1">Upload and manage your PDF documents</p>
                 </div>
                 <div class="flex-1 p-6 overflow-y-auto">
-                    <FileUpload />
                     <QueryPalette />
+                    <FileUpload />
                 </div>
             </div>
         </aside>
