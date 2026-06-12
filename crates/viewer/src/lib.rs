@@ -3,6 +3,7 @@ pub mod components;
 // pub mod event_panel;
 // pub mod match_panel;
 // pub mod rendering;
+pub mod query_tree;
 pub mod snippets;
 pub mod store;
 // pub mod stubs;

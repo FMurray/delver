@@ -112,17 +112,12 @@ fn text_match_block(match_name: &str, text: &str) -> String {
     format!("Match<Section> {match_name} {{\n  Text(\"{pattern}\", threshold=0.6)\n}}")
 }
 
-/// `TYPE TableP<page> AS TABLE ( … );` + a `Table` element using it. Field
-/// names are slugified header texts (fallback `col<index>`), deduplicated;
-/// field types DECIMAL for numeric-ish columns, else TEXT.
-fn typed_table_snippet(buffer: &str, page: i32, columns: &[ColumnSpec]) -> String {
-    let (type_name, as_name) = paired_unique(
-        buffer,
-        &format!("TableP{page}"),
-        &format!("table_p{page}"),
-    );
-    let mut fields: Vec<String> = Vec::new();
-    let mut lines = String::new();
+/// `(name, DECIMAL|TEXT)` field rows for a TYPE declaration generated from
+/// table columns: slugified header texts (fallback `col<index>`),
+/// deduplicated within the list; DECIMAL for numeric-ish columns. Shared by
+/// the typed-table snippet and the V4 builder's "New TYPE…" form.
+pub fn type_fields_from_columns(columns: &[ColumnSpec]) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
     for col in columns {
         let base = col
             .header
@@ -132,12 +127,26 @@ fn typed_table_snippet(buffer: &str, page: i32, columns: &[ColumnSpec]) -> Strin
             .unwrap_or_else(|| format!("col{}", col.index));
         let mut name = base.clone();
         let mut n = 2;
-        while fields.iter().any(|f| f == &name) {
+        while fields.iter().any(|(f, _)| f == &name) {
             name = format!("{base}_{n}");
             n += 1;
         }
-        fields.push(name.clone());
         let ty = if col.numeric { "DECIMAL" } else { "TEXT" };
+        fields.push((name, ty.to_string()));
+    }
+    fields
+}
+
+/// `TYPE TableP<page> AS TABLE ( … );` + a `Table` element using it. Field
+/// rows come from [`type_fields_from_columns`].
+fn typed_table_snippet(buffer: &str, page: i32, columns: &[ColumnSpec]) -> String {
+    let (type_name, as_name) = paired_unique(
+        buffer,
+        &format!("TableP{page}"),
+        &format!("table_p{page}"),
+    );
+    let mut lines = String::new();
+    for (name, ty) in type_fields_from_columns(columns) {
         lines.push_str(&format!("  {name} {ty},\n"));
     }
     format!(
@@ -575,6 +584,21 @@ mod tests {
             out,
             "TYPE TableP26 AS TABLE (\n  col1 TEXT,\n  c2015 DECIMAL,\n  c2014 DECIMAL,\n);\n\n\
              Table(as=\"table_p26\", type=\"TableP26\")"
+        );
+    }
+
+    #[test]
+    fn type_fields_from_columns_match_the_typed_snippet() {
+        // The V4 "New TYPE…" form prefill must agree with the DV-012
+        // generator: same slugs, same dedupe, same DECIMAL/TEXT guesses.
+        let columns = column_specs(5, &p26_like_cells());
+        assert_eq!(
+            type_fields_from_columns(&columns),
+            vec![
+                ("col1".to_string(), "TEXT".to_string()),
+                ("c2015".to_string(), "DECIMAL".to_string()),
+                ("c2014".to_string(), "DECIMAL".to_string()),
+            ]
         );
     }
 
