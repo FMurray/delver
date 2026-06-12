@@ -13,6 +13,8 @@
 // use crate::ui_controls;
 // use crate::utils;
 use crate::components::file_upload::FileUpload;
+use crate::components::insert::InsertBus;
+use crate::components::palette::QueryPalette;
 use crate::components::pdf_viewer::PdfViewer;
 use crate::components::query_panel::QueryPanel;
 use crate::components::ui::Toggle;
@@ -48,6 +50,11 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 
                 <link rel="stylesheet" href="https://unpkg.com/codemirror@5.65.17/addon/lint/lint.css" />
                 <script src="https://unpkg.com/codemirror@5.65.17/addon/lint/lint.js"></script>
+
+                // Completion dropdown (DV-012): the LSP-backed hint function
+                // in query_panel.rs renders through this addon (Ctrl-Space).
+                <link rel="stylesheet" href="https://unpkg.com/codemirror@5.65.17/addon/hint/show-hint.css" />
+                <script src="https://unpkg.com/codemirror@5.65.17/addon/hint/show-hint.js"></script>
             </head>
             <body>
                 <App />
@@ -60,13 +67,15 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 pub fn App() -> impl IntoView {
     provide_meta_context();
 
-    // Sidebar (document list) starts open; query panel opens on demand or
-    // via ?template=…&run=1 deep links (see QueryParamSync).
+    // Sidebar (document list) starts open; query panel opens on demand,
+    // via ?template=…&run=1 deep links (see QueryParamSync), or by any
+    // "insert into query" action (DV-012).
     let (show_sidebar, set_show_sidebar) = signal(true);
     let (show_query, set_show_query) = signal(false);
 
     provide_context(SidebarContext(show_sidebar, set_show_sidebar));
     provide_context(QueryContext(show_query, set_show_query));
+    provide_context(InsertBus::new());
 
     view! {
         <Router>
@@ -171,6 +180,7 @@ pub fn SidePanel() -> impl IntoView {
                 </div>
                 <div class="flex-1 p-6 overflow-y-auto">
                     <FileUpload />
+                    <QueryPalette />
                 </div>
             </div>
         </aside>

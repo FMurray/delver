@@ -103,6 +103,31 @@ pub struct TemplateRun {
     pub error: Option<String>,
 }
 
+/// Doc-aware query palette (DV-012): heading candidates + detected tables
+/// for the open document, with enough column structure to generate typed
+/// table snippets client-side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaletteData {
+    /// Section-heading candidates (heuristic in `snippets::select_headings`),
+    /// capped at [`crate::snippets`]' palette cap; pages are 1-based.
+    pub headings: Vec<crate::snippets::HeadingInput>,
+    /// Detected tables in (page, order) order.
+    pub tables: Vec<TableEntry>,
+}
+
+/// One detected table for the palette list (the D-018 metadata keys) plus
+/// the non-filler column specs used by the typed-table snippet generator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableEntry {
+    /// 1-based store page.
+    pub page: i32,
+    pub n_rows: i64,
+    pub n_cols: i64,
+    pub strategy: String,
+    pub confidence: f64,
+    pub columns: Vec<crate::snippets::ColumnSpec>,
+}
+
 // ───────────────────────── server-side implementation ─────────────────────────
 
 #[cfg(feature = "ssr")]
@@ -344,6 +369,123 @@ mod server {
                     .collect()
             }),
         }
+    }
+
+    // ── doc-aware query palette (DV-012) ─────────────────────────────────
+
+    /// Max heading candidates returned by the palette.
+    const PALETTE_HEADING_CAP: usize = 20;
+
+    /// Heading candidates + detected tables for one document. Pure viewer-
+    /// layer SQL over the store pool (the DV-001/DV-004 boundary precedent);
+    /// selection/inference logic lives in `crate::snippets` so it is unit-
+    /// testable without a database.
+    pub async fn doc_palette(doc_id: &str) -> Result<super::PaletteData> {
+        use crate::snippets::{column_specs, select_headings, CellLite, HeadingInput};
+
+        let store = store().await?;
+        let id = parse_doc_id(doc_id)?;
+
+        // Dominant (modal) text style: the document's body size + boldness.
+        let modal: Option<(f64, Option<String>)> = sqlx::query_as(
+            "SELECT round(font_size::numeric, 1)::float8 AS fs, font_name \
+               FROM elements \
+              WHERE document_id = $1 AND kind = 'text' \
+                AND font_size IS NOT NULL AND text IS NOT NULL \
+                AND length(trim(text)) > 0 \
+              GROUP BY fs, font_name ORDER BY count(*) DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(store.pool())
+        .await?;
+        let (body_size, body_font) = modal
+            .map(|(fs, font)| (fs as f32, font))
+            .unwrap_or((12.0, None));
+        let body_is_bold = body_font
+            .as_deref()
+            .is_some_and(|f| f.to_ascii_lowercase().contains("bold"));
+
+        // Short-line candidate pool (length(text) is a char count in PG,
+        // matching the heuristic's char-based bounds).
+        let pool: Vec<(i32, i32, String, f32, Option<String>)> = sqlx::query_as(
+            "SELECT page, order_idx, trim(text), font_size, font_name \
+               FROM elements \
+              WHERE document_id = $1 AND kind = 'text' \
+                AND font_size IS NOT NULL AND text IS NOT NULL \
+                AND length(trim(text)) BETWEEN 3 AND 80 \
+              ORDER BY page, order_idx",
+        )
+        .bind(id)
+        .fetch_all(store.pool())
+        .await?;
+        let pool: Vec<HeadingInput> = pool
+            .into_iter()
+            .map(|(page, order_idx, text, font_size, font_name)| HeadingInput {
+                page,
+                order_idx,
+                text,
+                font_size,
+                font_name,
+            })
+            .collect();
+        let headings = select_headings(&pool, body_size, body_is_bold, PALETTE_HEADING_CAP);
+
+        // Detected tables (kind=table elements; D-018 metadata keys) plus
+        // their cells, reduced server-side to non-filler column specs.
+        let tables: Vec<(Uuid, i32, serde_json::Value)> = sqlx::query_as(
+            "SELECT id, page, metadata FROM elements \
+              WHERE document_id = $1 AND kind = 'table' ORDER BY page, order_idx",
+        )
+        .bind(id)
+        .fetch_all(store.pool())
+        .await?;
+        let table_ids: Vec<Uuid> = tables.iter().map(|(id, _, _)| *id).collect();
+        let mut cells_by_table: HashMap<Uuid, Vec<CellLite>> = HashMap::new();
+        if !table_ids.is_empty() {
+            let cells: Vec<(Uuid, i32, i32, Option<String>, bool)> = sqlx::query_as(
+                "SELECT table_element_id, \"row\", col, text, is_header \
+                   FROM table_cells WHERE table_element_id = ANY($1) \
+                  ORDER BY \"row\", col",
+            )
+            .bind(&table_ids)
+            .fetch_all(store.pool())
+            .await?;
+            for (table_id, row, col, text, is_header) in cells {
+                cells_by_table.entry(table_id).or_default().push(CellLite {
+                    row,
+                    col,
+                    text,
+                    is_header,
+                });
+            }
+        }
+        let tables = tables
+            .into_iter()
+            .map(|(table_id, page, metadata)| {
+                let int = |key: &str| metadata.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+                let cells = cells_by_table.remove(&table_id).unwrap_or_default();
+                let n_cols = (int("n_cols").max(
+                    cells.iter().map(|c| c.col as i64 + 1).max().unwrap_or(0),
+                )) as usize;
+                super::TableEntry {
+                    page,
+                    n_rows: int("n_rows"),
+                    n_cols: n_cols as i64,
+                    strategy: metadata
+                        .get("strategy")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    confidence: metadata
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                    columns: column_specs(n_cols, &cells),
+                }
+            })
+            .collect();
+
+        Ok(super::PaletteData { headings, tables })
     }
 
     // ── page rasters ─────────────────────────────────────────────────────

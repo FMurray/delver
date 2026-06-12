@@ -1,20 +1,414 @@
-use delver_core::docql::{Rule, TemplateParser};
+//! DocQL language server (websocket-framed JSON-RPC, DV-012).
+//!
+//! Validation runs the REAL delver-core pipeline — pest syntax parse for
+//! positioned errors, then the full `parse_template` compile so every D-006
+//! fail-loud check (TYPE … AS TABLE misuse, `type=` on non-Table, unknown
+//! `method=`, undefined match references, bad regexes, SubCorpus/template
+//! interpolation errors) surfaces as a diagnostic. Completions come from one
+//! inventory table kept in lockstep with the grammar surface in
+//! `delver-core/src/docql.{pest,rs}` (elements, per-element attribute keys,
+//! match functions, TYPE field types).
+//!
+//! The previous revision embedded its own keyword list (no Annotation /
+//! Figure / SubCorpus / TYPE, a `Cosine` function instead of the canonical
+//! `EmbeddingSim`, `Table(match=…)` which the engine ignores) across THREE
+//! drifting copies (typed tower-lsp methods, a JSON duplicate, and hover
+//! text); the unused typed methods are deleted rather than refreshed.
+
+use delver_core::docql::{parse_template, Rule, TemplateParser};
 use pest::Parser;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tower_lsp::lsp_types::*;
 
 #[derive(Debug)]
 pub struct DocQLLanguageServer {
+    #[allow(dead_code)] // transport hook kept for a real LSP client
     pub client: MockClient,
-    document_map: tokio::sync::RwLock<HashMap<Url, String>>,
+    document_map: tokio::sync::RwLock<HashMap<String, String>>,
 }
 
-// Mock client for sending responses
+/// Transport stub retained for the websocket server-fn constructor.
 #[derive(Debug)]
 pub struct MockClient {
     pub sender: tokio::sync::mpsc::Sender<tower_lsp::jsonrpc::Response>,
 }
+
+// ───────────────────── completion inventory (current grammar) ─────────────────────
+//
+// Sources (read-only): docql.rs `element_type_from_name` (element names),
+// attribute resolve/validate sites (`as`/`match`/`end_match`/`type`/
+// `method`/`template`/`chunkSize`/`chunkOverlap`/`breakpointPercentile`/
+// `description`), `function_call_to_match_config` (match functions; Cosine /
+// Semantic parse as aliases of EmbeddingSim and are not advertised), and
+// `udt` field types TEXT / INT / DECIMAL (D-021).
+
+/// (label, detail, insert_text) — LSP `CompletionItemKind::CLASS`.
+const ELEMENT_COMPLETIONS: &[(&str, &str, &str)] = &[
+    (
+        "Section",
+        "Structural section: match=/end_match= boundaries, as= names the partition",
+        "Section(match=$1, as=\"$2\") {\n  $0\n}",
+    ),
+    (
+        "TextChunk",
+        "Chunk text: chunkSize/chunkOverlap, method=\"tokens\"|\"semantic\", template=\"…{text}…\"",
+        "TextChunk(chunkSize=500, chunkOverlap=150)",
+    ),
+    (
+        "Paragraph",
+        "Paragraph element (chunking attributes like TextChunk)",
+        "Paragraph(match=\"$1\")",
+    ),
+    (
+        "Table",
+        "Collect detected tables in scope; type=\"Name\" extracts typed records (D-021)",
+        "Table(as=\"$1\")",
+    ),
+    (
+        "Annotation",
+        "Collect annotation aux elements in scope (D-016)",
+        "Annotation(as=\"$1\")",
+    ),
+    (
+        "Figure",
+        "Collect figure aux elements in scope (D-016)",
+        "Figure(as=\"$1\")",
+    ),
+    (
+        "Image",
+        "Image element; children process matched images",
+        "Image {\n  $0\n}",
+    ),
+    (
+        "SubCorpus",
+        "Top-level declaration: description interpolates into TextChunk template= (D-022)",
+        "SubCorpus(description=\"$1\", as=\"$2\")",
+    ),
+];
+
+/// (label, detail, insert_text) — keyword-ish top-level constructs.
+const KEYWORD_COMPLETIONS: &[(&str, &str, &str)] = &[
+    (
+        "Match",
+        "Reusable match definition: Match<Section> Name { Text(…) … }",
+        "Match<Section> $1 {\n  $0\n}",
+    ),
+    (
+        "TYPE",
+        "User-defined table type: TYPE Name AS TABLE ( field TEXT, … ); (D-021)",
+        "TYPE $1 AS TABLE (\n  $2 TEXT,\n);",
+    ),
+];
+
+/// Per-element attribute keys (label, detail); insert is `key=`.
+const ELEMENT_ATTRS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Section",
+        &[
+            ("match", "Match definition name, inline function, or string"),
+            ("end_match", "Boundary match ending the section"),
+            ("as", "Output name for the section partition"),
+        ],
+    ),
+    (
+        "TextChunk",
+        &[
+            ("chunkSize", "Token/char budget per chunk (default 500)"),
+            ("chunkOverlap", "Carried-over budget between chunks"),
+            ("method", "\"tokens\" (default) or \"semantic\" (D-020)"),
+            (
+                "breakpointPercentile",
+                "Valley percentile 0..=100 for method=\"semantic\" (default 25)",
+            ),
+            ("template", "Interpolation template; {text} = chunk text (D-022)"),
+            ("as", "Output name"),
+        ],
+    ),
+    (
+        "Paragraph",
+        &[
+            ("match", "Match definition name, inline function, or string"),
+            ("chunkSize", "Token/char budget per chunk"),
+            ("chunkOverlap", "Carried-over budget between chunks"),
+            ("method", "\"tokens\" (default) or \"semantic\" (D-020)"),
+            ("as", "Output name"),
+        ],
+    ),
+    (
+        "Table",
+        &[
+            ("as", "Output name"),
+            ("type", "TYPE name for typed record extraction (D-021)"),
+        ],
+    ),
+    ("Annotation", &[("as", "Output name")]),
+    ("Figure", &[("as", "Output name")]),
+    ("Image", &[("as", "Output name")]),
+    (
+        "SubCorpus",
+        &[
+            ("description", "Interpolates as {name} into template= strings"),
+            ("as", "Declaration name"),
+        ],
+    ),
+];
+
+/// (label, detail, insert_text) — match functions inside Match bodies /
+/// match= attributes. `Cosine` / `Semantic` still parse as aliases of
+/// `EmbeddingSim` but only the canonical name is advertised (D-014).
+const MATCH_FUNCTION_COMPLETIONS: &[(&str, &str, &str)] = &[
+    (
+        "Text",
+        "Fuzzy text match: Text(\"pattern\", threshold=0.6)",
+        "Text(\"$1\", threshold=0.6)",
+    ),
+    (
+        "Regex",
+        "Regular-expression match (compiled at template compile)",
+        "Regex(\"$1\")",
+    ),
+    (
+        "Heuristic",
+        "Property comparisons (ANDed): font_size/font_name/text/text_length/page/x0/y0/x1/y1",
+        "Heuristic($1)",
+    ),
+    (
+        "EmbeddingSim",
+        "Embedding similarity: EmbeddingSim(\"query\", threshold=0.7, endpoint=\"…\", model=\"…\")",
+        "EmbeddingSim(\"$1\", threshold=0.7)",
+    ),
+    (
+        "FirstMatch",
+        "First matching alternative: FirstMatch(Text(…), Regex(…))",
+        "FirstMatch($1)",
+    ),
+];
+
+/// TYPE field types (D-021, `udt`).
+const TYPE_FIELD_COMPLETIONS: &[(&str, &str)] = &[
+    ("TEXT", "Verbatim cell text"),
+    ("INT", "Integer; strips %, $, commas; (n) = negative"),
+    ("DECIMAL", "Decimal; strips %, $, commas; (n) = negative"),
+];
+
+// ───────────────────── completion context detection ─────────────────────
+
+/// Where the cursor sits, derived from the text before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionCtx {
+    /// Top level or inside an element body: elements + Match/TYPE keywords.
+    Statement,
+    /// Inside `Name( …` for a known element: its attribute keys.
+    ElementAttrs(String),
+    /// Inside a `Match<…> Name { …` body or `FirstMatch(…`: match functions.
+    MatchBody,
+    /// Inside `TYPE Name AS TABLE ( …`: field type names.
+    TypeFields,
+    /// Inside a string literal: no completions.
+    InString,
+}
+
+/// Scan the prefix up to (0-based) `line`/`character`, tracking string
+/// literals, paren frames (with the identifier that opened them), and brace
+/// frames (match-definition bodies detected from clause text containing
+/// `Match<` at that nesting level).
+pub fn completion_context(text: &str, line: usize, character: usize) -> CompletionCtx {
+    let mut prefix = String::new();
+    for (i, l) in text.split('\n').enumerate() {
+        match i.cmp(&line) {
+            std::cmp::Ordering::Less => {
+                prefix.push_str(l);
+                prefix.push('\n');
+            }
+            std::cmp::Ordering::Equal => {
+                let upto: String = l.chars().take(character).collect();
+                prefix.push_str(&upto);
+                break;
+            }
+            std::cmp::Ordering::Greater => break,
+        }
+    }
+
+    #[derive(Debug)]
+    enum Frame {
+        Paren { word: String },
+        Brace { match_body: bool },
+    }
+
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    // The most recent identifier (kept across whitespace so `TABLE (` and
+    // `Section (` still attribute the paren to the word before it).
+    let mut word = String::new();
+    let mut prev_was_word = false;
+    let mut clause = String::new(); // text at the current brace level, outside parens
+
+    for ch in prefix.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        let mut is_word_char = false;
+        match ch {
+            '"' => {
+                in_string = true;
+                word.clear();
+            }
+            '(' => {
+                frames.push(Frame::Paren { word: word.clone() });
+                word.clear();
+            }
+            ')' => {
+                if matches!(frames.last(), Some(Frame::Paren { .. })) {
+                    frames.pop();
+                }
+                word.clear();
+            }
+            '{' => {
+                let match_body = clause.contains("Match<");
+                frames.push(Frame::Brace { match_body });
+                clause.clear();
+                word.clear();
+            }
+            '}' => {
+                if matches!(frames.last(), Some(Frame::Brace { .. })) {
+                    frames.pop();
+                }
+                clause.clear();
+                word.clear();
+            }
+            ';' => {
+                clause.clear();
+                word.clear();
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => {
+                if !prev_was_word {
+                    word.clear();
+                }
+                word.push(c);
+                is_word_char = true;
+            }
+            c if c.is_whitespace() => {} // keep the completed word
+            _ => word.clear(),
+        }
+        prev_was_word = is_word_char;
+        if !matches!(frames.last(), Some(Frame::Paren { .. })) && ch != '{' && ch != '}' {
+            clause.push(ch);
+        }
+    }
+
+    if in_string {
+        return CompletionCtx::InString;
+    }
+    match frames.last() {
+        Some(Frame::Paren { word }) => {
+            if word == "TABLE" {
+                CompletionCtx::TypeFields
+            } else if word == "FirstMatch" {
+                CompletionCtx::MatchBody
+            } else if ELEMENT_ATTRS.iter().any(|(name, _)| name == word) {
+                CompletionCtx::ElementAttrs(word.clone())
+            } else {
+                CompletionCtx::Statement
+            }
+        }
+        Some(Frame::Brace { match_body: true }) => CompletionCtx::MatchBody,
+        Some(Frame::Brace { match_body: false }) | None => CompletionCtx::Statement,
+    }
+}
+
+/// LSP CompletionItem JSON for a context. Insert texts use `$N` snippet
+/// placeholders (`insertTextFormat: 2`); the CodeMirror client strips them.
+pub fn completions_for(ctx: &CompletionCtx) -> Vec<Value> {
+    let item = |label: &str, kind: u32, detail: &str, insert: &str| {
+        json!({
+            "label": label,
+            "kind": kind,
+            "detail": detail,
+            "insertText": insert,
+            "insertTextFormat": 2,
+        })
+    };
+    match ctx {
+        CompletionCtx::InString => Vec::new(),
+        CompletionCtx::Statement => ELEMENT_COMPLETIONS
+            .iter()
+            .map(|(l, d, i)| item(l, 7, d, i)) // CLASS
+            .chain(
+                KEYWORD_COMPLETIONS
+                    .iter()
+                    .map(|(l, d, i)| item(l, 14, d, i)), // KEYWORD
+            )
+            .collect(),
+        CompletionCtx::ElementAttrs(element) => ELEMENT_ATTRS
+            .iter()
+            .find(|(name, _)| name == element)
+            .map(|(_, attrs)| {
+                attrs
+                    .iter()
+                    .map(|(l, d)| item(l, 10, d, &format!("{l}="))) // PROPERTY
+                    .collect()
+            })
+            .unwrap_or_default(),
+        CompletionCtx::MatchBody => MATCH_FUNCTION_COMPLETIONS
+            .iter()
+            .map(|(l, d, i)| item(l, 3, d, i)) // FUNCTION
+            .collect(),
+        CompletionCtx::TypeFields => TYPE_FIELD_COMPLETIONS
+            .iter()
+            .map(|(l, d)| item(l, 14, d, l)) // KEYWORD
+            .collect(),
+    }
+}
+
+// ───────────────────── diagnostics (real parser + compiler) ─────────────────────
+
+/// Diagnostics from the CURRENT delver-core pipeline: a pest syntax error
+/// with its real (line, col), else any `parse_template` compile error
+/// (fail-loud semantics, D-006) anchored at 0:0 with the full message.
+pub fn diagnostics_for(text: &str) -> Vec<Value> {
+    match TemplateParser::parse(Rule::template, text) {
+        Err(e) => {
+            let ((l0, c0), (l1, c1)) = match e.line_col {
+                pest::error::LineColLocation::Pos((l, c)) => ((l, c), (l, c + 1)),
+                pest::error::LineColLocation::Span((l0, c0), (l1, c1)) => ((l0, c0), (l1, c1)),
+            };
+            // pest is 1-based, LSP 0-based.
+            vec![json!({
+                "range": {
+                    "start": {"line": l0.saturating_sub(1), "character": c0.saturating_sub(1)},
+                    "end": {"line": l1.saturating_sub(1), "character": c1.saturating_sub(1).max(c0)},
+                },
+                "severity": 1,
+                "source": "docql-parser",
+                "message": format!("DocQL syntax error: {e}"),
+            })]
+        }
+        Ok(_) => match parse_template(text) {
+            Ok(_) => Vec::new(),
+            Err(e) => vec![json!({
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 1},
+                },
+                "severity": 1,
+                "source": "docql-compile",
+                "message": format!("DocQL compile error: {e}"),
+            })],
+        },
+    }
+}
+
+// ───────────────────── JSON-RPC processing ─────────────────────
+
+const DEFAULT_URI: &str = "file:///query.docql";
 
 impl DocQLLanguageServer {
     pub fn new(client: MockClient) -> Self {
@@ -24,505 +418,292 @@ impl DocQLLanguageServer {
         }
     }
 
-    async fn validate_docql(&self, uri: &Url, text: &str) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-
-        match TemplateParser::parse(Rule::template, text) {
-            Ok(_) => {
-                // Parsing successful, no errors
-                log::info!("DocQL parsing successful for {}", uri);
-            }
-            Err(e) => {
-                // Convert pest error to LSP diagnostic
-                let diagnostic = self.pest_error_to_diagnostic(&e);
-                diagnostics.push(diagnostic);
-                log::warn!("DocQL parsing failed for {}: {}", uri, e);
-            }
-        }
-
-        diagnostics
-    }
-
-    fn pest_error_to_diagnostic(&self, error: &pest::error::Error<Rule>) -> Diagnostic {
-        // For pest errors, we'll use a simple approach - default to line 0
-        let message = error.to_string();
-
-        Diagnostic::new(
-            Range::new(
-                Position::new(0, 0),
-                Position::new(0, 1), // Single character range for now
-            ),
-            Some(DiagnosticSeverity::ERROR),
-            None,
-            Some("docql-parser".to_string()),
-            message,
-            None,
-            None,
-        )
-    }
-
-    fn get_element_completions(&self) -> Vec<CompletionItem> {
-        vec![
-            CompletionItem {
-                label: "Section".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Document section element".to_string()),
-                documentation: Some(Documentation::String(
-                    "Defines a section that can contain other elements".to_string(),
-                )),
-                insert_text: Some("Section(match=\"\") {\n\t$0\n}".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "Paragraph".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Paragraph element".to_string()),
-                documentation: Some(Documentation::String(
-                    "Defines a paragraph text element".to_string(),
-                )),
-                insert_text: Some("Paragraph(match=\"\")".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "TextChunk".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Text chunk element".to_string()),
-                documentation: Some(Documentation::String(
-                    "Defines a text chunk for processing".to_string(),
-                )),
-                insert_text: Some("TextChunk(chunkSize=500, chunkOverlap=150)".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "Table".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Table element".to_string()),
-                documentation: Some(Documentation::String(
-                    "Defines a table structure".to_string(),
-                )),
-                insert_text: Some("Table(match=\"\")".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "Image".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Image element".to_string()),
-                documentation: Some(Documentation::String(
-                    "Defines an image element that can have children for processing".to_string(),
-                )),
-                insert_text: Some("Image {\n\t$0\n}".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "Match".to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                detail: Some("Match definition".to_string()),
-                documentation: Some(Documentation::String(
-                    "Defines a reusable match configuration".to_string(),
-                )),
-                insert_text: Some("Match<$1> $2 {\n\t$0\n}".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-        ]
-    }
-
-    fn get_function_completions(&self) -> Vec<CompletionItem> {
-        vec![
-            CompletionItem {
-                label: "Text".to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some("Text matching function".to_string()),
-                documentation: Some(Documentation::String(
-                    "Text(pattern, threshold=0.8) - Matches text content".to_string(),
-                )),
-                insert_text: Some("Text(\"$1\", threshold=0.8)".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "Cosine".to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some("Semantic matching function".to_string()),
-                documentation: Some(Documentation::String(
-                    "Cosine(pattern, threshold=0.7) - Semantic similarity matching".to_string(),
-                )),
-                insert_text: Some("Cosine(\"$1\", threshold=0.7)".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "Regex".to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some("Regular expression matching".to_string()),
-                documentation: Some(Documentation::String(
-                    "Regex(pattern) - Regular expression pattern matching".to_string(),
-                )),
-                insert_text: Some("Regex(\"$1\")".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                ..Default::default()
-            },
-        ]
-    }
-}
-
-impl DocQLLanguageServer {
-    pub async fn initialize(
-        &self,
-        _: InitializeParams,
-    ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
-        Ok(InitializeResult {
-            server_info: Some(ServerInfo {
-                name: "DocQL Language Server".to_string(),
-                version: Some("0.1.0".to_string()),
-            }),
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
-                )),
-                completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
-                    trigger_characters: Some(vec![
-                        "<".to_string(),
-                        "(".to_string(),
-                        "\"".to_string(),
-                        " ".to_string(),
-                    ]),
-                    work_done_progress_options: Default::default(),
-                    all_commit_characters: None,
-                    completion_item: None,
-                }),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                    DiagnosticOptions {
-                        identifier: Some("docql".to_string()),
-                        inter_file_dependencies: false,
-                        workspace_diagnostics: false,
-                        work_done_progress_options: Default::default(),
-                    },
-                )),
-                ..ServerCapabilities::default()
-            },
-        })
-    }
-
-    pub async fn initialized(&self, _: InitializedParams) {
-        log::info!("DocQL Language Server initialized!");
-    }
-
-    pub async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
-        Ok(())
-    }
-
-    pub async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let uri = params.text_document.uri;
-        let text = params.text_document.text.clone();
-
-        // Store the document
-        self.document_map
-            .write()
-            .await
-            .insert(uri.clone(), text.clone());
-
-        // Validate and send diagnostics
-        let diagnostics = self.validate_docql(&uri, &text).await;
-        self.publish_diagnostics(uri, diagnostics, None).await;
-    }
-
-    pub async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri;
-
-        // Get the latest text (assuming full document sync)
-        if let Some(change) = params.content_changes.into_iter().next() {
-            let text = change.text;
-
-            // Update stored document
-            self.document_map
-                .write()
-                .await
-                .insert(uri.clone(), text.clone());
-
-            // Validate and send diagnostics
-            let diagnostics = self.validate_docql(&uri, &text).await;
-            self.publish_diagnostics(uri, diagnostics, None).await;
-        }
-    }
-
-    pub async fn completion(
-        &self,
-        params: CompletionParams,
-    ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
-        let uri = &params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-
-        let documents = self.document_map.read().await;
-        if let Some(text) = documents.get(uri) {
-            // Get the line content up to the cursor position
-            let lines: Vec<&str> = text.lines().collect();
-            if let Some(line) = lines.get(position.line as usize) {
-                let line_prefix = &line[..std::cmp::min(position.character as usize, line.len())];
-
-                let mut completions = Vec::new();
-
-                // Provide element completions for main context
-                if line_prefix.trim().is_empty()
-                    || line_prefix.ends_with('{')
-                    || line_prefix.ends_with('\n')
-                {
-                    completions.extend(self.get_element_completions());
-                }
-
-                // Provide function completions inside match expressions
-                if line_prefix.contains("match=") || line_prefix.contains("Match<") {
-                    completions.extend(self.get_function_completions());
-                }
-
-                return Ok(Some(CompletionResponse::Array(completions)));
-            }
-        }
-
-        Ok(None)
-    }
-
-    pub async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
-        let uri = &params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-
-        let documents = self.document_map.read().await;
-        if let Some(text) = documents.get(uri) {
-            let lines: Vec<&str> = text.lines().collect();
-            if let Some(line) = lines.get(position.line as usize) {
-                let words: Vec<&str> = line.split_whitespace().collect();
-
-                // Simple hover support for known elements
-                for word in words {
-                    match word {
-                        "Section" => {
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: "**Section**\n\nDefines a document section that can contain other elements. Use `match` attribute to specify matching criteria.".to_string(),
-                                }),
-                                range: None,
-                            }));
-                        }
-                        "TextChunk" => {
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: "**TextChunk**\n\nDefines a text chunk for processing. Supports `chunkSize` and `chunkOverlap` attributes.".to_string(),
-                                }),
-                                range: None,
-                            }));
-                        }
-                        "Image" => {
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: "**Image**\n\nDefines an image element. Can contain child elements for image processing like ImageSummary, ImageBytes, etc.".to_string(),
-                                }),
-                                range: None,
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn publish_diagnostics(
-        &self,
-        uri: Url,
-        diagnostics: Vec<Diagnostic>,
-        _version: Option<i32>,
-    ) {
-        // For now, we'll just log the diagnostics instead of sending via WebSocket
-        log::info!("Diagnostics for {}: {:?}", uri, diagnostics);
-    }
-
-    /// Process a raw LSP message and return appropriate responses
+    /// Process a raw LSP message and return the responses to send.
     pub async fn process_lsp_message(&self, message: &str) -> Vec<String> {
         let mut responses = Vec::new();
 
-        if let Ok(request) = serde_json::from_str::<Value>(message) {
-            if let Some(method) = request.get("method").and_then(|m| m.as_str()) {
-                match method {
-                    "initialize" => {
-                        let response = json!({
+        let Ok(request) = serde_json::from_str::<Value>(message) else {
+            return responses;
+        };
+        let Some(method) = request.get("method").and_then(|m| m.as_str()) else {
+            return responses;
+        };
+        match method {
+            "initialize" => {
+                responses.push(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "result": {
+                            "capabilities": {
+                                "textDocumentSync": 1,
+                                "completionProvider": {
+                                    "resolveProvider": false,
+                                    "triggerCharacters": ["<", "(", " "]
+                                },
+                                "hoverProvider": false
+                            }
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            "textDocument/didOpen" => {
+                let params = request.get("params");
+                let uri = uri_from(params, &["textDocument", "uri"]);
+                if let Some(text) = params
+                    .and_then(|p| p.pointer("/textDocument/text"))
+                    .and_then(|t| t.as_str())
+                {
+                    self.document_map
+                        .write()
+                        .await
+                        .insert(uri.clone(), text.to_string());
+                    responses.push(publish_diagnostics(&uri, diagnostics_for(text)));
+                }
+            }
+            "textDocument/didChange" => {
+                let params = request.get("params");
+                let uri = uri_from(params, &["textDocument", "uri"]);
+                if let Some(text) = params
+                    .and_then(|p| p.get("contentChanges"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|c| c.first())
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    self.document_map
+                        .write()
+                        .await
+                        .insert(uri.clone(), text.to_string());
+                    responses.push(publish_diagnostics(&uri, diagnostics_for(text)));
+                }
+            }
+            "textDocument/completion" => {
+                let params = request.get("params");
+                let uri = uri_from(params, &["textDocument", "uri"]);
+                let line = position_part(params, "line");
+                let character = position_part(params, "character");
+                let documents = self.document_map.read().await;
+                let text = documents.get(&uri).map(String::as_str).unwrap_or("");
+                let ctx = completion_context(text, line, character);
+                responses.push(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
+                        "result": completions_for(&ctx)
+                    })
+                    .to_string(),
+                );
+            }
+            _ => {
+                // Generic acknowledgment for requests (id present) only.
+                if request.get("id").is_some() {
+                    responses.push(
+                        json!({
                             "jsonrpc": "2.0",
                             "id": request.get("id"),
-                            "result": {
-                                "capabilities": {
-                                    "textDocumentSync": 1,
-                                    "completionProvider": {
-                                        "resolveProvider": false,
-                                        "triggerCharacters": ["<", "(", "\"", " "]
-                                    },
-                                    "hoverProvider": true
-                                }
-                            }
-                        });
-                        responses.push(response.to_string());
-                    }
-                    "textDocument/didChange" => {
-                        if let Some(params) = request.get("params") {
-                            if let Some(changes) =
-                                params.get("contentChanges").and_then(|c| c.as_array())
-                            {
-                                if let Some(first_change) = changes.first() {
-                                    if let Some(text) =
-                                        first_change.get("text").and_then(|t| t.as_str())
-                                    {
-                                        // Use actual DocQL validation
-                                        let diagnostic_response =
-                                            self.validate_and_create_diagnostics(text).await;
-                                        responses.push(diagnostic_response);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "textDocument/completion" => {
-                        if let Some(params) = request.get("params") {
-                            let completion_response = self.handle_completion_request(params).await;
-                            if let Some(response) = completion_response {
-                                responses.push(
-                                    json!({
-                                        "jsonrpc": "2.0",
-                                        "id": request.get("id"),
-                                        "result": response
-                                    })
-                                    .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    "textDocument/hover" => {
-                        if let Some(params) = request.get("params") {
-                            let hover_response = self.handle_hover_request(params).await;
-                            if let Some(response) = hover_response {
-                                responses.push(
-                                    json!({
-                                        "jsonrpc": "2.0",
-                                        "id": request.get("id"),
-                                        "result": response
-                                    })
-                                    .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    _ => {
-                        // Generic acknowledgment for other methods
-                        responses.push(
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": request.get("id"),
-                                "result": null
-                            })
-                            .to_string(),
-                        );
-                    }
+                            "result": null
+                        })
+                        .to_string(),
+                    );
                 }
             }
         }
 
         responses
     }
+}
 
-    /// Validate DocQL text and create diagnostics response
-    async fn validate_and_create_diagnostics(&self, text: &str) -> String {
-        match TemplateParser::parse(Rule::template, text) {
-            Ok(_) => {
-                // Clear diagnostics for valid syntax
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/publishDiagnostics",
-                    "params": {
-                        "uri": "file:///query.docql",
-                        "diagnostics": []
-                    }
-                })
-                .to_string()
-            }
-            Err(e) => {
-                // Send syntax error diagnostic
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/publishDiagnostics",
-                    "params": {
-                        "uri": "file:///query.docql",
-                        "diagnostics": [{
-                            "range": {
-                                "start": {"line": 0, "character": 0},
-                                "end": {"line": 0, "character": 1}
-                            },
-                            "severity": 1,
-                            "message": format!("DocQL syntax error: {}", e)
-                        }]
-                    }
-                })
-                .to_string()
-            }
+fn uri_from(params: Option<&Value>, path: &[&str]) -> String {
+    let mut cur = params;
+    for key in path {
+        cur = cur.and_then(|v| v.get(key));
+    }
+    cur.and_then(|v| v.as_str()).unwrap_or(DEFAULT_URI).to_string()
+}
+
+fn position_part(params: Option<&Value>, part: &str) -> usize {
+    params
+        .and_then(|p| p.pointer(&format!("/position/{part}")))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize
+}
+
+fn publish_diagnostics(uri: &str, diagnostics: Vec<Value>) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/publishDiagnostics",
+        "params": { "uri": uri, "diagnostics": diagnostics }
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── context detection ──
+
+    fn ctx(text: &str) -> CompletionCtx {
+        // Cursor at end of text.
+        let line = text.matches('\n').count();
+        let character = text.split('\n').next_back().unwrap_or("").chars().count();
+        completion_context(text, line, character)
+    }
+
+    #[test]
+    fn context_statement_at_top_level_and_in_element_bodies() {
+        assert_eq!(ctx(""), CompletionCtx::Statement);
+        assert_eq!(ctx("Section(match=X, as=\"y\") {\n  "), CompletionCtx::Statement);
+        // After a closed element the context resets.
+        assert_eq!(ctx("TextChunk(chunkSize=500)\n"), CompletionCtx::Statement);
+    }
+
+    #[test]
+    fn context_attrs_inside_known_element_parens() {
+        assert_eq!(
+            ctx("Table("),
+            CompletionCtx::ElementAttrs("Table".to_string())
+        );
+        assert_eq!(
+            ctx("Section(match=MDA, "),
+            CompletionCtx::ElementAttrs("Section".to_string())
+        );
+        // Closed parens pop the frame.
+        assert_eq!(ctx("Table(as=\"t\")"), CompletionCtx::Statement);
+    }
+
+    #[test]
+    fn context_match_bodies_and_strings_and_type_fields() {
+        assert_eq!(ctx("Match<Section> MDA {\n  "), CompletionCtx::MatchBody);
+        assert_eq!(ctx("Match<Section> M { FirstMatch("), CompletionCtx::MatchBody);
+        assert_eq!(ctx("Match<Section> M { Text(\""), CompletionCtx::InString);
+        assert_eq!(ctx("TYPE Seg AS TABLE ( "), CompletionCtx::TypeFields);
+        // A `{` from a previous match definition does not leak.
+        assert_eq!(ctx("Match<Section> M { Text(\"x\") }\n"), CompletionCtx::Statement);
+        // Escaped quote stays inside the string.
+        assert_eq!(ctx("Text(\"a\\\""), CompletionCtx::InString);
+    }
+
+    #[test]
+    fn completion_inventory_covers_current_grammar() {
+        let labels = |ctx: &CompletionCtx| -> Vec<String> {
+            completions_for(ctx)
+                .iter()
+                .map(|c| c["label"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let statement = labels(&CompletionCtx::Statement);
+        for expected in [
+            "Section", "TextChunk", "Table", "Annotation", "Figure", "Paragraph",
+            "Image", "SubCorpus", "Match", "TYPE",
+        ] {
+            assert!(statement.contains(&expected.to_string()), "missing {expected}");
         }
+        let functions = labels(&CompletionCtx::MatchBody);
+        for expected in ["Text", "Regex", "Heuristic", "EmbeddingSim", "FirstMatch"] {
+            assert!(functions.contains(&expected.to_string()), "missing {expected}");
+        }
+        assert_eq!(labels(&CompletionCtx::TypeFields), ["TEXT", "INT", "DECIMAL"]);
+        let table_attrs = labels(&CompletionCtx::ElementAttrs("Table".into()));
+        assert_eq!(table_attrs, ["as", "type"]);
+        let chunk_attrs = labels(&CompletionCtx::ElementAttrs("TextChunk".into()));
+        for expected in ["chunkSize", "chunkOverlap", "method", "template", "as"] {
+            assert!(chunk_attrs.contains(&expected.to_string()), "missing {expected}");
+        }
+        assert!(labels(&CompletionCtx::InString).is_empty());
     }
 
-    /// Handle completion requests
-    async fn handle_completion_request(&self, _params: &Value) -> Option<Value> {
-        // Return element completions as JSON
-        Some(json!([
-            {
-                "label": "Section",
-                "kind": 7, // CompletionItemKind::CLASS
-                "detail": "Document section element",
-                "documentation": "Defines a section that can contain other elements",
-                "insertText": "Section(match=\"\") {\n\t$0\n}",
-                "insertTextFormat": 2 // InsertTextFormat::SNIPPET
-            },
-            {
-                "label": "TextChunk",
-                "kind": 7,
-                "detail": "Text chunk element",
-                "documentation": "Defines a text chunk for processing",
-                "insertText": "TextChunk(chunkSize=500, chunkOverlap=150)",
-                "insertTextFormat": 2
-            },
-            {
-                "label": "Image",
-                "kind": 7,
-                "detail": "Image element",
-                "documentation": "Defines an image element that can have children for processing",
-                "insertText": "Image {\n\t$0\n}",
-                "insertTextFormat": 2
-            },
-            {
-                "label": "Match",
-                "kind": 14, // CompletionItemKind::KEYWORD
-                "detail": "Match definition",
-                "documentation": "Defines a reusable match configuration",
-                "insertText": "Match<$1> $2 {\n\t$0\n}",
-                "insertTextFormat": 2
-            }
-        ]))
+    // ── diagnostics ──
+
+    #[test]
+    fn diagnostics_clean_on_valid_current_grammar_template() {
+        let template = r#"
+TYPE Seg AS TABLE ( metric TEXT, y2015 DECIMAL );
+
+SubCorpus(description="California auto loans", as="CA_auto_loans")
+
+Match<Section> MDA {
+  FirstMatch(Text("Management Discussion", threshold=0.6), Regex("M.*D.*A"))
+}
+
+Section(match=MDA, as="mda") {
+  TextChunk(chunkSize=500, chunkOverlap=150, method="semantic", template="{CA_auto_loans}: {text}")
+  Table(as="t", type="Seg")
+}
+"#;
+        let diags = diagnostics_for(template);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
     }
 
-    /// Handle hover requests
-    async fn handle_hover_request(&self, params: &Value) -> Option<Value> {
-        // Simple hover support - in a real implementation, we'd parse the position
-        // and provide context-specific hover information
-        Some(json!({
-            "contents": {
-                "kind": "markdown",
-                "value": "**DocQL Element**\n\nHover over DocQL elements for documentation."
+    #[test]
+    fn diagnostics_surface_syntax_errors_with_position() {
+        let diags = diagnostics_for("Section(match=) {}");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["source"], "docql-parser");
+        assert_eq!(diags[0]["range"]["start"]["line"], 0);
+        assert!(diags[0]["range"]["start"]["character"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn diagnostics_surface_compile_errors_from_the_real_pipeline() {
+        // Parses, but `type=` references an undefined TYPE (D-021 fail-loud).
+        let diags = diagnostics_for("Table(as=\"t\", type=\"Nope\")");
+        assert_eq!(diags.len(), 1, "expected one compile diagnostic: {diags:?}");
+        assert_eq!(diags[0]["source"], "docql-compile");
+        let msg = diags[0]["message"].as_str().unwrap();
+        assert!(msg.contains("Nope"), "message should name the type: {msg}");
+        // Unknown chunking method is also caught at compile (D-020).
+        let diags = diagnostics_for("TextChunk(method=\"banana\")");
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0]["message"].as_str().unwrap().contains("banana"));
+    }
+
+    // ── end-to-end JSON-RPC ──
+
+    fn server() -> DocQLLanguageServer {
+        let (sender, _rx) = tokio::sync::mpsc::channel(1);
+        DocQLLanguageServer::new(MockClient { sender })
+    }
+
+    #[tokio::test]
+    async fn did_change_stores_text_and_completion_uses_position() {
+        let s = server();
+        let did_change = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {"uri": "file:///query.docql", "version": 1},
+                "contentChanges": [{"text": "Table("}]
             }
-        }))
+        });
+        let responses = s.process_lsp_message(&did_change.to_string()).await;
+        assert_eq!(responses.len(), 1);
+        let diag: Value = serde_json::from_str(&responses[0]).unwrap();
+        assert_eq!(diag["method"], "textDocument/publishDiagnostics");
+        // "Table(" alone is a syntax error — fail-loud diagnostics present.
+        assert!(!diag["params"]["diagnostics"].as_array().unwrap().is_empty());
+
+        let completion = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": "file:///query.docql"},
+                "position": {"line": 0, "character": 6}
+            }
+        });
+        let responses = s.process_lsp_message(&completion.to_string()).await;
+        assert_eq!(responses.len(), 1);
+        let resp: Value = serde_json::from_str(&responses[0]).unwrap();
+        assert_eq!(resp["id"], 7);
+        let labels: Vec<&str> = resp["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["as", "type"], "cursor inside Table( offers its attrs");
     }
 }

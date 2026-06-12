@@ -93,6 +93,15 @@ mod rest {
         }
     }
 
+    /// GET /api/v/docs/{doc_id}/palette — heading candidates + detected
+    /// tables for the doc-aware query palette (DV-012).
+    pub async fn palette(Path(doc_id): Path<String>) -> Response {
+        match store::doc_palette(&doc_id).await {
+            Ok(palette) => json_ok(&palette),
+            Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        }
+    }
+
     /// POST /api/v/docs/{doc_id}/template — body is DocQL source; returns the
     /// outputs JSON, or 422 with a readable error (fail-loud matchers, D-006).
     pub async fn run_template(Path(doc_id): Path<String>, template: String) -> Response {
@@ -153,6 +162,7 @@ async fn main() {
             "/api/v/docs/{doc_id}/pages/{page}/meta",
             get(rest::page_meta),
         )
+        .route("/api/v/docs/{doc_id}/palette", get(rest::palette))
         .route("/api/v/docs/{doc_id}/template", post(rest::run_template))
         .route("/api/v/upload", post(rest::upload))
         .leptos_routes(&leptos_options, routes, {

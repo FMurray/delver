@@ -157,3 +157,78 @@ server's upload path into corpus `viewer-dev` on the shared DB → document
 125 tables / 11 615 cells, byte-cache uri set so rasters render). Store page
 26 (viewer page index 25) carries the 10×7 ruled segment-performance table
 (confidence 0.88) used for the overlay evidence.
+
+**DV-012 · 2026-06-12 · Slice V2: discover → query. Insert-into-query snippets, doc-aware palette, LSP refresh + completions.**
+The core loop (click an element → see what it is → add it to a query → run) is wired end to end.
+- **Snippet generation** (`crates/viewer/src/snippets.rs`, pure + unit-tested): the element side
+  panel gains kind-appropriate "Insert into query" actions, the palette reuses the same
+  generators. Text → `Match<Section> SectionN { Text("…", threshold=0.6) }` ("match only") or
+  that plus `Section(match=SectionN, as="sectionN") { TextChunk(chunkSize=500, chunkOverlap=150) }`
+  ("section scaffold") — N is the smallest integer where both names are free in the buffer. Table →
+  `Table(as="table_p<page>")` and a typed scaffold `TYPE TableP<page> AS TABLE ( … );` +
+  `Table(as=…, type=…)`; Annotation/Figure → `Annotation(as="annotation_p<page>")` /
+  `Figure(as="figure_p<page>")`. Pages are 1-based store pages. Generation rules: pattern text is
+  whitespace-collapsed and elided to ≤80 chars (no ellipsis — a truncated prefix still
+  fuzzy-matches; an added ellipsis would not), `\` and `"` escaped (the only chars the grammar's
+  string rule cannot take raw). Field names are lowercased slugs of header-cell texts
+  (non-alphanumerics collapse to `_`, 30-char cap, digit-leading slugs get a `c` prefix — `c2015`
+  ↔ "2015" sits exactly on D-021's 0.8 fuzzy-match boundary), fallback `col<index>` (1-based
+  original column), deduplicated within the field list. Field type DECIMAL when a strict majority
+  of the column's non-empty body cells coerce under the D-021 conventions (trailing `%`, parens
+  negative, `$`/`,`/whitespace stripped), else TEXT — majority, not all, so the p26 em-dash nil
+  doesn't flip its column to TEXT. `$`-filler columns (every body cell empty or only `$%()`/
+  whitespace) are skipped entirely so every declared field can claim a real column at run time.
+  All generated identifiers are made unique against the editor buffer (whole-word scan; `_2`,
+  `_3`… suffixes; TYPE name + `as=` name share one suffix). Note: `Table(as=)` selects every
+  table in scope (Pass 2 has no per-element match filtering, D-018) — the generated snippets
+  follow the slice spec's shapes verbatim; scoping is the user's next iteration step (wrap in a
+  Section), not invented core semantics.
+- **Insert plumbing**: an `InsertBus` context carries `SnippetSpec`s (not pre-rendered text)
+  from the side panel / palette to the query panel, which renders against the LIVE buffer at
+  insertion time (uniqueness cannot be decided earlier) and inserts at the CodeMirror cursor
+  (own line; replaces the buffer when it still holds the pristine starter). Any insert action
+  opens the query panel; with the panel previously closed, the bus is consumed by the
+  mount-time effect run, and the consumed value is cleared so panel re-mounts cannot re-insert.
+- **Doc-aware palette** (`components/palette.rs`, collapsible section in the left side panel;
+  REST mirror `GET /api/v/docs/{id}/palette`): (a) heading candidates — documented heuristic in
+  `snippets::select_headings`: pool = text elements 3..=80 chars with a letter; modal (font_size,
+  font_name) over non-empty text = body style; keep lines that are size-prominent (≥ body+1.5pt)
+  OR bold-emphasis (bold while body isn't, ≥ body−0.5pt, ALL-CAPS — the SEC convention where
+  headings share the body size: the 3M 10-K's section heads are Times-Bold at body 13pt); order
+  by size desc then position, dedupe case-insensitively, cap 20. On the demo doc this surfaces
+  the four 21pt title-page lines plus OVERVIEW / RESULTS OF OPERATIONS / PERFORMANCE BY BUSINESS
+  SEGMENT (p24) / PERFORMANCE BY GEOGRAPHIC AREA…; (b) detected tables (page, n×m, strategy,
+  confidence — the D-018 metadata keys) with server-reduced non-filler `ColumnSpec`s so the
+  typed scaffold generates client-side without shipping 11.6k cells; (c) four starter templates
+  (plain chunks / sections+chunks / tables-in-section / typed table), pre-filled with the first
+  real heading and the best table (named headers preferred, then confidence). Palette queries
+  are viewer-layer SQL over the store pool (the DV-001/DV-004 boundary precedent; zero
+  delver-store changes).
+- **LSP findings + refresh** (`language_server/docql_server.rs`): syntax validation already used
+  the real pest grammar (so TYPE…AS etc. *parsed*), but compile-level checks never ran and the
+  completion inventory was stale in THREE drifting copies (no Annotation/Figure/SubCorpus/TYPE,
+  a `Cosine` item instead of canonical `EmbeddingSim`, `Table(match=…)` which the engine
+  ignores); the websocket `didChange` path also never stored the document, so position-aware
+  completion was impossible. Now: diagnostics run pest (positioned errors) then full
+  `parse_template` (D-006 fail-loud compile surface: unknown TYPE/type= placement, unknown
+  method=, undefined match refs, bad regexes, template= interpolation); one inventory table
+  (elements Section/TextChunk/Paragraph/Table/Annotation/Figure/Image/SubCorpus + Match/TYPE
+  keywords, per-element attribute keys incl. method/breakpointPercentile/template/type, match
+  functions Text/Regex/Heuristic/EmbeddingSim/FirstMatch, TYPE field types TEXT/INT/DECIMAL)
+  serves a context-aware `textDocument/completion` (string/paren/brace scanner: element attrs
+  inside `Name(…`, functions inside match bodies and `FirstMatch(`, field types inside
+  `TYPE … AS TABLE (`); the dead tower-lsp typed methods were deleted rather than refreshed.
+  Doc-aware completions (real heading strings inside `Text("…")`) were deliberately NOT added —
+  the palette covers discovery.
+- **Editor wiring** (`components/query_panel.rs`): the `codemirror` crate wraps only
+  value/change, so the raw CM5 instance is recovered (wrapper div's `CodeMirror` property) for
+  cursor insertion, `extraKeys`, and the show-hint addon (now loaded in the shell head).
+  Ctrl-Space sends `textDocument/completion` through the existing websocket (id-correlated
+  thread-local pending-hint slot; `$N` snippet markers stripped for CM5) and renders via
+  show-hint. Ctrl/Cmd-Enter now executes FROM INSIDE the editor — the original textarea's
+  keydown never fired once CodeMirror owned input, so the documented one-keystroke run flow was
+  actually dead under hydration. The default editor content is a runnable starter
+  (`TextChunk(chunkSize=500, chunkOverlap=150)`) — the old `// comment` placeholder was itself a
+  DocQL syntax error (the grammar has no comments) and greeted users with a red diagnostic.
+  The LSP server's document state is seeded right after initialize so completions are
+  position-aware before the first edit.

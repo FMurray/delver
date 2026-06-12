@@ -7,6 +7,8 @@ use leptos_router::hooks::{use_params_map, use_query_map};
 use uuid::Uuid;
 
 use crate::components::file_upload::get_document_by_id;
+use crate::components::insert::{use_request_insert, INSERT_CHIP};
+use crate::snippets::{column_specs, AuxRefKind, CellLite, SnippetSpec};
 use crate::store::{CellOverlay, ElementOverlay, PageMeta};
 
 /// Raster layout metadata for one page (placeholder info when the original
@@ -439,6 +441,94 @@ fn page_view(
     }
 }
 
+/// "Insert into query" actions for one element (DV-012): context-appropriate
+/// snippet specs published on the insert bus. The spec is rendered against
+/// the live editor buffer at insertion time (names stay unique).
+fn insert_actions(element: &ElementOverlay) -> Option<AnyView> {
+    let insert = use_request_insert();
+    let page = element.page;
+    match element.kind.as_str() {
+        "text" => {
+            let text = element.text.clone()?.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let match_text = text.clone();
+            Some(view! {
+                <div class="flex flex-wrap gap-1.5">
+                    <button
+                        class=INSERT_CHIP
+                        title="Insert Match<Section> block matching this text"
+                        on:click=move |_| insert(SnippetSpec::TextMatch { text: match_text.clone() })
+                    >"match only"</button>
+                    <button
+                        class=INSERT_CHIP
+                        title="Insert match block + Section { TextChunk } scaffold"
+                        on:click=move |_| insert(SnippetSpec::SectionScaffold { text: text.clone() })
+                    >"section scaffold"</button>
+                </div>
+            }.into_any())
+        }
+        "table" => {
+            let cells: Vec<CellLite> = element
+                .cells
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|c| CellLite {
+                    row: c.row,
+                    col: c.col,
+                    text: c.text.clone(),
+                    is_header: c.is_header,
+                })
+                .collect();
+            let n_cols = element
+                .metadata
+                .get("n_cols")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(cells.iter().map(|c| c.col as i64 + 1).max().unwrap_or(0))
+                .max(0) as usize;
+            let columns = column_specs(n_cols, &cells);
+            let typed_ok = !columns.is_empty();
+            Some(view! {
+                <div class="flex flex-wrap gap-1.5">
+                    <button
+                        class=INSERT_CHIP
+                        title=format!("Insert Table(as=\"table_p{page}\")")
+                        on:click=move |_| insert(SnippetSpec::TableRef { page })
+                    >{format!("Table(as=\"table_p{page}\")")}</button>
+                    <button
+                        class=INSERT_CHIP
+                        disabled=!typed_ok
+                        title="Insert TYPE … AS TABLE scaffold (fields from headers, DECIMAL for numeric columns) + typed Table"
+                        on:click=move |_| insert(SnippetSpec::TypedTable { page, columns: columns.clone() })
+                    >"typed…"</button>
+                </div>
+            }.into_any())
+        }
+        "annotation" => Some(view! {
+            <div class="flex flex-wrap gap-1.5">
+                <button
+                    class=INSERT_CHIP
+                    title="Insert Annotation selector"
+                    on:click=move |_| insert(SnippetSpec::AuxRef { kind: AuxRefKind::Annotation, page })
+                >{format!("Annotation(as=\"annotation_p{page}\")")}</button>
+            </div>
+        }.into_any()),
+        "figure" => Some(view! {
+            <div class="flex flex-wrap gap-1.5">
+                <button
+                    class=INSERT_CHIP
+                    title="Insert Figure selector"
+                    on:click=move |_| insert(SnippetSpec::AuxRef { kind: AuxRefKind::Figure, page })
+                >{format!("Figure(as=\"figure_p{page}\")")}</button>
+            </div>
+        }.into_any()),
+        _ => None,
+    }
+}
+
 /// Discover-mode side panel: text + metadata of the clicked element.
 #[component]
 fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverlay>>) -> impl IntoView {
@@ -455,6 +545,14 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
         (None, Some(size)) => format!("{size:.1}pt"),
         (None, None) => "—".to_string(),
     };
+
+    // Discover → query: insert actions for this element kind (DV-012).
+    let insert_block = insert_actions(&element).map(|actions| view! {
+        <div>
+            <div class="text-xs font-medium text-gray-500 uppercase mb-1">"Insert into query"</div>
+            {actions}
+        </div>
+    });
 
     // Table structure section (kind=table, D-018): n_rows × n_cols, strategy,
     // confidence from element metadata + the cell text grid.
@@ -520,6 +618,7 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
                     <div class="text-xs font-medium text-gray-500 uppercase mb-1">"Font"</div>
                     <div class="text-xs text-gray-700">{font}</div>
                 </div>
+                {insert_block}
                 {table_section}
                 <div>
                     <div class="text-xs font-medium text-gray-500 uppercase mb-1">"Text"</div>
