@@ -3,11 +3,11 @@ use leptos::prelude::*;
 use leptos::svg::*;
 use leptos_router::hooks::use_navigate;
 use server_fn::codec::{MultipartData, MultipartFormData};
-use leptos::ev;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::FormData;
 use wasm_bindgen::JsCast;
 
+use crate::components::doc_tree::DocTree;
 use crate::store::{DocumentSummary, UploadReceipt};
 
 /// Upload a PDF: write original bytes to the local byte-cache, ingest into
@@ -69,7 +69,6 @@ pub async fn get_document_by_id(
 #[component]
 pub fn FileUpload() -> impl IntoView {
     let navigate = use_navigate();
-    let navigate_clone = navigate.clone();
 
     // Create signals for upload state
     let (upload_pending, set_upload_pending) = signal(false);
@@ -78,7 +77,7 @@ pub fn FileUpload() -> impl IntoView {
     // Handle successful upload and navigation with an effect
     Effect::new(move |_| {
         if let Some(Ok(receipt)) = upload_result.get() {
-            navigate_clone(&format!("/viewer/{}/0", receipt.document_id), Default::default());
+            navigate(&format!("/viewer/{}/0", receipt.document_id), Default::default());
         }
     });
 
@@ -302,58 +301,11 @@ pub fn FileUpload() -> impl IntoView {
                                             .child("No documents in the store yet")
                                             .into_any()
                                     } else {
-                                        div()
-                                            .class("space-y-2")
-                                            .child(docs.into_iter().map(|doc| {
-                                                let name_tooltip = doc.name.clone();
-                                                div()
-                                                    .class("flex items-center justify-between p-3 bg-white border border-gray-200 rounded-lg hover:bg-gray-50")
-                                                    .child((
-                                                        div()
-                                                            .class("flex-1 min-w-0 mr-2")
-                                                            .child((
-                                                                div()
-                                                                    .class("text-sm font-medium text-gray-900 truncate")
-                                                                    .attr("title", name_tooltip)
-                                                                    .child(doc.name.clone()),
-                                                                div()
-                                                                    .class("text-xs text-gray-500")
-                                                                    .child(format!(
-                                                                        "{} • {} pages • parse v{} • {}",
-                                                                        doc.corpus,
-                                                                        doc.page_count,
-                                                                        doc.parse_version,
-                                                                        doc.parsed_at.format("%Y-%m-%d %H:%M")
-                                                                    )),
-                                                                div()
-                                                                    .class(if doc.has_source {
-                                                                        "text-xs text-green-600"
-                                                                    } else {
-                                                                        "text-xs text-amber-600"
-                                                                    })
-                                                                    .child(if doc.has_source {
-                                                                        "source bytes cached"
-                                                                    } else {
-                                                                        "no source bytes (overlays only)"
-                                                                    })
-                                                            )),
-                                                        div()
-                                                            .class("flex items-center space-x-2")
-                                                            .child(
-                                                                button()
-                                                                    .class("text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200")
-                                                                    .on(ev::click, {
-                                                                        let doc_id = doc.id.clone();
-                                                                        let navigate_copy = navigate.clone();
-                                                                        move |_| {
-                                                                            navigate_copy(&format!("/viewer/{}/0", doc_id), Default::default());
-                                                                        }
-                                                                    })
-                                                                    .child("View")
-                                                            )
-                                                    ))
-                                            }).collect::<Vec<_>>())
-                                            .into_any()
+                                        // File tree following the hive-style
+                                        // partition tags captured at ingest
+                                        // (D-023): corpus → key=value levels
+                                        // → document leaf (DV-015).
+                                        view! { <DocTree docs=docs /> }.into_any()
                                     }
                                 })
                                     }}

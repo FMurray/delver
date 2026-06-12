@@ -26,6 +26,13 @@ pub struct DocumentSummary {
     /// Whether the original bytes are reachable (uri set and file readable),
     /// i.e. whether page rasters can be produced.
     pub has_source: bool,
+    /// Hive-style partition tags captured at ingest (D-023,
+    /// `documents.metadata.partitions`). A `BTreeMap` so iteration order is
+    /// deterministic ALPHABETICAL by key — the stored jsonb object is
+    /// unordered and the original `--partition`/path order is not persisted
+    /// (DV-015). Empty for untagged documents.
+    #[serde(default)]
+    pub partitions: std::collections::BTreeMap<String, String>,
 }
 
 /// Receipt for an upload/ingest (mirrors the CLI `index` JSON, D-012).
@@ -223,13 +230,37 @@ mod server {
 
     const SUMMARY_SELECT: &str = "SELECT d.id::text AS id, c.name AS corpus, d.uri, \
             d.page_count, d.parse_version, d.parsed_at, \
-            d.metadata->>'title' AS title \
+            d.metadata->>'title' AS title, \
+            d.metadata->'partitions' AS partitions \
        FROM documents d JOIN corpora c ON c.id = d.corpus_id";
+
+    /// `documents.metadata.partitions` jsonb object → string map. Values are
+    /// strings as written by `delver index --partition` (D-023); any
+    /// non-string value is rendered with its JSON representation rather than
+    /// dropped.
+    fn partition_map(value: Option<&serde_json::Value>) -> std::collections::BTreeMap<String, String> {
+        value
+            .and_then(|v| v.as_object())
+            .map(|object| {
+                object
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = match value {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
     fn summary_from_row(row: &sqlx::postgres::PgRow) -> Result<DocumentSummary> {
         let id: String = row.try_get("id")?;
         let uri: Option<String> = row.try_get("uri")?;
         let title: Option<String> = row.try_get("title")?;
+        let partitions: Option<serde_json::Value> = row.try_get("partitions")?;
         let has_source = uri
             .as_deref()
             .map(|u| Path::new(u).is_file())
@@ -241,6 +272,7 @@ mod server {
             parse_version: row.try_get("parse_version")?,
             parsed_at: row.try_get("parsed_at")?,
             has_source,
+            partitions: partition_map(partitions.as_ref()),
             uri,
             id,
         })
@@ -832,6 +864,23 @@ mod server {
             assert_eq!(cells[0].bbox, Some((10.0, 20.0, 60.0, 40.0)));
             assert_eq!((cells[1].row, cells[1].col), (0, 1));
             assert!(!cells[1].is_header);
+        }
+
+        #[test]
+        fn partition_map_is_alphabetical_and_handles_non_strings() {
+            let value = serde_json::json!({"year": "2015", "company": "3M", "rev": 7});
+            let map = partition_map(Some(&value));
+            let pairs: Vec<(String, String)> = map.into_iter().collect();
+            assert_eq!(
+                pairs,
+                vec![
+                    ("company".to_string(), "3M".to_string()),
+                    ("rev".to_string(), "7".to_string()),
+                    ("year".to_string(), "2015".to_string()),
+                ]
+            );
+            assert!(partition_map(None).is_empty());
+            assert!(partition_map(Some(&serde_json::Value::Null)).is_empty());
         }
 
         #[test]

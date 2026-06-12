@@ -1,3 +1,4 @@
+pub mod doc_tree;
 pub mod file_upload;
 pub mod insert;
 pub mod palette;

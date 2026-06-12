@@ -282,3 +282,22 @@ fresh headless session: empty state → p26 segment table click → "10 rows × 
 confidence 0.88" + grid + both insert chips; chip click auto-opens the query panel and lands
 `Table(as="table_p26")` at the cursor).
 
+**DV-015 · 2026-06-12 · "Documents in Store" is a partition file tree.**
+The flat newest-first list is replaced by `components/doc_tree.rs`: corpus (collapsible) →
+one collapsible level per hive-style partition `key=value` (D-023,
+`documents.metadata.partitions`) → compact document leaf (name, pages • parse version •
+date, source-bytes dot, `View` as a plain `<a href>` per DV-009). Documents without
+partitions sit directly under their corpus. Built from the ONE existing listing call —
+`DocumentSummary` gains a `partitions: BTreeMap<String, String>` (additive; REST `/api/v/docs`
+carries it automatically); no per-node requests. Ordering decision: the stored jsonb object
+is UNORDERED, so the original hive-path key order (`company=3M/year=2015`) is lost at ingest —
+levels use deterministic ALPHABETICAL key order (the BTreeMap makes this structural), and
+corpora + sibling segment values sort alphabetically too. Future fix noted: persist partition
+key order at ingest (e.g. a `partition_keys` array next to the object) and order levels by it.
+Default state: all corpora collapsed except the one containing the open document, whose full
+partition path auto-expands and whose leaf is highlighted — with the test-residue corpora in
+the shared dev DB (DV-010) the tree collapses ~250 documents into ~230 one-line rows.
+Initial expansion derives only from (listing, route pathname), identical on server and
+client, so the structural `<Show>`s hydrate cleanly (DV-009). Tree building is pure and
+unit-tested (alphabetical paths, unpartitioned docs at corpus level, descendant counts,
+listing order inside nodes).
