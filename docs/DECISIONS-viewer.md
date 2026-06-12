@@ -301,3 +301,96 @@ Initial expansion derives only from (listing, route pathname), identical on serv
 client, so the structural `<Show>`s hydrate cleanly (DV-009). Tree building is pure and
 unit-tested (alphabetical paths, unpartitioned docs at corpus level, descendant counts,
 listing order inside nodes).
+
+**DV-016 · 2026-06-12 · Slice V4: the palette is a no-code structural query builder; the editor becomes "view source".**
+The owner's design verbatim: the palette must "match the DOM structure of the actual query" — and
+"the attributes [must] be selectable in the palette — no one knows what DocQL actually is". The
+palette now renders the parsed buffer as a node tree (add-slot / node / add-slot …, child slots
+inside structural nodes, ONE root slot when the buffer is empty) and every node expands into an
+attribute form whose values are pickable: headings from the document, rule types from the grammar,
+TYPE fields from detected table columns. LSP autocomplete polish was explicitly deprioritized
+below this; nothing there changed.
+- **Parse "service" decision: neither a server fn nor an LSP custom request — a pure shared
+  function.** The slice offered two transports; both were beaten by the observation that
+  delver-core is a NON-OPTIONAL viewer dependency and therefore already compiles into the wasm
+  bundle. `query_tree::parse_query_tree(text)` walks the pest pairs (spans!) into
+  `QueryTree { nodes, compile }` — nodes carry kind (Element / MatchDef / TypeDef), byte spans
+  (whole node, header, body interior, declaration name), attributes with value + value-span
+  (raw source preserved), children, match rules (function, pattern, threshold, endpoint,
+  Heuristic comparisons, FirstMatch nesting) and TYPE fields — then runs the real
+  `parse_template` for the D-006 compile surface. It executes synchronously IN the client
+  (sub-ms at palette scale), so there is no round trip, no JSON-RPC id correlation, no debounce
+  and no staleness window; the same code unit-tests under `cargo test -p viewer --lib`. pest
+  span quirk recorded: spans absorb whitespace consumed by a trailing failed optional rule
+  (an element's missing body), so node spans are trimmed back to the last non-whitespace byte.
+- **Sync semantics: span surgery against the last-good snapshot, gated byte-for-byte.**
+  `components::builder::QueryBuilder` (app context) holds ONE buffer signal (editor and forms
+  both write it; `?template` deep links seed it in `QueryParamSync` so the tree sees them with
+  the panel closed), the last good `Snapshot { text, tree }`, the syntax error, and the selected
+  node path. Form edits compute byte splices from node spans and apply them ONLY when
+  `snapshot.text == buffer` (the `fresh()` guard) — so hand formatting outside the edited span
+  survives verbatim, and a syntactically broken buffer shows the last-good tree with an amber
+  "fix syntax in the editor" banner and forms disabled (opacity + pointer-events) until the
+  reparse succeeds. Manual edits round-trip: every buffer change reparses (client effect in
+  `BuilderSync`) → tree rebuild. Editor mirror: programmatic buffer changes setValue with
+  cursor+scroll preserved; editor keystrokes are equal-value no-ops, so the loop converges.
+  Tree click selects the node's span in CodeMirror (byte → UTF-16 conversion for
+  `posFromIndex`); cursor→tree was the documented nice-to-have and is deferred.
+- **Compile diagnostics per node, by name heuristic.** `parse_template` stops at its first
+  error and carries no positions, so the diagnostic is attributed to the first DFS node whose
+  declaration name, `as=` value, or element identifier appears single-quoted in the message
+  (red dot on the row, message on expand); unattributed messages render under the tree. Good
+  enough in practice because the engine's fail-loud messages consistently name their owner.
+- **Slot legality table** (`query_tree::slot_menu`): top level → Section, TextChunk, Table,
+  Paragraph, Annotation, Figure, Image + Match, TYPE, SubCorpus; inside Section → the seven
+  element kinds; everything else is a leaf. Inserted nodes are minimal-but-valid
+  (`Section(as="section1") {}`, `Table(as="table1")`, `Match<Section> Match1 { Text("",
+  threshold=0.6) }`, …), names uniquified DV-012-style; the new node is auto-selected with its
+  form open.
+- **Forms.** Section: heading picker (DV-012 palette fetch feeds it) + free text + rule-type
+  selector — Text (threshold stepper 0.6) / Regex (pattern) / Heuristic (property dropdown over
+  the D-014 supported set + comparator + value rows, string properties forced to ==/!=) /
+  EmbeddingSim (text + threshold + endpoint); optional end_match with the same editor; `as`
+  input. EVERY Section rule lives in a named `Match<Section>` block (created on first edit,
+  auto-named from the pattern slug `Overview`/`overview`, inserted right before the section's
+  top-level ancestor; the selection path shifts with it). TextChunk: chunkSize/chunkOverlap
+  steppers (500/150), method dropdown (tokens drops the attr — engine default — and removes
+  breakpointPercentile; semantic reveals the percentile stepper). Table: `as` + `type` dropdown
+  over declared TYPEs + "New TYPE from a detected table…" → pick one of the doc's tables →
+  field rows prefilled via `snippets::type_fields_from_columns` (extracted from the DV-012
+  typed-table generator so form and snippet can never drift) → editable names/types → emits the
+  TYPE at the TOP of the buffer and sets `type=`. TYPE nodes: row editor (add/remove/rename
+  fields, type dropdown) and rename-with-reference-rewrite (`type=` values); Match nodes: the
+  rule editor + rename-with-reference-rewrite (`match=`/`end_match=` identifiers).
+  Annotation/Figure/Image/Paragraph: `as`. SubCorpus: description + as. Unknown elements render
+  with no form ("edit in the editor"). All text inputs commit on change (blur/Enter), not per
+  keystroke — the tree re-renders on every buffer change and a focused input would not survive.
+- **Fidelity caveats (documented behavior, not bugs):** editing converts inline
+  `match="string"` to a named block; only the FIRST clause of a multi-clause definition is
+  form-edited (the rest are preserved verbatim and noted); FirstMatch/exotic clauses and
+  array-valued attributes render read-only with their source; a heading pick overwrites `as=`
+  with the slug (stable when re-picking the same heading); rewritten spans are re-rendered in
+  canonical form (number formatting, attribute spacing) while existing attributes keep source
+  order and new ones append; TYPE field-row edits rewrite the whole declaration (nothing else
+  in a TYPE to preserve — the grammar has no comments).
+- **Insert chips re-routed.** The DV-012 insert bus is consumed by the builder now (`BuilderSync`),
+  not at the editor cursor: single-element specs (table/annotation/figure/plain-chunks) land in
+  the selected node's child slot when slot-legal, everything else (and everything while the
+  buffer is broken) appends at top level. The pristine-starter special case died with the
+  starter: the DEFAULT BUFFER IS NOW EMPTY — the root slot is the empty state the owner asked
+  for, and an empty template is valid DocQL (the DV-012 starter existed to avoid a syntax-error
+  greeting, which no longer applies). The buffer also survives panel close/reopen now (it
+  out-lives the panel-local signal it used to be).
+- **Deliberately deferred:** Image element children (ImageSummary/Bytes/Caption/Embedding) —
+  Image stays a leaf in the builder; FirstMatch composition UI; editing clauses past the first;
+  cursor-position→tree-selection sync; a REST mirror for the parse (it is client-side; REST
+  template execution from DV-006 still covers curl); doc-aware LSP completions (DV-012 stance
+  unchanged).
+- **Verified** (fresh headless sessions, evidence in /tmp/v4-evidence): empty buffer → root
+  slot with the 10-kind menu; Section form with the real 10-K heading picker; OVERVIEW pick →
+  `Match<Section> Overview { Text("OVERVIEW", threshold=0.6) }` + `Section(as="overview",
+  match=Overview)`; child slot → TextChunk; editor buffer textually identical to the tree; run
+  → chunk outputs (post-hydration path, LSP Connected, zero hydration/panic console errors);
+  New TYPE… on the p26 10×7 table prefilled `col1 TEXT, c2015/c2014/c2013 DECIMAL` and emitted
+  the declaration at top; deep-link `?template&run=1` autorun + tree intact; inspector chip
+  landed inside the selected Section. CLI baselines 414534/466678 bytes, 0-byte stderr.
