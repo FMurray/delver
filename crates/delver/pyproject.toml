@@ -8,10 +8,7 @@ version = "0.2.0-rc.1"
 description = "Delver is a tool for declarative PDF extraction"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-    "cffi>=1.17.1",
-    "maturin[zig]>=1.8.1",
-]
+dependencies = []
 
 [tool.maturin]
 bindings = "pyo3"
