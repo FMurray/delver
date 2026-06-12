@@ -1,11 +1,12 @@
 //! Document page view: on-demand raster from the byte-cache, element bbox
-//! overlays with per-kind toggles (Stage B kinds), and a click-through
-//! "discover mode" side panel (DV-004).
+//! overlays with per-kind toggles (Stage B kinds), and the discover-mode
+//! element inspector in a persistent right sidebar (DV-004, DV-014).
 
 use leptos::prelude::*;
 use leptos_router::hooks::{use_params_map, use_query_map};
 use uuid::Uuid;
 
+use crate::app::InspectorContext;
 use crate::components::file_upload::get_document_by_id;
 use crate::components::insert::{use_request_insert, INSERT_CHIP};
 use crate::snippets::{column_specs, AuxRefKind, CellLite, SnippetSpec};
@@ -150,8 +151,10 @@ pub fn PdfViewer() -> impl IntoView {
         })
         .collect();
 
-    // Selected element for the discover-mode side panel.
+    // Selected element for the discover-mode inspector (right sidebar).
     let selected: RwSignal<Option<ElementOverlay>> = RwSignal::new(None);
+    let InspectorContext(show_inspector, set_show_inspector) =
+        use_context::<InspectorContext>().expect("inspector context in doc view");
 
     // Document summary.
     let document = Resource::new(
@@ -288,12 +291,17 @@ pub fn PdfViewer() -> impl IntoView {
                                         elems,
                                         toggles_for_page.clone(),
                                         selected,
+                                        set_show_inspector,
                                     )}
                                 </div>
                             </main>
-                            {move || selected.get().map(|element| view! {
-                                <ElementPanel element=element selected=selected />
-                            })}
+                            // Persistent right sidebar (DV-014): empty-state
+                            // hint until an element is clicked. `selected`
+                            // starts None on server and client alike, so SSR
+                            // and hydration render the same subtree.
+                            <Show when=move || show_inspector.get()>
+                                <InspectorPanel selected=selected />
+                            </Show>
                         </div>
                     }.into_any()
                 }}
@@ -311,6 +319,7 @@ fn page_view(
     elems: Vec<ElementOverlay>,
     toggles: Vec<(&'static str, RwSignal<bool>)>,
     selected: RwSignal<Option<ElementOverlay>>,
+    set_show_inspector: WriteSignal<bool>,
 ) -> impl IntoView {
     // Container size and pts→px scale: from the raster when available,
     // otherwise a placeholder sized from the page's element extent.
@@ -432,7 +441,13 @@ fn page_view(
                             class="absolute cursor-pointer"
                             style=style
                             title=title
-                            on:click=move |_| selected.set(Some(element.clone()))
+                            // Clicking an element also surfaces the inspector
+                            // when it was collapsed — click-select must never
+                            // look dead (DV-014).
+                            on:click=move |_| {
+                                selected.set(Some(element.clone()));
+                                set_show_inspector.set(true);
+                            }
                         >{cell_grid}</div>
                     })
                 }).collect::<Vec<_>>()}
@@ -529,7 +544,42 @@ fn insert_actions(element: &ElementOverlay) -> Option<AnyView> {
     }
 }
 
-/// Discover-mode side panel: text + metadata of the clicked element.
+/// Persistent right sidebar housing the discover-mode element inspector
+/// (DV-014). Mirrors the left aside's chrome (`app::SidePanel`) with
+/// `border-l` instead of `border-r`; collapsible through
+/// [`InspectorContext`]'s nav toggle. Shows an empty-state hint until an
+/// element is clicked. `selected` starts `None` on server and client, so the
+/// initial subtree is identical across hydration (DV-009).
+#[component]
+pub fn InspectorPanel(selected: RwSignal<Option<ElementOverlay>>) -> impl IntoView {
+    view! {
+        <aside class="w-96 bg-white border-l border-gray-200 shadow-lg transition-all duration-300 ease-in-out">
+            <div class="h-full flex flex-col">
+                {move || match selected.get() {
+                    Some(element) => view! {
+                        <ElementPanel element=element selected=selected />
+                    }
+                    .into_any(),
+                    None => view! {
+                        <div class="p-4 border-b border-gray-200">
+                            <h2 class="text-sm font-semibold text-gray-900">"Element inspector"</h2>
+                            <p class="text-xs text-gray-600 mt-1">"Discover mode"</p>
+                        </div>
+                        <div class="flex-1 p-6 overflow-y-auto">
+                            <p class="text-sm text-gray-500 italic">
+                                "Click any element on the page to inspect it."
+                            </p>
+                        </div>
+                    }
+                    .into_any(),
+                }}
+            </div>
+        </aside>
+    }
+}
+
+/// Inspector contents for one clicked element: kind badge, id/bbox/font,
+/// insert-into-query actions, table structure, text, metadata.
 #[component]
 fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverlay>>) -> impl IntoView {
     let (border, fill) = kind_colors(&element.kind);
@@ -591,7 +641,6 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
     });
 
     view! {
-        <aside class="bg-white border-l border-gray-200 shadow-lg" style="width:24rem;overflow-y:auto">
             <div class="p-4 border-b border-gray-200 flex items-center justify-between">
                 <div class="flex items-center space-x-2">
                     <span
@@ -605,7 +654,7 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
                     on:click=move |_| selected.set(None)
                 >"✕ close"</button>
             </div>
-            <div class="p-4 space-y-4 text-sm">
+            <div class="flex-1 p-4 space-y-4 text-sm overflow-y-auto">
                 <div>
                     <div class="text-xs font-medium text-gray-500 uppercase mb-1">"Element id"</div>
                     <div class="font-mono text-xs text-gray-700 break-all">{element.id.clone()}</div>
@@ -631,7 +680,6 @@ fn ElementPanel(element: ElementOverlay, selected: RwSignal<Option<ElementOverla
                     <pre class="text-xs text-gray-800 bg-gray-50 rounded p-2" style="max-height:16rem;overflow:auto">{metadata}</pre>
                 </div>
             </div>
-        </aside>
     }
 }
 

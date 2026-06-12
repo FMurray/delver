@@ -263,3 +263,22 @@ REST `POST /api/v/docs/{id}/template`. Rule of thumb recorded: never SSR unbound
 a hydrated subtree — anything that can exceed ~64 KiB must render post-hydration (or be
 chunked below the parser's split boundary).
 
+**DV-014 · 2026-06-12 · Discover mode moves to a persistent right sidebar.**
+Owner request: the element inspector is now the third column of the doc view — left sidebar
+(palette + upload, unchanged) | page canvas | right `<aside>` housing the discover-mode
+inspector (kind badge, id/bbox/font, insert-into-query actions, table structure with the
+D-018 cell grid, text, metadata). `InspectorPanel` (pdf_viewer.rs) renders persistently where
+the old inline `ElementPanel` appeared, with an empty-state hint ("Click any element on the
+page to inspect it") instead of mounting on selection; `ElementPanel` is now just its
+populated contents (header pinned, body scrolls). Collapsible exactly like the left aside:
+a new `InspectorContext` (app.rs, default open) + a third nav `Toggle` ("Toggle element
+inspector"), aside classes mirror `SidePanel` (`w-96` instead of `w-80` for the cell grid,
+`border-l` for `border-r`). Clicking an overlay also re-opens a collapsed inspector
+(`page_view` takes the context's write half) so click-select never looks dead. DV-009
+discipline: `selected` starts `None` on server and client and the inspector/Show initial
+states are constants, so the hydration subtree is identical; no resources moved. All existing
+behavior kept: overlay toggles, click-select, insert-bus publishing, cell grid (verified in a
+fresh headless session: empty state → p26 segment table click → "10 rows × 7 cols • ruled •
+confidence 0.88" + grid + both insert chips; chip click auto-opens the query panel and lands
+`Table(as="table_p26")` at the cursor).
+

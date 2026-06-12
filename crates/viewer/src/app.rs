@@ -34,6 +34,12 @@ pub struct SidebarContext(pub ReadSignal<bool>, pub WriteSignal<bool>);
 #[derive(Clone, Copy)]
 pub struct QueryContext(pub ReadSignal<bool>, pub WriteSignal<bool>);
 
+/// Right sidebar: the discover-mode element inspector (DV-014). Mirrors
+/// [`SidebarContext`]; the panel itself lives in the doc view
+/// (`components::pdf_viewer::InspectorPanel`).
+#[derive(Clone, Copy)]
+pub struct InspectorContext(pub ReadSignal<bool>, pub WriteSignal<bool>);
+
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
@@ -69,12 +75,16 @@ pub fn App() -> impl IntoView {
 
     // Sidebar (document list) starts open; query panel opens on demand,
     // via ?template=…&run=1 deep links (see QueryParamSync), or by any
-    // "insert into query" action (DV-012).
+    // "insert into query" action (DV-012). The right-sidebar element
+    // inspector starts open too (it shows an empty-state hint until an
+    // element is clicked, DV-014).
     let (show_sidebar, set_show_sidebar) = signal(true);
     let (show_query, set_show_query) = signal(false);
+    let (show_inspector, set_show_inspector) = signal(true);
 
     provide_context(SidebarContext(show_sidebar, set_show_sidebar));
     provide_context(QueryContext(show_query, set_show_query));
+    provide_context(InspectorContext(show_inspector, set_show_inspector));
     provide_context(InsertBus::new());
 
     view! {
@@ -120,6 +130,8 @@ pub fn MainNav() -> impl IntoView {
         use_context::<SidebarContext>().expect("sidebar context in nav");
     let QueryContext(show_query, set_show_query) =
         use_context::<QueryContext>().expect("query context in nav");
+    let InspectorContext(show_inspector, set_show_inspector) =
+        use_context::<InspectorContext>().expect("inspector context in nav");
 
     view! {
         <nav class="bg-white shadow-sm border-b border-gray-200 px-4 py-3">
@@ -137,6 +149,11 @@ pub fn MainNav() -> impl IntoView {
                         show=show_query
                         set_show=set_show_query
                         aria_label="Toggle query panel".to_string()
+                    />
+                    <Toggle
+                        show=show_inspector
+                        set_show=set_show_inspector
+                        aria_label="Toggle element inspector".to_string()
                     />
                     <span class="text-sm text-gray-500">Ready</span>
                 </div>
