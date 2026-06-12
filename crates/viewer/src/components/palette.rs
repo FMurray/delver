@@ -17,6 +17,7 @@ use std::sync::Arc;
 use leptos::prelude::*;
 use leptos_router::hooks::use_location;
 
+use crate::app::{QueryContext, RunBus, RunStatus};
 use crate::components::builder::{QueryBuilder, SlotKey, Snapshot};
 use crate::components::query_panel::doc_id_from_path;
 use crate::query_tree::{
@@ -156,6 +157,9 @@ pub fn QueryPalette() -> impl IntoView {
     let current_doc = Memo::new(move |_| doc_id_from_path(&location.pathname.get()));
     let open = RwSignal::new(true);
     let builder = expect_context::<QueryBuilder>();
+    // V5 (DV-017): the Run button publishes on the bus and opens the panel.
+    let run_bus = expect_context::<RunBus>();
+    let QueryContext(_, set_show_query) = expect_context::<QueryContext>();
 
     // Transient builder-UI state, OUTSIDE the rebuilt tree closure so a
     // reparse never resets an open menu or a half-edited TYPE draft.
@@ -184,6 +188,7 @@ pub fn QueryPalette() -> impl IntoView {
                 <span class="text-gray-400 text-xs">{move || if open.get() { "▾" } else { "▸" }}</span>
             </button>
             <Show when=move || open.get()>
+                {run_bar(builder, run_bus, set_show_query)}
                 <Suspense fallback=move || view! {
                     <p class="text-xs text-gray-500 mt-2">"Loading document data..."</p>
                 }>
@@ -205,6 +210,71 @@ pub fn QueryPalette() -> impl IntoView {
             </Show>
         </div>
         </Show>
+    }
+}
+
+/// The Run bar at the top of the builder (V5, DV-017): a prominent Run
+/// button — enabled exactly when the buffer is runnable
+/// ([`QueryBuilder::run_gate`]: non-empty, parses, compiles; the hint below
+/// carries the reason otherwise) — plus the compact status of the latest
+/// run, reported back by the query panel over the [`RunBus`]. Clicking
+/// opens the panel (results render there; execution stays client-side
+/// post-hydration, DV-013) and publishes a consumed one-shot request.
+/// Every dynamic part is attribute/text-level on a constant subtree, so
+/// SSR and hydration stay structurally identical (DV-009).
+fn run_bar(
+    builder: QueryBuilder,
+    run_bus: RunBus,
+    set_show_query: WriteSignal<bool>,
+) -> impl IntoView {
+    let gate = Memo::new(move |_| builder.run_gate());
+    let on_run = move |_| {
+        if gate.get_untracked().is_some() {
+            return;
+        }
+        set_show_query.set(true);
+        run_bus.request_run();
+    };
+    let status_text = move || match run_bus.status.get() {
+        RunStatus::Idle => String::new(),
+        RunStatus::Running => "running…".to_string(),
+        RunStatus::Done(1) => "1 output".to_string(),
+        RunStatus::Done(n) => format!("{n} outputs"),
+        RunStatus::Failed(_) => "run failed".to_string(),
+    };
+    let status_class = move || match run_bus.status.get() {
+        RunStatus::Idle => "text-[11px] shrink-0",
+        RunStatus::Running => "text-[11px] shrink-0 text-blue-600",
+        RunStatus::Done(_) => "text-[11px] shrink-0 font-medium text-green-700",
+        RunStatus::Failed(_) => "text-[11px] shrink-0 font-medium text-red-700",
+    };
+    let status_title = move || match run_bus.status.get() {
+        RunStatus::Failed(msg) => msg,
+        RunStatus::Done(n) => {
+            format!("Latest run produced {n} output(s) — see the results panel below")
+        }
+        _ => String::new(),
+    };
+
+    view! {
+        <div class="mt-2">
+            <div class="flex items-center gap-2">
+                <button
+                    class="flex-1 px-3 py-1.5 bg-blue-600 text-white text-xs font-semibold rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    title=move || gate.get().unwrap_or_else(|| {
+                        "Run this query against the open document".to_string()
+                    })
+                    disabled=move || gate.get().is_some()
+                    on:click=on_run
+                >
+                    "▶ Run"
+                </button>
+                <span class=status_class title=status_title>{status_text}</span>
+            </div>
+            <p class="text-[10px] text-amber-700 mt-1 break-words">
+                {move || gate.get().unwrap_or_default()}
+            </p>
+        </div>
     }
 }
 

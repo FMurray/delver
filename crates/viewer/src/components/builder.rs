@@ -354,6 +354,45 @@ impl QueryBuilder {
         };
         self.buffer.set(new_text);
     }
+
+    /// Why the palette's Run button is disabled — `None` means runnable
+    /// (slice V5, DV-017). Reactive: tracks buffer, syntax error, and
+    /// snapshot, so the button state follows every edit. Logic lives in the
+    /// pure [`run_gate`] so it unit-tests without a reactive runtime.
+    pub fn run_gate(&self) -> Option<String> {
+        run_gate(
+            &self.buffer.get(),
+            self.syntax_error.get().as_deref(),
+            self.snapshot.get().as_ref(),
+        )
+    }
+}
+
+/// Run-button gate (V5): a buffer is runnable when it is non-empty, parses
+/// (no syntax error, snapshot caught up byte-for-byte) and compiles (no
+/// `parse_template` diagnostic). Returns the disabled-reason hint otherwise.
+pub fn run_gate(
+    buffer: &str,
+    syntax_error: Option<&str>,
+    snapshot: Option<&Snapshot>,
+) -> Option<String> {
+    if buffer.trim().is_empty() {
+        return Some("The query is empty — add a node first.".to_string());
+    }
+    if let Some(msg) = syntax_error {
+        return Some(format!("Fix the syntax error first ({msg})."));
+    }
+    match snapshot {
+        Some(snap) if snap.text == buffer => snap
+            .tree
+            .compile
+            .as_ref()
+            .map(|diag| format!("Fix the compile error first ({}).", diag.message)),
+        // SSR and the instant before the first client-side reparse
+        // (BuilderSync): identical on server and client, so the disabled
+        // button hydrates cleanly (DV-009).
+        _ => Some("Reading query structure...".to_string()),
+    }
 }
 
 impl Default for QueryBuilder {
@@ -657,5 +696,46 @@ mod tests {
         b.buffer.set("Table(as=\"t\") garbage(".to_string());
         b.set_attrs(&[0], vec![("as".into(), AttrWrite::Set("\"x\"".into()))]);
         assert_eq!(b.buffer.get_untracked(), "Table(as=\"t\") garbage(");
+    }
+
+    // ── Run-button gate (V5, DV-017) ──
+
+    #[test]
+    fn run_gate_blocks_empty_buffer() {
+        let (_owner, b) = fresh_builder("");
+        let reason = b.run_gate().expect("empty buffer must not be runnable");
+        assert!(reason.contains("empty"), "got: {reason}");
+        // Whitespace-only counts as empty too.
+        assert!(run_gate("  \n ", None, None).is_some());
+    }
+
+    #[test]
+    fn run_gate_blocks_syntax_error_with_its_message() {
+        let (_owner, b) = fresh_builder("Table(as=\"t\")");
+        b.buffer.set("Table(as=".to_string());
+        b.reparse("Table(as=");
+        let reason = b.run_gate().expect("syntax error must not be runnable");
+        assert!(reason.contains("syntax error"), "got: {reason}");
+        assert!(reason.contains("line 1"), "positioned message expected, got: {reason}");
+    }
+
+    #[test]
+    fn run_gate_blocks_compile_error_with_its_message() {
+        // Parses fine, but type="Nope" references an undefined TYPE.
+        let (_owner, b) = fresh_builder("Table(as=\"t\", type=\"Nope\")");
+        let reason = b.run_gate().expect("compile error must not be runnable");
+        assert!(reason.contains("compile error"), "got: {reason}");
+        assert!(reason.contains("Nope"), "got: {reason}");
+    }
+
+    #[test]
+    fn run_gate_blocks_stale_snapshot_and_opens_when_clean() {
+        let (_owner, b) = fresh_builder("Table(as=\"t\")");
+        assert_eq!(b.run_gate(), None, "clean parse + compile must be runnable");
+        // Buffer edited but not yet reparsed (SSR / pre-effect instant).
+        b.buffer.set("TextChunk(chunkSize=500)".to_string());
+        assert!(b.run_gate().is_some(), "stale snapshot must gate the run");
+        b.reparse("TextChunk(chunkSize=500)");
+        assert_eq!(b.run_gate(), None);
     }
 }

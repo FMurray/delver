@@ -394,3 +394,47 @@ below this; nothing there changed.
   New TYPE… on the p26 10×7 table prefilled `col1 TEXT, c2015/c2014/c2013 DECIMAL` and emitted
   the declaration at top; deep-link `?template&run=1` autorun + tree intact; inspector chip
   landed inside the selected Section. CLI baselines 414534/466678 bytes, 0-byte stderr.
+
+**DV-017 · 2026-06-12 · Slice V5: the builder gets a Run button; results stop hiding behind the
+closed panel.**
+Owner's report verbatim: "I am not seeing the query results anywhere but the authoring
+experience is much better." Root cause confirmed: the V4 builder had no run affordance, and
+results render only inside the bottom `QueryPanel`, which mounts behind `QueryContext`'s
+`show_query` (default false) — a user authoring purely in the palette had no path to results.
+- **Run button** at the top of the "Query builder" section (`palette::run_bar`): enabled
+  exactly when the buffer is runnable — non-empty, parses, compiles — via
+  `builder::run_gate(buffer, syntax_error, snapshot)` (pure, unit-tested; the reactive
+  `QueryBuilder::run_gate` wraps it). When disabled, the reason renders as a hint below the
+  button (and as its tooltip): empty buffer / positioned syntax error / `parse_template`
+  compile message / "Reading query structure..." for the pre-first-parse instant (that
+  fallback is what SSR renders, so the disabled button hydrates cleanly per DV-009).
+- **Run plumbing — `RunBus` context (app.rs), two halves.** `request: RwSignal<Option<u64>>`
+  is a consumed one-shot exactly like the DV-012 insert bus: the button sets `show_query`
+  true and publishes a nonce; the panel's client-side effect calls the SAME `execute()` as
+  Ctrl/Cmd-Enter (doc id from the route + shared buffer) and clears the request — so a
+  request published while the panel is closed is consumed by the mount-time effect run, and
+  panel re-mounts (toggle close/open) never replay a stale one. Effects never run during SSR,
+  so DV-013's never-execute-server-side rule holds. `status: RwSignal<RunStatus>` flows back:
+  Idle | Running | Done(n) | Failed(msg) — sharing the multi-MB output itself would be
+  pointlessly heavy; the count is all the builder needs.
+- **Status badge** next to Run: "running…" → "{n} outputs" (green, tooltip points at the
+  results panel) or "run failed" (red, tooltip carries the template/transport error). The
+  panel reduces its run resource into the enum; results now ride with their request nonce
+  (`Resource` value `(nonce, result)`) so a stale value — the previous run's, still readable
+  while the next is in flight — can never overwrite "running…"; `count_outputs` measures the
+  top-level array length via `Vec<serde::de::IgnoredAny>` without materializing values.
+  Closing the panel mid-run drops the resource (aborting the run), so `on_cleanup` resets a
+  dangling Running to Idle; a finished Done/Failed badge survives the panel closing (it
+  describes the last run).
+- **Unchanged behaviors verified:** Ctrl/Cmd-Enter in the editor, the panel's Execute Query
+  button (badge cycles running… → count there too), insert chips opening the panel, and
+  `?template&run=1` deep-link autorun (now also feeds the badge).
+- **Verified** (fresh headless sessions, evidence in /tmp/v5-evidence): empty buffer → Run
+  disabled with "query is empty" hint, panel closed; Section(OVERVIEW)+TextChunk built purely
+  in the palette → Run enabled → click → panel auto-opens, badge "running…" → "214 outputs",
+  results `<pre>` parses to exactly 214 entries; `Table(as=` → disabled + "Fix the syntax
+  error first (line 1:10: expected value)"; `type="Nope"` → disabled + the undefined-TYPE
+  compile message; deep-link autorun: panel open, 3036 outputs, badge agrees, LSP Connected;
+  zero hydration/panic console errors in all sessions. cargo check ssr + hydrate/wasm clean;
+  viewer lib tests 57 (default) / 71 (ssr), workspace suite green; CLI baselines
+  414534/466678 bytes, 0-byte stderr.

@@ -41,6 +41,62 @@ pub struct QueryContext(pub ReadSignal<bool>, pub WriteSignal<bool>);
 #[derive(Clone, Copy)]
 pub struct InspectorContext(pub ReadSignal<bool>, pub WriteSignal<bool>);
 
+/// Builder→panel run plumbing (slice V5, DV-017): the palette's Run button
+/// opens the query panel and publishes a run request; the panel reports the
+/// run's outcome back for the compact badge next to the button.
+///
+/// `request` is a consumed one-shot exactly like the insert bus (DV-012):
+/// the button sets `Some(nonce)`, the panel's client-side effect executes
+/// the shared buffer against the open document and clears it — so panel
+/// re-mounts (toggle closed/open) never replay a stale request, and a
+/// request published while the panel is closed is consumed by the
+/// mount-time effect run. Effects never run during SSR (DV-013).
+#[derive(Clone, Copy)]
+pub struct RunBus {
+    pub request: RwSignal<Option<u64>>,
+    pub status: RwSignal<RunStatus>,
+}
+
+impl RunBus {
+    pub fn new() -> Self {
+        Self {
+            request: RwSignal::new(None),
+            status: RwSignal::new(RunStatus::Idle),
+        }
+    }
+
+    /// Publish a run request (next nonce). The caller opens the panel.
+    pub fn request_run(&self) {
+        let nonce = self
+            .request
+            .get_untracked()
+            .map(|n| n.wrapping_add(1))
+            .unwrap_or(0);
+        self.request.set(Some(nonce));
+    }
+}
+
+impl Default for RunBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compact summary of the latest template run, reduced by the query panel
+/// from its run resource and rendered next to the builder's Run button —
+/// sharing the multi-MB output itself would be pointlessly heavy (DV-017).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum RunStatus {
+    /// No run yet (or the panel was closed mid-run, aborting it).
+    #[default]
+    Idle,
+    Running,
+    /// Completed: top-level length of the outputs array.
+    Done(usize),
+    /// Failed: readable template/transport error.
+    Failed(String),
+}
+
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
@@ -90,6 +146,8 @@ pub fn App() -> impl IntoView {
     // V4 (DV-016): the query builder state — ONE buffer signal shared by
     // the palette tree and the editor, plus the parse snapshot + selection.
     provide_context(QueryBuilder::new());
+    // V5 (DV-017): the palette's Run button ↔ query panel plumbing.
+    provide_context(RunBus::new());
 
     view! {
         <Router>

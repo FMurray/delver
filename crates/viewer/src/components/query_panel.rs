@@ -24,6 +24,7 @@ use serde_json::json;
 use serde_json::Value;
 use server_fn::{codec::JsonEncoding, BoxedStream, ServerFnError, Websocket};
 
+use crate::app::{RunBus, RunStatus};
 use crate::components::builder::QueryBuilder;
 use crate::store::TemplateRun;
 
@@ -400,11 +401,16 @@ pub fn query_panel() -> impl IntoView {
             });
         }
     }
+    // The result rides with its request nonce so the V5 status badge can
+    // tell a fresh value from the previous run's (still readable while the
+    // next one is in flight).
     let run_result = Resource::new(
         move || run_request.get(),
         |request| async move {
             match request {
-                Some((doc, template, _nonce)) => Some(run_doc_template(doc, template).await),
+                Some((doc, template, nonce)) => {
+                    Some((nonce, run_doc_template(doc, template).await))
+                }
                 None => None,
             }
         },
@@ -423,6 +429,44 @@ pub fn query_panel() -> impl IntoView {
             run_request.set(Some((doc, template, nonce)));
         }
     };
+
+    // ── V5 (DV-017): the palette's Run button, via the RunBus ──
+    let run_bus = expect_context::<RunBus>();
+
+    // Requests are consumed one-shots (DV-012 insert-bus discipline): the
+    // button may publish while this panel is closed — the mount-time effect
+    // run executes it — and clearing means panel re-mounts never replay.
+    // Effects only run on the client, post-hydration (DV-013).
+    Effect::new(move |_| {
+        if run_bus.request.get().is_some() {
+            execute();
+            run_bus.request.set(None);
+        }
+    });
+
+    // Reduce the run state to the compact badge next to the Run button.
+    // Nonce-correlated: a stale resource value can never overwrite
+    // "running…" while the next run is in flight.
+    Effect::new(move |_| {
+        let status = match run_request.get() {
+            None => RunStatus::Idle,
+            Some((_, _, nonce)) => match run_result.get().flatten() {
+                Some((res_nonce, result)) if res_nonce == nonce => run_status_of(&result),
+                _ => RunStatus::Running,
+            },
+        };
+        run_bus.status.set(status);
+    });
+
+    // Closing the panel drops the run resource — and any in-flight run with
+    // it — so a "running…" badge would otherwise dangle in the builder.
+    on_cleanup(move || {
+        run_bus.status.update(|s| {
+            if *s == RunStatus::Running {
+                *s = RunStatus::Idle;
+            }
+        });
+    });
 
     let (tx, rx) = mpsc::channel::<Result<String, ServerFnError>>(8);
     let (connected, set_connected) = signal(false);
@@ -686,7 +730,7 @@ pub fn query_panel() -> impl IntoView {
                             "Executing template..."
                         </div>
                     }>
-                        {move || run_result.get().flatten().map(|result| match result {
+                        {move || run_result.get().flatten().map(|(_nonce, result)| match result {
                             Ok(TemplateRun { ok: true, output, .. }) => view! {
                                 <div class="border border-gray-200 rounded-md">
                                     <div class="px-3 py-1.5 bg-gray-50 border-b border-gray-200 text-xs font-medium text-gray-600">
@@ -732,6 +776,28 @@ pub fn query_panel() -> impl IntoView {
             </div>
         </div>
     }
+}
+
+/// Reduce one finished run to the builder's badge status (V5, DV-017).
+fn run_status_of(result: &Result<TemplateRun, ServerFnError>) -> RunStatus {
+    match result {
+        Ok(TemplateRun { ok: true, output, .. }) => {
+            RunStatus::Done(count_outputs(output.as_deref().unwrap_or("[]")))
+        }
+        Ok(TemplateRun { error, .. }) => {
+            RunStatus::Failed(error.clone().unwrap_or_else(|| "unknown error".to_string()))
+        }
+        Err(e) => RunStatus::Failed(e.to_string()),
+    }
+}
+
+/// Top-level length of the outputs array (`run_template` serializes a
+/// `Vec<ProcessedOutput>`) without materializing element values — the
+/// pretty JSON can be multi-MB (DV-013).
+fn count_outputs(outputs_json: &str) -> usize {
+    serde_json::from_str::<Vec<serde::de::IgnoredAny>>(outputs_json)
+        .map(|v| v.len())
+        .unwrap_or(0)
 }
 
 // Helper functions for LSP communication
@@ -833,5 +899,45 @@ fn send_lsp_did_change(tx: &StoredValue<mpsc::Sender<Result<String, ServerFnErro
 
     if let Ok(msg) = serde_json::to_string(&did_change) {
         let _ = tx.with_value(|tx| tx.clone().try_send(Ok(msg)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_outputs_counts_top_level_array_only() {
+        assert_eq!(count_outputs("[]"), 0);
+        assert_eq!(count_outputs("[{\"type\":\"Text\"},{\"type\":\"Table\"}]"), 2);
+        // Nested arrays do not inflate the count.
+        assert_eq!(count_outputs("[{\"rows\":[1,2,3]}]"), 1);
+        // Defensive: non-array / broken payloads count as zero.
+        assert_eq!(count_outputs("{\"not\":\"an array\"}"), 0);
+        assert_eq!(count_outputs("nonsense"), 0);
+    }
+
+    #[test]
+    fn run_status_of_maps_ok_error_and_transport() {
+        let ok = Ok(TemplateRun {
+            ok: true,
+            output: Some("[1, 2, 3]".to_string()),
+            error: None,
+        });
+        assert_eq!(run_status_of(&ok), RunStatus::Done(3));
+
+        let failed = Ok(TemplateRun {
+            ok: false,
+            output: None,
+            error: Some("Match 'X' matched nothing".to_string()),
+        });
+        assert_eq!(
+            run_status_of(&failed),
+            RunStatus::Failed("Match 'X' matched nothing".to_string())
+        );
+
+        let transport: Result<TemplateRun, ServerFnError> =
+            Err(ServerFnError::ServerError("boom".to_string()));
+        assert!(matches!(run_status_of(&transport), RunStatus::Failed(_)));
     }
 }
