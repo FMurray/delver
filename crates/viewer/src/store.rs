@@ -108,6 +108,15 @@ pub struct TemplateRun {
     pub output: Option<String>,
     /// Readable error message (anyhow chain, no backtrace) when `!ok`.
     pub error: Option<String>,
+    /// Per-output provenance sidecar (D-025): source element ids, pages,
+    /// document order, section spans — index-aligned with the outputs array.
+    /// Drives the Ctrl+F results mode (slice V6); never part of `output`.
+    #[serde(default)]
+    pub provenance: Option<delver_core::provenance::RunProvenance>,
+    /// Near-miss diagnostics of the run (D-024), surfaced in the results
+    /// bar with click-to-jump page references.
+    #[serde(default)]
+    pub diagnostics: Option<delver_core::diagnostics::RunDiagnostics>,
 }
 
 /// Doc-aware query palette (DV-012): heading candidates + detected tables
@@ -755,7 +764,25 @@ mod server {
     /// path the CLI `query --doc` uses: load rows → `hydrate_pages` →
     /// `process_parsed` (D-012). Embedder comes from `DELVER_EMBED_ENDPOINT`
     /// (DV-006); no tokenizer (character-based chunking) this slice.
+    ///
+    /// Returns only the outputs JSON — the REST surface
+    /// (`POST /api/v/docs/{id}/template`) keeps its exact pre-V6 payload.
     pub async fn execute_template(doc_id: &str, template: &str) -> Result<String> {
+        let (output, _, _) = execute_template_full(doc_id, template).await?;
+        Ok(output)
+    }
+
+    /// [`execute_template`] plus the run's provenance sidecar (D-025) and
+    /// near-miss diagnostics (D-024) — the data the Ctrl+F results mode
+    /// renders (slice V6). The outputs JSON is identical.
+    pub async fn execute_template_full(
+        doc_id: &str,
+        template: &str,
+    ) -> Result<(
+        String,
+        delver_core::diagnostics::RunDiagnostics,
+        delver_core::provenance::RunProvenance,
+    )> {
         let store = store().await?;
         let id = parse_doc_id(doc_id)?;
         let loaded = store.load_document(id).await?;
@@ -765,11 +792,11 @@ mod server {
             ));
         }
         let template = template.to_string();
-        tokio::task::spawn_blocking(move || -> Result<String> {
+        tokio::task::spawn_blocking(move || {
             let pages = delver_store::hydrate_pages(&loaded.elements);
             let mut match_context = delver_core::layout::MatchContext::default();
             match_context.embedder = embedder_from_env()?.into();
-            delver_core::process_parsed(&pages, &match_context, &template, None)
+            delver_core::process_parsed_with_provenance(&pages, &match_context, &template, None)
         })
         .await
         .context("template task panicked")?

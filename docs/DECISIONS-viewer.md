@@ -438,3 +438,64 @@ results render only inside the bottom `QueryPanel`, which mounts behind `QueryCo
   zero hydration/panic console errors in all sessions. cargo check ssr + hydrate/wasm clean;
   viewer lib tests 57 (default) / 71 (ssr), workspace suite green; CLI baselines
   414534/466678 bytes, 0-byte stderr.
+
+**DV-018 · 2026-06-12 · Slice V6: results work like Ctrl+F — highlights + match pagination +
+section page-filters, driven by the D-025 provenance sidecar.**
+Owner's design verbatim: "the results display should work like a ctrl + f search, where the
+matching elements are highlighted and the prev,next buttons can paginate through matches. For
+sections it should filter the whole document to the matching pages."
+- **Data**: the run server fn now uses `store::execute_template_full` →
+  `process_parsed_with_provenance` (D-025); `TemplateRun` gains optional `provenance` +
+  `diagnostics` (serde-default, so old payloads still parse). The REST
+  `POST /api/v/docs/{id}/template` keeps its exact pre-V6 outputs-only payload
+  (`execute_template` delegates and drops the extras). The JSON results panel and the DV-017
+  count badge are unchanged — results mode is a NAVIGABLE view over the same run, not a
+  replacement.
+- **Model** (`results.rs`, pure + unit-tested): `build_results` turns the sidecar into
+  `RunResults { doc_id, run_id, matches, sections, misses }` — matches sorted by
+  (first page, document order, output index), which re-interleaves the D-018 tail-deferred
+  table outputs into reading order; sections deduplicated by value and ordered by span. An
+  app-level `ResultsBus` (results `Arc`, current match position, section filter) is published
+  by the query panel once per run nonce (builder Run, Ctrl/Cmd-Enter, Execute button, and
+  `?template&run=1` deep links all land here); failed runs CLEAR it — stale highlights must
+  not lie about the document.
+- **Results bar** (between header and canvas): "x of N matches", section chips
+  ("all" + `name · pA–B` per distinct attribution), near-miss warnings, ✕ exit. Near misses
+  (D-024) render one amber row per miss — `match 'X' matched nothing at threshold 0.6 —
+  closest: '…' (0.55, p45); …` — with every candidate page reference a plain `<a>` to that
+  page: the silent-`[]` failure is now guided iteration (run → see closest → fix pattern).
+- **Highlights**: a second per-element overlay layer, ALWAYS in the tree with visibility via
+  the style attribute (the DV-009 overlay discipline) — yellow fill for every visible match
+  touching the page, orange emphasis for the current match. Per-page id sets come from one
+  memo over the sidecar (multi-page matches contribute all their ids; the page's own element
+  join filters naturally). Results are client-side post-run state (DV-013), so SSR and
+  hydration both render every highlight `display:none` — structurally identical. Highlights
+  are click-to-inspect like discover overlays (DV-014) and independent of the kind toggles.
+- **Nav semantics (the UX calls, made here):** in results mode the EXISTING header Prev/Next
+  become "← Prev match"/"Next match →", stepping through visible matches with wrap-around
+  (Ctrl+F convention); compact "‹ pg"/"pg ›" steppers appear beside them so plain page nav
+  stays one click away (exit ✕ restores the pair fully). Keys n/p step too, by clicking the
+  real anchors (never while typing — input/textarea/CodeMirror targets are ignored). A run
+  never yanks navigation away: the cursor seeds to the first match ON the open page (else the
+  first match overall) and the user drives from there. Section chips filter BY PAGE SPAN —
+  the owner's "filter the whole document to the matching pages" — so any match on an
+  in-span page stays navigable regardless of attribution; the header indicator becomes
+  "page 17 of 16–21" while filtered; chips re-seed the cursor to the open page's first
+  visible match.
+- **Anchor mechanics (DV-009 extension):** Prev/Next stay plain `<a href>` links, but the
+  href tracks the CURRENT match's page while on:click advances the cursor synchronously —
+  tachys flushes the reactive attribute before the router's document-level listener reads the
+  anchor, so navigation lands on the NEW current match's page with no dependence on
+  microtask ordering between the two listeners (a deferred-update variant measured one tick
+  stale at page boundaries in headless probing; this shape is timing-independent by
+  construction: worst case is a same-URL no-op, never a skip).
+- **Verified** (fresh headless sessions, evidence in /tmp/v6-evidence; zero console errors /
+  hydration panics): Section(OVERVIEW→RESULTS, as="overview")+TextChunk deep-link autorun on
+  the 3M 10-K → bar "1 of 112 matches", chip "overview · p16–21", 52 visible highlights with
+  the OVERVIEW heading orange; Next twice from the landing page's last match → URL p16→p17
+  with highlights on the new page ("8 of" → "9 of" → "10 of"); chip click → selected state +
+  "page 17 of 16–21" indicator; 'n' key steps ("9 of" → "10 of"); a never-matching fragment
+  query → "0 matches" + the near-miss warning whose "p45" link jumps to that page. cargo
+  check ssr + hydrate/wasm clean; viewer lib tests 66 (default) / 80 (ssr); workspace 269
+  passed / 0 failed / 1 ignored (pre-existing gated live test); CLI baselines byte-exact
+  414534 / 466678 with 0-byte stderr.

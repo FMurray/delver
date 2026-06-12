@@ -24,8 +24,9 @@ use serde_json::json;
 use serde_json::Value;
 use server_fn::{codec::JsonEncoding, BoxedStream, ServerFnError, Websocket};
 
-use crate::app::{RunBus, RunStatus};
+use crate::app::{ResultsBus, RunBus, RunStatus};
 use crate::components::builder::QueryBuilder;
+use crate::results::{build_results, RunResults};
 use crate::store::TemplateRun;
 
 #[cfg(feature = "hydrate")]
@@ -52,16 +53,20 @@ pub async fn run_doc_template(
     doc_id: String,
     template: String,
 ) -> Result<TemplateRun, ServerFnError> {
-    match crate::store::execute_template(&doc_id, &template).await {
-        Ok(output) => Ok(TemplateRun {
+    match crate::store::execute_template_full(&doc_id, &template).await {
+        Ok((output, diagnostics, provenance)) => Ok(TemplateRun {
             ok: true,
             output: Some(output),
             error: None,
+            provenance: Some(provenance),
+            diagnostics: Some(diagnostics),
         }),
         Err(e) => Ok(TemplateRun {
             ok: false,
             output: None,
             error: Some(format!("{e:#}")),
+            provenance: None,
+            diagnostics: None,
         }),
     }
 }
@@ -444,14 +449,33 @@ pub fn query_panel() -> impl IntoView {
         }
     });
 
+    // ── V6 (DV-018): publish each finished run's navigable results ──
+    let results_bus = expect_context::<ResultsBus>();
+    // Once per nonce: the effect below re-runs on unrelated signal changes
+    // and publishing resets the doc view's match cursor.
+    let published_nonce: StoredValue<Option<u64>> = StoredValue::new(None);
+
     // Reduce the run state to the compact badge next to the Run button.
     // Nonce-correlated: a stale resource value can never overwrite
     // "running…" while the next run is in flight.
     Effect::new(move |_| {
         let status = match run_request.get() {
             None => RunStatus::Idle,
-            Some((_, _, nonce)) => match run_result.get().flatten() {
-                Some((res_nonce, result)) if res_nonce == nonce => run_status_of(&result),
+            Some((doc, _, nonce)) => match run_result.get().flatten() {
+                Some((res_nonce, result)) if res_nonce == nonce => {
+                    if published_nonce.get_value() != Some(u64::from(nonce)) {
+                        published_nonce.set_value(Some(u64::from(nonce)));
+                        match results_of(&doc, u64::from(nonce), &result) {
+                            // Results mode on: bar + highlights in the doc
+                            // view, driven by the D-025 sidecar.
+                            Some(results) => results_bus.publish(results),
+                            // Failed (or sidecar-less) runs must not leave
+                            // stale highlights lying about the document.
+                            None => results_bus.clear(),
+                        }
+                    }
+                    run_status_of(&result)
+                }
                 _ => RunStatus::Running,
             },
         };
@@ -791,6 +815,34 @@ fn run_status_of(result: &Result<TemplateRun, ServerFnError>) -> RunStatus {
     }
 }
 
+/// Reduce one finished run to the doc view's results mode (V6, DV-018):
+/// successful runs with a provenance sidecar become navigable [`RunResults`]
+/// (near misses riding along); failed runs and transport errors yield `None`
+/// (results mode exits rather than showing stale highlights).
+fn results_of(
+    doc_id: &str,
+    nonce: u64,
+    result: &Result<TemplateRun, ServerFnError>,
+) -> Option<RunResults> {
+    match result {
+        Ok(TemplateRun {
+            ok: true,
+            provenance: Some(provenance),
+            diagnostics,
+            ..
+        }) => Some(build_results(
+            doc_id,
+            nonce,
+            provenance,
+            diagnostics
+                .as_ref()
+                .map(|d| d.match_misses.clone())
+                .unwrap_or_default(),
+        )),
+        _ => None,
+    }
+}
+
 /// Top-level length of the outputs array (`run_template` serializes a
 /// `Vec<ProcessedOutput>`) without materializing element values — the
 /// pretty JSON can be multi-MB (DV-013).
@@ -923,6 +975,8 @@ mod tests {
             ok: true,
             output: Some("[1, 2, 3]".to_string()),
             error: None,
+            provenance: None,
+            diagnostics: None,
         });
         assert_eq!(run_status_of(&ok), RunStatus::Done(3));
 
@@ -930,6 +984,8 @@ mod tests {
             ok: false,
             output: None,
             error: Some("Match 'X' matched nothing".to_string()),
+            provenance: None,
+            diagnostics: None,
         });
         assert_eq!(
             run_status_of(&failed),
@@ -939,5 +995,60 @@ mod tests {
         let transport: Result<TemplateRun, ServerFnError> =
             Err(ServerFnError::ServerError("boom".to_string()));
         assert!(matches!(run_status_of(&transport), RunStatus::Failed(_)));
+    }
+
+    #[test]
+    fn results_of_requires_a_successful_run_with_sidecar() {
+        use delver_core::diagnostics::{MatchMiss, RunDiagnostics};
+        use delver_core::provenance::{OutputProvenance, RunProvenance};
+
+        let ok = Ok(TemplateRun {
+            ok: true,
+            output: Some("[…]".to_string()),
+            error: None,
+            provenance: Some(RunProvenance {
+                outputs: vec![OutputProvenance {
+                    element_ids: vec!["e1".into()],
+                    pages: vec![16],
+                    order: 9,
+                    section: None,
+                }],
+            }),
+            diagnostics: Some(RunDiagnostics {
+                match_misses: vec![MatchMiss {
+                    match_name: "M".into(),
+                    pattern: "x".into(),
+                    threshold: 0.6,
+                    near_misses: vec![],
+                }],
+            }),
+        });
+        let results = results_of("doc-1", 3, &ok).expect("ok run yields results");
+        assert_eq!(results.doc_id, "doc-1");
+        assert_eq!(results.run_id, 3);
+        assert_eq!(results.matches.len(), 1);
+        assert_eq!(results.matches[0].page, 16);
+        assert_eq!(results.misses.len(), 1);
+
+        // A run without a sidecar (or a failed run) exits results mode.
+        let no_sidecar = Ok(TemplateRun {
+            ok: true,
+            output: Some("[]".to_string()),
+            error: None,
+            provenance: None,
+            diagnostics: None,
+        });
+        assert!(results_of("doc-1", 4, &no_sidecar).is_none());
+        let failed = Ok(TemplateRun {
+            ok: false,
+            output: None,
+            error: Some("boom".to_string()),
+            provenance: None,
+            diagnostics: None,
+        });
+        assert!(results_of("doc-1", 5, &failed).is_none());
+        let transport: Result<TemplateRun, ServerFnError> =
+            Err(ServerFnError::ServerError("boom".to_string()));
+        assert!(results_of("doc-1", 6, &transport).is_none());
     }
 }

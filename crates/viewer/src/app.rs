@@ -97,6 +97,56 @@ pub enum RunStatus {
     Failed(String),
 }
 
+/// Ctrl+F results mode (slice V6, DV-018): the query panel publishes each
+/// finished run's navigable results (built from the D-025 provenance
+/// sidecar); the doc view renders the results bar, the per-match highlight
+/// overlays, and match-stepping Prev/Next from them.
+///
+/// All three signals start at their defaults on server and client alike —
+/// runs are client-side post-hydration (DV-013), so SSR always renders the
+/// no-results state and hydration sees the identical tree (DV-009).
+#[derive(Clone, Copy)]
+pub struct ResultsBus {
+    /// Latest finished run's results; `None` = results mode off. `Arc` so
+    /// signal reads stay cheap at thousands of matches.
+    pub results: RwSignal<Option<crate::results::SharedResults>>,
+    /// Current match as a POSITION within the visible (section-filtered)
+    /// match list — "x of N".
+    pub current: RwSignal<usize>,
+    /// Selected section chip: an index into `RunResults::sections`.
+    pub section_filter: RwSignal<Option<usize>>,
+}
+
+impl ResultsBus {
+    pub fn new() -> Self {
+        Self {
+            results: RwSignal::new(None),
+            current: RwSignal::new(0),
+            section_filter: RwSignal::new(None),
+        }
+    }
+
+    /// Publish a finished run's results and reset navigation state.
+    pub fn publish(&self, results: crate::results::RunResults) {
+        self.section_filter.set(None);
+        self.current.set(0);
+        self.results.set(Some(std::sync::Arc::new(results)));
+    }
+
+    /// Leave results mode (the bar's ✕, or a failed run).
+    pub fn clear(&self) {
+        self.results.set(None);
+        self.section_filter.set(None);
+        self.current.set(0);
+    }
+}
+
+impl Default for ResultsBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
@@ -148,6 +198,8 @@ pub fn App() -> impl IntoView {
     provide_context(QueryBuilder::new());
     // V5 (DV-017): the palette's Run button ↔ query panel plumbing.
     provide_context(RunBus::new());
+    // V6 (DV-018): Ctrl+F results mode — run results for the doc view.
+    provide_context(ResultsBus::new());
 
     view! {
         <Router>

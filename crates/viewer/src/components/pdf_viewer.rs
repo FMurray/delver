@@ -1,14 +1,23 @@
 //! Document page view: on-demand raster from the byte-cache, element bbox
-//! overlays with per-kind toggles (Stage B kinds), and the discover-mode
-//! element inspector in a persistent right sidebar (DV-004, DV-014).
+//! overlays with per-kind toggles (Stage B kinds), the discover-mode
+//! element inspector in a persistent right sidebar (DV-004, DV-014), and
+//! Ctrl+F-style results mode over the latest run's provenance sidecar
+//! (slice V6, DV-018): results bar, per-match highlights, match-stepping
+//! Prev/Next with section page-filters and near-miss warnings.
+
+use std::collections::HashSet;
 
 use leptos::prelude::*;
 use leptos_router::hooks::{use_params_map, use_query_map};
 use uuid::Uuid;
 
-use crate::app::InspectorContext;
+use crate::app::{InspectorContext, ResultsBus};
 use crate::components::file_upload::get_document_by_id;
 use crate::components::insert::{use_request_insert, INSERT_CHIP};
+use crate::results::{
+    clamp_current, initial_current, next_pos, page_indicator, prev_pos, section_chip_label,
+    visible_indices, SharedResults,
+};
 use crate::snippets::{column_specs, AuxRefKind, CellLite, SnippetSpec};
 use crate::store::{CellOverlay, ElementOverlay, PageMeta};
 
@@ -49,6 +58,14 @@ fn kind_colors(kind: &str) -> (&'static str, &'static str) {
 /// Inner cell-grid styling for table overlays (D-018 cells).
 const CELL_BORDER: &str = "rgba(220,38,38,0.45)";
 const HEADER_FILL: &str = "rgba(220,38,38,0.16)";
+
+/// Ctrl+F match highlight (V6) — deliberately distinct from the kind-colored
+/// discover overlays: a translucent yellow fill with an amber border.
+const HIGHLIGHT_BASE: &str =
+    "background:rgba(250,204,21,0.40);border:1.5px solid rgba(202,138,4,0.9)";
+/// The current match gets orange emphasis (the Ctrl+F "active" convention).
+const HIGHLIGHT_CURRENT: &str = "background:rgba(249,115,22,0.45);\
+     border:2px solid rgba(194,65,12,0.95);box-shadow:0 0 0 2px rgba(249,115,22,0.35)";
 
 const TOGGLE_KINDS: [&str; 6] = ["text", "annotation", "figure", "path", "image", "table"];
 
@@ -156,6 +173,130 @@ pub fn PdfViewer() -> impl IntoView {
     let InspectorContext(show_inspector, set_show_inspector) =
         use_context::<InspectorContext>().expect("inspector context in doc view");
 
+    // ── Ctrl+F results mode (V6, DV-018) ────────────────────────────────
+    // All of this is client-side post-run state: results are `None` during
+    // SSR and at hydration (runs never execute server-side, DV-013), so
+    // every reactive read below renders its empty state identically on
+    // server and client (DV-009).
+    let results_bus = expect_context::<ResultsBus>();
+
+    // The latest run's results, but only while ITS document is open.
+    let active_results = Memo::new(move |_| -> Option<SharedResults> {
+        let doc = doc_id.get()?.to_string();
+        let results = results_bus.results.get()?;
+        (results.doc_id == doc).then_some(results)
+    });
+
+    // Match indices visible under the section page-filter, in match order.
+    let visible = Memo::new(move |_| match active_results.get() {
+        Some(results) => visible_indices(&results, results_bus.section_filter.get()),
+        None => Vec::new(),
+    });
+
+    // Position of the match one step away from the current cursor
+    // (wrapping, Ctrl+F-style). Pure reads — shared by the Prev/Next click
+    // handlers and the n/p keys.
+    let nav_target = move |dir: i32| -> Option<usize> {
+        let vis_len = visible.get().len();
+        if vis_len == 0 {
+            return None;
+        }
+        let cur = clamp_current(results_bus.current.get(), vis_len);
+        Some(if dir > 0 {
+            next_pos(cur, vis_len)
+        } else {
+            prev_pos(cur, vis_len)
+        })
+    };
+    // 1-based page of the match the cursor sits ON. The Prev/Next hrefs
+    // point HERE: their click handlers advance the cursor synchronously
+    // first, the reactive href re-renders, and the router's delegated
+    // listener then reads the anchor — so navigation always lands on the
+    // (new) current match's page, with zero dependence on microtask/flush
+    // ordering between the two listeners (DV-018).
+    let current_match_page = move || -> Option<u32> {
+        let results = active_results.get();
+        let results = results.as_ref()?;
+        let vis = visible.get();
+        if vis.is_empty() {
+            return None;
+        }
+        let cur = clamp_current(results_bus.current.get(), vis.len());
+        Some(results.matches.get(*vis.get(cur)?)?.page)
+    };
+    let in_results = move || active_results.get().is_some();
+    let page_url = move |page_index: usize| {
+        doc_id
+            .get()
+            .map(|id| format!("/viewer/{id}/{page_index}"))
+            .unwrap_or_default()
+    };
+
+    // A NEW run landed (run_id changed): seed the cursor to the first
+    // visible match on the page being viewed — running never yanks
+    // navigation away (DV-018) — else the first match overall. Client-only
+    // (effects never run during SSR).
+    Effect::new(move |prev: Option<Option<u64>>| {
+        let run_id = active_results.get().map(|r| r.run_id);
+        if let Some(results) = active_results.get() {
+            if prev.flatten() != run_id {
+                let page = page_id.get_untracked() as u32 + 1;
+                let vis =
+                    visible_indices(&results, results_bus.section_filter.get_untracked());
+                results_bus.current.set(initial_current(&results, &vis, page));
+            }
+        }
+        run_id
+    });
+
+    // n/p step through matches by clicking the real Prev/Next anchors, so
+    // navigation stays on the DV-009 plain-link path. Wasm-only code; the
+    // listener detaches with the component.
+    #[cfg(feature = "hydrate")]
+    {
+        use leptos::ev;
+        use wasm_bindgen::JsCast;
+
+        let handle = window_event_listener(ev::keydown, move |ev| {
+            if ev.ctrl_key() || ev.meta_key() || ev.alt_key() {
+                return;
+            }
+            let key = ev.key();
+            if key != "n" && key != "p" {
+                return;
+            }
+            // Never hijack typing (inputs, selects, the CodeMirror editor).
+            let typing = ev
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                .map(|el| {
+                    let tag = el.tag_name().to_ascii_uppercase();
+                    tag == "INPUT"
+                        || tag == "TEXTAREA"
+                        || tag == "SELECT"
+                        || el.closest(".CodeMirror").ok().flatten().is_some()
+                })
+                .unwrap_or(false);
+            if typing
+                || active_results.get_untracked().is_none()
+                || visible.get_untracked().is_empty()
+            {
+                return;
+            }
+            let id = if key == "n" {
+                "v6-next-match"
+            } else {
+                "v6-prev-match"
+            };
+            if let Some(el) = document().get_element_by_id(id) {
+                if let Ok(el) = el.dyn_into::<web_sys::HtmlElement>() {
+                    el.click();
+                }
+            }
+        });
+        on_cleanup(move || handle.remove());
+    }
+
     // Document summary.
     let document = Resource::new(
         move || doc_id.get().map(|id| id.to_string()),
@@ -232,32 +373,110 @@ pub fn PdfViewer() -> impl IntoView {
                                     <h1 class="text-lg font-semibold text-gray-900 truncate">{doc_name}</h1>
                                     <p class="text-xs text-gray-500">
                                         {format!("corpus {corpus} • parse v{parse_version} • ")}
-                                        {move || format!("page {} of {}", page_id.get() + 1, total_pages)}
+                                        // In a section page-filter the indicator
+                                        // shows the span: "page 17 of 16–29" (V6).
+                                        {move || {
+                                            let page = page_id.get() as u32 + 1;
+                                            let span = active_results.get().and_then(|r| {
+                                                results_bus
+                                                    .section_filter
+                                                    .get()
+                                                    .and_then(|i| r.sections.get(i).cloned())
+                                            });
+                                            page_indicator(page, total_pages, span.as_ref())
+                                        }}
                                     </p>
                                 </div>
                                 // Prev/Next are plain links (the router intercepts
                                 // same-origin clicks): programmatic `use_navigate`
                                 // here ran during SSR resolve and panicked on
-                                // js_sys::global() — see DV-009.
+                                // js_sys::global() — see DV-009. In results mode
+                                // (V6) the SAME pair steps through MATCHES: the
+                                // click advances the cursor synchronously and the
+                                // href tracks the CURRENT match's page, so the
+                                // router (whose delegated listener runs after
+                                // ours) reads the already-updated target (DV-018).
+                                // Compact "pg" steppers keep plain page nav
+                                // reachable.
                                 <div class="flex items-center space-x-2">
                                     <a
-                                        class=move || nav_button_class(page_id.get() == 0)
-                                        href=move || {
-                                            let p = page_id.get();
-                                            doc_id.get()
-                                                .map(|id| format!("/viewer/{}/{}", id, p.saturating_sub(1)))
-                                                .unwrap_or_default()
-                                        }
-                                    >"← Prev"</a>
+                                        class="px-2 py-1 bg-gray-50 text-gray-500 rounded text-xs hover:bg-gray-200"
+                                        style=move || if in_results() { "" } else { "display:none" }
+                                        title="Previous page (plain page navigation)"
+                                        href=move || page_url(page_id.get().saturating_sub(1))
+                                    >"‹ pg"</a>
                                     <a
-                                        class=move || nav_button_class(page_id.get() + 1 >= total_pages)
-                                        href=move || {
-                                            let p = (page_id.get() + 1).min(total_pages - 1);
-                                            doc_id.get()
-                                                .map(|id| format!("/viewer/{}/{}", id, p))
-                                                .unwrap_or_default()
+                                        class="px-2 py-1 bg-gray-50 text-gray-500 rounded text-xs hover:bg-gray-200"
+                                        style=move || if in_results() { "" } else { "display:none" }
+                                        title="Next page (plain page navigation)"
+                                        href=move || page_url((page_id.get() + 1).min(total_pages - 1))
+                                    >"pg ›"</a>
+                                    <a
+                                        id="v6-prev-match"
+                                        class=move || {
+                                            if in_results() {
+                                                nav_button_class(visible.get().is_empty())
+                                            } else {
+                                                nav_button_class(page_id.get() == 0)
+                                            }
                                         }
-                                    >"Next →"</a>
+                                        title=move || if in_results() {
+                                            "Previous match (p)"
+                                        } else {
+                                            "Previous page"
+                                        }
+                                        href=move || {
+                                            if in_results() {
+                                                current_match_page()
+                                                    .map(|page| {
+                                                        page_url(page.saturating_sub(1) as usize)
+                                                    })
+                                                    .unwrap_or_default()
+                                            } else {
+                                                page_url(page_id.get().saturating_sub(1))
+                                            }
+                                        }
+                                        on:click=move |_| {
+                                            if in_results() {
+                                                if let Some(pos) = nav_target(-1) {
+                                                    results_bus.current.set(pos);
+                                                }
+                                            }
+                                        }
+                                    >{move || if in_results() { "← Prev match" } else { "← Prev" }}</a>
+                                    <a
+                                        id="v6-next-match"
+                                        class=move || {
+                                            if in_results() {
+                                                nav_button_class(visible.get().is_empty())
+                                            } else {
+                                                nav_button_class(page_id.get() + 1 >= total_pages)
+                                            }
+                                        }
+                                        title=move || if in_results() {
+                                            "Next match (n)"
+                                        } else {
+                                            "Next page"
+                                        }
+                                        href=move || {
+                                            if in_results() {
+                                                current_match_page()
+                                                    .map(|page| {
+                                                        page_url(page.saturating_sub(1) as usize)
+                                                    })
+                                                    .unwrap_or_default()
+                                            } else {
+                                                page_url((page_id.get() + 1).min(total_pages - 1))
+                                            }
+                                        }
+                                        on:click=move |_| {
+                                            if in_results() {
+                                                if let Some(pos) = nav_target(1) {
+                                                    results_bus.current.set(pos);
+                                                }
+                                            }
+                                        }
+                                    >{move || if in_results() { "Next match →" } else { "Next →" }}</a>
                                 </div>
                             </div>
                             <div class="flex items-center flex-wrap gap-4 mt-2">
@@ -281,6 +500,12 @@ pub fn PdfViewer() -> impl IntoView {
                                 }).collect::<Vec<_>>()}
                             </div>
                         </header>
+                        // Results bar (V6): match count + "x of N", section
+                        // chips, near-miss warnings, exit. Rendered only in
+                        // results mode — `active_results` is None during SSR
+                        // and at hydration, so the initial tree is identical
+                        // on both sides (DV-013/DV-009).
+                        {results_bar(results_bus, active_results, visible, page_id, doc_id)}
                         <div class="flex-1 flex overflow-hidden">
                             <main class="flex-1 p-6 overflow-auto">
                                 <div class="flex justify-center">
@@ -292,6 +517,9 @@ pub fn PdfViewer() -> impl IntoView {
                                         toggles_for_page.clone(),
                                         selected,
                                         set_show_inspector,
+                                        results_bus,
+                                        active_results,
+                                        visible,
                                     )}
                                 </div>
                             </main>
@@ -310,8 +538,171 @@ pub fn PdfViewer() -> impl IntoView {
     }
 }
 
+/// The results bar (V6, DV-018): match position, section page-filter chips,
+/// near-miss warnings with click-to-jump page links, and the exit button.
+/// Renders nothing until a run lands (results are client-side post-run
+/// state, DV-013); the JSON results panel in the query panel is untouched —
+/// this bar is the navigable view over the same run.
+fn results_bar(
+    results_bus: ResultsBus,
+    active_results: Memo<Option<SharedResults>>,
+    visible: Memo<Vec<usize>>,
+    page_id: Memo<usize>,
+    doc_id: Memo<Option<Uuid>>,
+) -> impl IntoView {
+    move || {
+        active_results.get().map(|results| {
+            // "x of N matches" — tracks the cursor and the section filter.
+            let pos_label = move || {
+                let vis = visible.get();
+                if vis.is_empty() {
+                    return "0 matches".to_string();
+                }
+                let cur = clamp_current(results_bus.current.get(), vis.len());
+                format!("{} of {} matches", cur + 1, vis.len())
+            };
+
+            // Section chips: "all" + one per distinct section attribution.
+            let chips = (!results.sections.is_empty()).then(|| {
+                let all_chip = {
+                    let results = results.clone();
+                    let class = move || {
+                        if results_bus.section_filter.get().is_none() {
+                            "px-2 py-0.5 rounded-full text-[11px] font-medium bg-blue-600 text-white"
+                        } else {
+                            "px-2 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                        }
+                    };
+                    view! {
+                        <button
+                            class=class
+                            title="Show matches on every page"
+                            on:click=move |_| {
+                                results_bus.section_filter.set(None);
+                                let vis = visible_indices(&results, None);
+                                let page = page_id.get_untracked() as u32 + 1;
+                                results_bus.current.set(initial_current(&results, &vis, page));
+                            }
+                        >"all"</button>
+                    }
+                };
+                let section_chips = results
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .map(|(i, span)| {
+                        let label = section_chip_label(span);
+                        let results = results.clone();
+                        let class = move || {
+                            if results_bus.section_filter.get() == Some(i) {
+                                "px-2 py-0.5 rounded-full text-[11px] font-medium bg-blue-600 text-white"
+                            } else {
+                                "px-2 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+                            }
+                        };
+                        view! {
+                            <button
+                                class=class
+                                title="Filter navigation to this section's pages"
+                                on:click=move |_| {
+                                    results_bus.section_filter.set(Some(i));
+                                    let vis = visible_indices(&results, Some(i));
+                                    let page = page_id.get_untracked() as u32 + 1;
+                                    results_bus
+                                        .current
+                                        .set(initial_current(&results, &vis, page));
+                                }
+                            >{label}</button>
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                view! {
+                    <div class="flex items-center flex-wrap gap-1.5">
+                        <span class="text-[10px] font-medium text-gray-500 uppercase">"Sections:"</span>
+                        {all_chip}
+                        {section_chips}
+                    </div>
+                }
+            });
+
+            // Near-miss warnings (D-024 → V6): one amber row per miss, each
+            // closest-candidate page reference a plain link (DV-009).
+            let misses = (!results.misses.is_empty()).then(|| {
+                let rows = results
+                    .misses
+                    .iter()
+                    .map(|miss| {
+                        let head = format!(
+                            "match '{}' matched nothing at threshold {}",
+                            miss.match_name, miss.threshold
+                        );
+                        let closest = miss
+                            .near_misses
+                            .iter()
+                            .enumerate()
+                            .map(|(j, near)| {
+                                let sep = if j == 0 { " — closest: " } else { "; " };
+                                let target = near.page.saturating_sub(1) as usize;
+                                let href = move || {
+                                    doc_id
+                                        .get()
+                                        .map(|id| format!("/viewer/{id}/{target}"))
+                                        .unwrap_or_default()
+                                };
+                                view! {
+                                    <span>
+                                        {sep}
+                                        <span class="italic">{format!("'{}'", near.text)}</span>
+                                        {format!(" ({:.2}, ", near.score)}
+                                        <a
+                                            class="underline font-semibold hover:text-amber-950"
+                                            title="Jump to this page"
+                                            href=href
+                                        >{format!("p{}", near.page)}</a>
+                                        ")"
+                                    </span>
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let none_note = miss
+                            .near_misses
+                            .is_empty()
+                            .then_some(" — no fuzzy-text candidates in scope");
+                        view! {
+                            <div class="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                                <span class="font-semibold">"⚠ "</span>
+                                {head}{closest}{none_note}
+                            </div>
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                view! { <div class="flex flex-col gap-1 mt-1">{rows}</div> }
+            });
+
+            view! {
+                <div id="v6-results-bar" class="bg-white border-b border-gray-200 px-6 py-2">
+                    <div class="flex items-center flex-wrap gap-3">
+                        <span class="text-xs font-semibold text-gray-900">"Results"</span>
+                        <span id="v6-match-pos" class="text-xs text-gray-700">{pos_label}</span>
+                        {chips}
+                        <span class="flex-1"></span>
+                        <button
+                            class="text-gray-400 hover:text-gray-600 text-xs"
+                            title="Exit results mode (clears highlights; Prev/Next return to page navigation)"
+                            on:click=move |_| results_bus.clear()
+                        >"✕ exit"</button>
+                    </div>
+                    {misses}
+                </div>
+            }
+        })
+    }
+}
+
 /// The page canvas: raster `<img>` (or placeholder) + absolutely positioned
-/// bbox overlays scaled from PDF points to raster pixels.
+/// bbox overlays scaled from PDF points to raster pixels, plus the V6
+/// match-highlight layer (always in the tree, display-toggled — DV-009).
+#[allow(clippy::too_many_arguments)]
 fn page_view(
     doc_id: String,
     page_index: usize,
@@ -320,6 +711,9 @@ fn page_view(
     toggles: Vec<(&'static str, RwSignal<bool>)>,
     selected: RwSignal<Option<ElementOverlay>>,
     set_show_inspector: WriteSignal<bool>,
+    results_bus: ResultsBus,
+    active_results: Memo<Option<SharedResults>>,
+    visible: Memo<Vec<usize>>,
 ) -> impl IntoView {
     // Container size and pts→px scale: from the raster when available,
     // otherwise a placeholder sized from the page's element extent.
@@ -347,6 +741,26 @@ fn page_view(
             (false, max_x * scale, max_y * scale, scale, Some(reason))
         }
     };
+
+    // V6 highlight layer data (id, bbox, element for click-to-inspect) —
+    // captured before the discover overlays consume `elems`.
+    let highlight_elems: Vec<(String, (f32, f32, f32, f32), ElementOverlay)> = elems
+        .iter()
+        .filter_map(|e| Some((e.id.clone(), e.bbox?, e.clone())))
+        .collect();
+
+    // Element ids to highlight on THIS page: (every visible match's ids,
+    // the current match's ids). One memo per page render, O(1) lookups per
+    // element style — recomputed on cursor/filter/run changes only.
+    let store_page = page_index as u32 + 1;
+    let hl_sets: Memo<(HashSet<String>, HashSet<String>)> = Memo::new(move |_| {
+        let Some(results) = active_results.get() else {
+            return (HashSet::new(), HashSet::new());
+        };
+        let vis = visible.get();
+        let cur = clamp_current(results_bus.current.get(), vis.len());
+        crate::results::highlight_sets(&results, &vis, cur, store_page)
+    });
 
     let overlays: Vec<_> = elems
         .into_iter()
@@ -450,6 +864,44 @@ fn page_view(
                             }
                         >{cell_grid}</div>
                     })
+                }).collect::<Vec<_>>()}
+                // V6 match highlights: a second per-element layer, ALWAYS in
+                // the tree with visibility driven by the style attribute
+                // (the DV-009 overlay discipline). Results are client-side
+                // post-run state (DV-013), so SSR and hydration both render
+                // every highlight as display:none — structurally identical.
+                {highlight_elems.into_iter().map(|(id, (x0, y0, x1, y1), element)| {
+                    let base = format!(
+                        "left:{:.1}px;top:{:.1}px;width:{:.1}px;height:{:.1}px",
+                        x0 * scale,
+                        y0 * scale,
+                        (x1 - x0).max(1.0) * scale,
+                        (y1 - y0).max(1.0) * scale,
+                    );
+                    let style = move || {
+                        hl_sets.with(|(all, current)| {
+                            if current.contains(&id) {
+                                format!("{base};{HIGHLIGHT_CURRENT}")
+                            } else if all.contains(&id) {
+                                format!("{base};{HIGHLIGHT_BASE}")
+                            } else {
+                                format!("{base};display:none")
+                            }
+                        })
+                    };
+                    view! {
+                        <div
+                            class="absolute cursor-pointer"
+                            style=style
+                            title="matched element"
+                            // Highlights are clickable like overlays: jump
+                            // straight into the inspector (DV-014).
+                            on:click=move |_| {
+                                selected.set(Some(element.clone()));
+                                set_show_inspector.set(true);
+                            }
+                        ></div>
+                    }
                 }).collect::<Vec<_>>()}
             </div>
         </div>
