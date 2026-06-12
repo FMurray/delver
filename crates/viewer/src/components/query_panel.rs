@@ -359,12 +359,28 @@ pub fn query_panel() -> impl IntoView {
 
     // Template execution: bumping `run_request` (re)runs the resource.
     type RunKey = (String, String, u32);
-    let run_request: RwSignal<Option<RunKey>> = RwSignal::new(
-        match (autorun, initial_template, current_doc.get_untracked()) {
-            (true, Some(template), Some(doc)) => Some((doc, template, 0)),
-            _ => None,
-        },
-    );
+    let run_request: RwSignal<Option<RunKey>> = RwSignal::new(None);
+
+    // Deep-link autorun (`?template=…&run=1`) happens AFTER hydration, never
+    // during SSR. Seeding `run_request` at setup made the Suspense execute
+    // the template server-side and stream its entire output as one text node
+    // inside the results <pre>; browsers split text nodes at 64 KiB while
+    // parsing, so hydration walked [Text, Text, …] where the client view
+    // expected [Text, marker] and panicked unrecoverably, freezing the whole
+    // app at its server-rendered state — including the "LSP Disconnected"
+    // indicator (DV-013). Effects only run on the client, so the output is
+    // now always rendered client-side and never hydrated.
+    if autorun {
+        if let Some(template) = initial_template {
+            Effect::new(move |_| {
+                if run_request.get_untracked().is_none() {
+                    if let Some(doc) = current_doc.get_untracked() {
+                        run_request.set(Some((doc, template.clone(), 0)));
+                    }
+                }
+            });
+        }
+    }
     let run_result = Resource::new(
         move || run_request.get(),
         |request| async move {

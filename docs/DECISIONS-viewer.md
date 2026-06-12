@@ -232,3 +232,34 @@ The core loop (click an element → see what it is → add it to a query → run
   DocQL syntax error (the grammar has no comments) and greeted users with a red diagnostic.
   The LSP server's document state is seeded right after initialize so completions are
   position-aware before the first edit.
+
+**DV-013 · 2026-06-12 · "LSP Disconnected" root cause: deep-link autorun streamed multi-MB
+output into SSR; >64 KiB text nodes split by the browser parser kill hydration. Autorun is now
+post-hydration.**
+The user-visible symptom (red dot, "LSP Disconnected", dead editor) was NOT a websocket bug —
+the ws server fn route (`/api/lsp_websocket<hash>`, registered by `leptos_routes` via
+`server_fn_paths()`, upgrade compiled in through server_fn's `axum` feature) connects fine
+(101) from any fresh session. The real bug was confined to `?template=…&run=1` deep links
+(DV-006): seeding `run_request` at component setup made the results Suspense execute the
+template DURING SSR and stream its whole pretty-JSON output (2.17 MB for the starter template
+over the 158-page demo doc) as ONE text node inside the results `<pre>`. Browsers' HTML
+parsers split text nodes at 65 536 chars (measured: the live `<pre>` held 34 sibling Text
+nodes), so tachys hydration — which walks exactly one Text node per dynamic string and then
+expects the trailing `<!>` marker — found `[Text, Text, …]`, reported "expected a marker node,
+but found this instead: [node Text]" (query_panel.rs:700) and panicked unrecoverably
+(tachys hydration.rs:186). The wasm app died mid-hydration, freezing the panel at its
+server-rendered state — `connected` is `false` during SSR, which renders precisely
+"LSP Disconnected". Why earlier probes were inconclusive: plain `/viewer/{id}` sessions never
+render the panel at all (it mounts inside `<Show when=show_query>`, default closed — the
+lead's dump-dom containing neither indicator string is by design), and the toggle flow
+connects fine, so only deep-link entries (bookmark/refresh/new tab) crashed.
+Fix (`query_panel.rs`): `run_request` now starts `None` on both server and client; the
+deep-link autorun moved into an `Effect` (client-only, post-hydration). The output subtree is
+therefore only ever rendered client-side and never hydrated — immune to parser text-splitting
+at ANY output size — and SSR no longer blocks seconds on template execution (the deep-link
+page shrank ~5.2 MB → ~360 KB). Behavior preserved: `?template` still pre-fills, `run=1`
+still auto-runs (one server-fn round trip after hydrate); curl-visible execution lives in
+REST `POST /api/v/docs/{id}/template`. Rule of thumb recorded: never SSR unbounded text into
+a hydrated subtree — anything that can exceed ~64 KiB must render post-hydration (or be
+chunked below the parser's split boundary).
+
