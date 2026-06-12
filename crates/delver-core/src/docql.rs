@@ -1,6 +1,7 @@
 use crate::chunker::{chunk_semantic, chunk_text_elements, ChunkMethod, ChunkingStrategy};
 use crate::matcher::{MatchedContent, TemplateContentMatch};
 use crate::parse::{PageContent, TextElement};
+use crate::provenance::{OutputProvenance, SectionSpan};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use image;
@@ -1689,30 +1690,132 @@ pub fn process_matched_content(
     index: &crate::search_index::PdfIndex, // Add index parameter to resolve handles
     tokenizer: Option<&Tokenizer>,
 ) -> Result<Vec<ProcessedOutput>, Error> {
+    let (all_outputs, _provenance) =
+        process_matched_content_with_provenance(matched_items, index, tokenizer)?;
+    Ok(all_outputs)
+}
+
+/// [`process_matched_content`] plus the per-output provenance sidecar
+/// (D-025): for every output, the source element ids, pages, a document-order
+/// sort key, and — for outputs produced under a matched Section — the
+/// section's name and full page span. The outputs vec is identical to
+/// [`process_matched_content`]'s; the sidecar is index-aligned with it,
+/// including the D-018 tail-deferral of table outputs.
+pub fn process_matched_content_with_provenance(
+    matched_items: &Vec<TemplateContentMatch>,
+    index: &crate::search_index::PdfIndex,
+    tokenizer: Option<&Tokenizer>,
+) -> Result<(Vec<ProcessedOutput>, Vec<OutputProvenance>), Error> {
     let mut global_chunk_counter = 0;
-    let mut all_outputs = Vec::new();
-    let mut deferred_tables = Vec::new();
+    let mut sink = OutputSink::default();
 
     // Process all content and then fix parent references
     process_matched_content_recursive(
         matched_items,
         index,
         tokenizer,
-        &mut all_outputs,
-        &mut deferred_tables,
+        &mut sink,
         &mut global_chunk_counter,
         None, // parent_info: Option<(String, usize)>
         &HashMap::new(),
+        None, // section: provenance attribution of the enclosing Section
     )?;
 
-    // TableOutputs append after all positional outputs (D-018): chunk
-    // parent_index links are positions in this array, so inserting tables
-    // inline would shift the recorded indices of every later section. The
-    // table outputs themselves carry parent_name/parent_index captured at
-    // match time, which stay valid because earlier positions never move.
-    all_outputs.extend(deferred_tables);
+    Ok(sink.into_parts())
+}
 
-    Ok(all_outputs)
+/// Output accumulators for the recursive collation walk: positional outputs,
+/// tail-deferred table outputs (D-018), and the provenance sidecar entries
+/// kept 1:1 with each (D-025) — pairing is enforced by construction, so the
+/// sidecar can never drift out of alignment with the outputs array.
+#[derive(Default)]
+struct OutputSink {
+    outputs: Vec<ProcessedOutput>,
+    deferred_tables: Vec<ProcessedOutput>,
+    provenance: Vec<OutputProvenance>,
+    deferred_provenance: Vec<OutputProvenance>,
+}
+
+impl OutputSink {
+    /// Index the NEXT positional output will land at (section parent links).
+    fn next_index(&self) -> usize {
+        self.outputs.len()
+    }
+
+    fn push(&mut self, output: ProcessedOutput, provenance: OutputProvenance) {
+        self.outputs.push(output);
+        self.provenance.push(provenance);
+    }
+
+    /// Defer a table output to the array tail (D-018: positional
+    /// parent_index links of later sections must not shift).
+    fn push_deferred(&mut self, output: ProcessedOutput, provenance: OutputProvenance) {
+        self.deferred_tables.push(output);
+        self.deferred_provenance.push(provenance);
+    }
+
+    fn into_parts(mut self) -> (Vec<ProcessedOutput>, Vec<OutputProvenance>) {
+        // TableOutputs append after all positional outputs (D-018): chunk
+        // parent_index links are positions in this array, so inserting tables
+        // inline would shift the recorded indices of every later section. The
+        // table outputs themselves carry parent_name/parent_index captured at
+        // match time, which stay valid because earlier positions never move.
+        // The provenance sidecar mirrors the reorder exactly.
+        self.outputs.extend(self.deferred_tables);
+        self.provenance.extend(self.deferred_provenance);
+        debug_assert_eq!(self.outputs.len(), self.provenance.len());
+        (self.outputs, self.provenance)
+    }
+}
+
+/// Provenance entry for a single-element output (image/annotation/figure/
+/// table selectors): one source id, one page, document order = its index.
+fn single_element_provenance(
+    id: uuid::Uuid,
+    page: u32,
+    doc_idx: usize,
+    section: Option<&SectionSpan>,
+) -> OutputProvenance {
+    OutputProvenance {
+        element_ids: vec![id.to_string()],
+        pages: vec![page],
+        order: doc_idx as u32,
+        section: section.cloned(),
+    }
+}
+
+/// The provenance [`SectionSpan`] of a matched Section: display name exactly
+/// as the outputs' `section` metadata key will carry it (`as=` value, falling
+/// back to the `match=` reference, then the template element name) and the
+/// 1-based page span over the section's entire matched range.
+fn section_provenance_span(
+    match_item: &TemplateContentMatch,
+    index: &crate::search_index::PdfIndex,
+    metadata: &HashMap<String, Value>,
+) -> Option<SectionSpan> {
+    let name = metadata
+        .get("section")
+        .map(|v| match template_value_to_json(v) {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| match_item.template_element.name.clone());
+
+    let mut page_start: Option<u32> = None;
+    let mut page_end: Option<u32> = None;
+    for mc_ref in &match_item.matched_content {
+        if let MatchedContent::Index(doc_idx) = mc_ref {
+            if let Some((_, page)) = index.id_page_at(*doc_idx) {
+                page_start = Some(page_start.map_or(page, |p| p.min(page)));
+                page_end = Some(page_end.map_or(page, |p| p.max(page)));
+            }
+        }
+    }
+    Some(SectionSpan {
+        name,
+        page_start: page_start?,
+        page_end: page_end?,
+    })
 }
 
 // Recursive function that builds the output list and tracks parent relationships
@@ -1721,11 +1824,11 @@ fn process_matched_content_recursive(
     matched_items: &Vec<TemplateContentMatch>,
     index: &crate::search_index::PdfIndex,
     tokenizer: Option<&Tokenizer>,
-    all_outputs: &mut Vec<ProcessedOutput>,
-    deferred_tables: &mut Vec<ProcessedOutput>,
+    sink: &mut OutputSink,
     global_chunk_counter: &mut usize,
     parent_info: Option<(String, usize)>, // (parent_name, parent_output_index)
     parent_metadata: &HashMap<String, Value>,
+    section: Option<&SectionSpan>, // provenance attribution of the enclosing Section (D-025)
 ) -> Result<(), Error> {
     for match_item in matched_items {
         // Combine parent metadata with the current item's metadata.
@@ -1740,7 +1843,10 @@ fn process_matched_content_recursive(
 
         match &match_item.template_element.element_type {
             ElementType::TextChunk | ElementType::Paragraph => {
-                let text_elements_to_chunk: Vec<TextElement> = match_item
+                // Resolved elements paired with their document-order index
+                // (the provenance sort key, D-025); the element vec itself is
+                // built exactly as before.
+                let resolved: Vec<(usize, TextElement)> = match_item
                     .matched_content
                     .iter()
                     .filter_map(|mc_ref| match mc_ref {
@@ -1748,7 +1854,7 @@ fn process_matched_content_recursive(
                             // Resolve index to get actual content
                             if let Some(content) = index.content_at(*doc_idx) {
                                 match content {
-                                    PageContent::Text(text_elem) => Some(text_elem),
+                                    PageContent::Text(text_elem) => Some((*doc_idx, text_elem)),
                                     _ => None,
                                 }
                             } else {
@@ -1758,6 +1864,12 @@ fn process_matched_content_recursive(
                         MatchedContent::None => None,
                     })
                     .collect();
+                let order_by_id: HashMap<uuid::Uuid, u32> = resolved
+                    .iter()
+                    .map(|(doc_idx, elem)| (elem.id, *doc_idx as u32))
+                    .collect();
+                let text_elements_to_chunk: Vec<TextElement> =
+                    resolved.into_iter().map(|(_, elem)| elem).collect();
 
                 if !text_elements_to_chunk.is_empty() {
                     let chunk_outputs = process_text_chunk_elements_simple(
@@ -1768,18 +1880,28 @@ fn process_matched_content_recursive(
                         global_chunk_counter,
                         tokenizer,
                         index.embedder(),
+                        &order_by_id,
+                        section,
                     )?;
                     tracing::debug!("chunk outputs: {:?}", chunk_outputs);
-                    for chunk_output in chunk_outputs {
-                        all_outputs.push(ProcessedOutput::Text(chunk_output));
+                    for (chunk_output, chunk_provenance) in chunk_outputs {
+                        sink.push(ProcessedOutput::Text(chunk_output), chunk_provenance);
                     }
                 }
             }
             ElementType::Section => {
                 let current_section_name = match_item.template_element.name.clone();
 
+                // Provenance attribution for everything produced under this
+                // section (D-025): its display name + full page span. Nested
+                // sections override their parent's, mirroring the metadata
+                // "section" key.
+                let section_span =
+                    section_provenance_span(match_item, index, &current_metadata);
+                let section_for_children = section_span.as_ref().or(section);
+
                 // First, process the section's own content if it has any
-                let section_text_elements: Vec<TextElement> = match_item
+                let resolved: Vec<(usize, TextElement)> = match_item
                     .matched_content
                     .iter()
                     .filter_map(|mc_ref| match mc_ref {
@@ -1787,7 +1909,7 @@ fn process_matched_content_recursive(
                             // Resolve index to get actual content
                             if let Some(content) = index.content_at(*doc_idx) {
                                 match content {
-                                    PageContent::Text(text_elem) => Some(text_elem),
+                                    PageContent::Text(text_elem) => Some((*doc_idx, text_elem)),
                                     _ => None,
                                 }
                             } else {
@@ -1797,9 +1919,15 @@ fn process_matched_content_recursive(
                         MatchedContent::None => None,
                     })
                     .collect();
+                let order_by_id: HashMap<uuid::Uuid, u32> = resolved
+                    .iter()
+                    .map(|(doc_idx, elem)| (elem.id, *doc_idx as u32))
+                    .collect();
+                let section_text_elements: Vec<TextElement> =
+                    resolved.into_iter().map(|(_, elem)| elem).collect();
 
                 // Track where this section's content will be in the output
-                let section_output_index = all_outputs.len();
+                let section_output_index = sink.next_index();
                 let mut section_has_content = false;
 
                 if !section_text_elements.is_empty() {
@@ -1811,9 +1939,11 @@ fn process_matched_content_recursive(
                         global_chunk_counter,
                         tokenizer,
                         index.embedder(),
+                        &order_by_id,
+                        section_for_children,
                     )?;
-                    for chunk_output in chunk_outputs {
-                        all_outputs.push(ProcessedOutput::Text(chunk_output));
+                    for (chunk_output, chunk_provenance) in chunk_outputs {
+                        sink.push(ProcessedOutput::Text(chunk_output), chunk_provenance);
                         section_has_content = true;
                     }
                 }
@@ -1855,11 +1985,11 @@ fn process_matched_content_recursive(
                                     &vec![child_match.clone()],
                                     index,
                                     tokenizer,
-                                    all_outputs,
-                                    deferred_tables,
+                                    sink,
                                     global_chunk_counter,
                                     textchunk_parent_info,
                                     &current_metadata,
+                                    section_for_children,
                                 )?;
                             }
                             ElementType::Section => {
@@ -1868,11 +1998,11 @@ fn process_matched_content_recursive(
                                     &vec![child_match.clone()],
                                     index,
                                     tokenizer,
-                                    all_outputs,
-                                    deferred_tables,
+                                    sink,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
                                     &current_metadata,
+                                    section_for_children,
                                 )?;
                             }
                             _ => {
@@ -1881,11 +2011,11 @@ fn process_matched_content_recursive(
                                     &vec![child_match.clone()],
                                     index,
                                     tokenizer,
-                                    all_outputs,
-                                    deferred_tables,
+                                    sink,
                                     global_chunk_counter,
                                     child_parent_info.clone(),
                                     &current_metadata,
+                                    section_for_children,
                                 )?;
                             }
                         }
@@ -1899,12 +2029,20 @@ fn process_matched_content_recursive(
                         // Resolve index to get actual content
                         if let Some(content) = index.content_at(*doc_idx) {
                             if let PageContent::Image(image_elem) = content {
-                                all_outputs.push(process_image_element_simple(
-                                    &image_elem,
-                                    &match_item.template_element,
-                                    &current_metadata,
-                                    parent_info.clone(),
-                                ));
+                                sink.push(
+                                    process_image_element_simple(
+                                        &image_elem,
+                                        &match_item.template_element,
+                                        &current_metadata,
+                                        parent_info.clone(),
+                                    ),
+                                    single_element_provenance(
+                                        image_elem.id,
+                                        image_elem.page_number,
+                                        *doc_idx,
+                                        section,
+                                    ),
+                                );
                                 image_processed = true;
                                 break;
                             }
@@ -1959,7 +2097,10 @@ fn process_matched_content_recursive(
                             parent_info.clone(),
                         ),
                     };
-                    deferred_tables.push(output);
+                    sink.push_deferred(
+                        output,
+                        single_element_provenance(aux.id, aux.page_number, *doc_idx, section),
+                    );
                 }
             }
             // Annotation / Figure selectors (D-016): every matched element of
@@ -1977,12 +2118,15 @@ fn process_matched_content_recursive(
                     else {
                         continue;
                     };
-                    all_outputs.push(process_aux_element_simple(
-                        aux,
-                        &match_item.template_element,
-                        &current_metadata,
-                        parent_info.clone(),
-                    ));
+                    sink.push(
+                        process_aux_element_simple(
+                            aux,
+                            &match_item.template_element,
+                            &current_metadata,
+                            parent_info.clone(),
+                        ),
+                        single_element_provenance(aux.id, aux.page_number, *doc_idx, section),
+                    );
                 }
             }
             ElementType::ImageSummary
@@ -2374,6 +2518,12 @@ fn process_image_element_simple(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Chunk `elements` into outputs, each paired with its provenance sidecar
+/// entry (D-025): the chunk's source element ids/pages, the document-order
+/// index of its first element (`order_by_id`, keyed by element id), and the
+/// enclosing section attribution. Output assembly is byte-identical to the
+/// pre-D-025 code; the sidecar is bookkeeping only.
+#[allow(clippy::too_many_arguments)]
 fn process_text_chunk_elements_simple(
     elements: &[TextElement],
     template_element: &Element,
@@ -2382,7 +2532,9 @@ fn process_text_chunk_elements_simple(
     global_chunk_counter: &mut usize,
     tokenizer: Option<&Tokenizer>,
     embedder: Option<&dyn crate::embed::Embedder>,
-) -> Result<Vec<ChunkOutput>, Error> {
+    order_by_id: &HashMap<uuid::Uuid, u32>,
+    section: Option<&SectionSpan>,
+) -> Result<Vec<(ChunkOutput, OutputProvenance)>, Error> {
     // -------- 1. resolve parameters once --------
     let chunk_size = template_element
         .attributes
@@ -2593,13 +2745,30 @@ fn process_text_chunk_elements_simple(
             None => chunk_text,
         };
 
-        outputs.push(ChunkOutput {
-            text,
-            metadata: meta,
-            chunk_index: *global_chunk_counter,
-            parent_name: parent_name.clone(),
-            parent_index,
-        });
+        // Provenance sidecar entry (D-025): the chunk's source element ids
+        // in document order, its pages (ascending dedup, computed above for
+        // the metadata), and the doc-order index of its first element.
+        let provenance = OutputProvenance {
+            element_ids: chunk.iter().map(|e| e.id.to_string()).collect(),
+            pages: page_numbers,
+            order: chunk
+                .first()
+                .and_then(|e| order_by_id.get(&e.id))
+                .copied()
+                .unwrap_or(0),
+            section: section.cloned(),
+        };
+
+        outputs.push((
+            ChunkOutput {
+                text,
+                metadata: meta,
+                chunk_index: *global_chunk_counter,
+                parent_name: parent_name.clone(),
+                parent_index,
+            },
+            provenance,
+        ));
 
         *global_chunk_counter += 1;
     }

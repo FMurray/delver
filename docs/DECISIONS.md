@@ -596,3 +596,38 @@ document id.
   crates/delver/tests/near_miss_cli.rs (incl. a DB-gated run of the user's exact query against
   the real 10-K). Rescue + near-miss scans run only on zero-match (~3.5 s extra on the
   158-page 10-K, debug build); the hot path is pass 1, unchanged.
+
+**D-025 · 2026-06-12 · Provenance sidecar: per-output source element ids + pages + section spans, beside the unchanged outputs JSON.**
+The viewer's Ctrl+F results mode (DV-018) needs to know WHICH stored elements produced each
+output — and the serialized outputs array must stay byte-identical (the regression baselines
+and every D-012/D-013 consumer ride on it), so the ids cannot be added to the payload.
+Collation already holds them at assembly time; they are now threaded into a side channel.
+- **Shape** (`delver_core::provenance`): `RunProvenance { outputs: Vec<OutputProvenance> }`,
+  index-aligned with the outputs array — including the D-018 tail-deferral of table outputs
+  (the sidecar defers its entries through the same two-queue `OutputSink`, so alignment is
+  enforced by construction: every output push carries its provenance). Each entry:
+  `element_ids` (stringified UUIDs in document order — hydration preserves store ids, so
+  `query --doc`/viewer runs join straight back to stored elements), `pages` (1-based,
+  ascending dedup — the chunk builder's existing page statistics, reused), `order` (global
+  document index of the first source element: the within-page sort key, since the outputs
+  array itself is not page-ordered), and `section: Option<SectionSpan { name, page_start,
+  page_end }>` for outputs produced under a matched Section — name exactly as the output's
+  `section` metadata key renders it (`as=` > `match=` > template element name), span =
+  min/max page over the section's ENTIRE matched range (computed via the new
+  `PdfIndex::id_page_at`, an id+page accessor that skips `content_at`'s payload clones).
+  Nested sections override their parent's attribution, mirroring metadata inheritance.
+- **Surface (additive)**: `process_parsed_with_provenance` → `(json, RunDiagnostics,
+  RunProvenance)`, `docql::process_matched_content_with_provenance`, and
+  `delver::run_template_on_doc_with_provenance`; every pre-existing function delegates and
+  drops the sidecar (`process_parsed_with_diagnostics` etc. keep their exact signatures and
+  payloads). The CLI never touches it: both baselines re-verified byte-identical with 0-byte
+  stderr (414 534 / 466 678). Diagnostics + provenance types now derive `Deserialize` too,
+  so the viewer's server-fn DTO can carry them without a parallel shape.
+- **Chunk provenance**: `process_text_chunk_elements_simple` returns
+  `(ChunkOutput, OutputProvenance)` pairs — output assembly is untouched; the sidecar reuses
+  the per-chunk page statistics and a doc-index map built at the (only two) call sites from
+  `MatchedContent::Index` before resolution. Single-element outputs
+  (image/annotation/figure/table) record their element's id/page/doc-index at the push site.
+- **Tests**: crates/delver-core/tests/provenance_sidecar.rs — index alignment, chunk source
+  ids/pages against knowable synthetic ids, section name + span (heading page through table
+  page), tail-deferred table entries keeping document order, sectionless top-level chunks.

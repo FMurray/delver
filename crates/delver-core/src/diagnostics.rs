@@ -10,7 +10,7 @@
 //! (`process_parsed_with_diagnostics` / `process_pdf_with_diagnostics`) get
 //! the struct so other surfaces (e.g. the viewer) can render it later.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Maximum characters of candidate text echoed in a near miss.
 pub const NEAR_MISS_EXCERPT_CHARS: usize = 80;
@@ -20,7 +20,7 @@ pub const NEAR_MISS_TOP_K: usize = 3;
 
 /// One below-threshold candidate for a missed match: where the engine looked,
 /// how close it got.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NearMiss {
     /// Candidate element text, truncated to [`NEAR_MISS_EXCERPT_CHARS`]
     /// chars (ellipsis included when truncated).
@@ -47,7 +47,7 @@ impl NearMiss {
 }
 
 /// A match config that produced zero candidates above its threshold.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchMiss {
     /// Match-definition name when the config came from one (`match=M`),
     /// otherwise the owning template element's name.
@@ -90,7 +90,7 @@ impl MatchMiss {
 /// Diagnostics accumulated over one template run. Additive surface: runs that
 /// match everything produce an empty value and zero stderr (the D-017/D-018
 /// quiet-by-default contract holds).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunDiagnostics {
     /// Match configs that yielded zero candidates, in encounter order.
     pub match_misses: Vec<MatchMiss>,

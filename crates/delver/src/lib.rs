@@ -13,7 +13,8 @@ use anyhow::{bail, Context, Result};
 use delver_core::diagnostics::RunDiagnostics;
 use delver_core::embed::Embedder;
 use delver_core::layout::MatchContext;
-use delver_core::process_parsed_with_diagnostics;
+use delver_core::process_parsed_with_provenance;
+use delver_core::provenance::RunProvenance;
 use delver_core::scan::ScanClass;
 use delver_embed::DatabricksEmbedder;
 use delver_parse_dbx::{map_ai_parse_response, DbxConfig, DbxParseClient};
@@ -442,6 +443,24 @@ pub fn run_template_on_doc_with_diagnostics(
     tokenizer: Option<&Tokenizer>,
     embedder: Option<Arc<dyn Embedder>>,
 ) -> Result<(String, RunDiagnostics)> {
+    let (json, diagnostics, _provenance) =
+        run_template_on_doc_with_provenance(store, doc, template_str, tokenizer, embedder)?;
+    Ok((json, diagnostics))
+}
+
+/// [`run_template_on_doc_with_diagnostics`] plus the run's provenance
+/// sidecar (D-025): one entry per output, index-aligned with the outputs
+/// array, carrying source element ids (the store's element ids — hydration
+/// preserves them), pages, and section page spans. The outputs JSON is
+/// byte-identical; the sidecar is a separate value, so CLI stdout never
+/// changes.
+pub fn run_template_on_doc_with_provenance(
+    store: &DelverStoreBlocking,
+    doc: DocumentId,
+    template_str: &str,
+    tokenizer: Option<&Tokenizer>,
+    embedder: Option<Arc<dyn Embedder>>,
+) -> Result<(String, RunDiagnostics, RunProvenance)> {
     let loaded = store.load_document(doc)?;
     if loaded.elements.is_empty() {
         bail!("document {doc} has no stored elements (unknown id or empty document)");
@@ -449,7 +468,7 @@ pub fn run_template_on_doc_with_diagnostics(
     let pages = delver_store::hydrate_pages(&loaded.elements);
     let mut match_context = MatchContext::default();
     match_context.embedder = embedder.into();
-    process_parsed_with_diagnostics(&pages, &match_context, template_str, tokenizer)
+    process_parsed_with_provenance(&pages, &match_context, template_str, tokenizer)
 }
 
 /// Print one `warning:` line per near miss on stderr (D-024). Stdout is

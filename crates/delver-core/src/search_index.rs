@@ -1161,6 +1161,28 @@ impl PdfIndex {
         self.content_from_handle(idx)
     }
 
+    /// (element id, 1-based page) of the content at a sequential document
+    /// index, without materializing the element payload — `content_at`
+    /// clones text/image bytes, which the provenance sidecar's page-span
+    /// sweeps (D-025) neither need nor want.
+    #[inline]
+    pub fn id_page_at(&self, idx: usize) -> Option<(Uuid, u32)> {
+        match self.order.get(idx)? {
+            ContentHandle::Text(i) => Some((
+                *self.text_store.id.get(*i)?,
+                *self.text_store.page_number.get(*i)?,
+            )),
+            ContentHandle::Image(i) => Some((
+                *self.image_store.id.get(*i)?,
+                *self.image_store.page_number.get(*i)?,
+            )),
+            ContentHandle::Aux(i) => {
+                let aux = self.aux_store.items.get(*i)?;
+                Some((aux.id, aux.page_number))
+            }
+        }
+    }
+
     /// Borrow a slice of content by sequential indices
     #[inline]
     pub fn content_slice(&self, start: usize, end: usize) -> Vec<PageContent> {

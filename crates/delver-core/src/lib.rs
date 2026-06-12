@@ -8,6 +8,7 @@ pub mod layout;
 pub mod logging;
 pub mod matcher;
 pub mod parse;
+pub mod provenance;
 pub mod scan;
 pub mod search_index;
 pub mod table;
@@ -15,10 +16,11 @@ pub mod udt;
 // pub mod viewer;
 
 use crate::diagnostics::RunDiagnostics;
-use crate::docql::{parse_template, process_matched_content, ProcessedOutput, Root};
+use crate::docql::{parse_template, process_matched_content_with_provenance, ProcessedOutput, Root};
 use crate::layout::{group_text_into_lines_and_blocks, MatchContext, TextBlock};
 use crate::matcher::align_template_with_content_diag;
 use crate::parse::{get_refs, parse_document, PageContents, TextElement};
+use crate::provenance::RunProvenance;
 use anyhow::Result;
 use lopdf::Document;
 use search_index::PdfIndex;
@@ -83,7 +85,8 @@ pub fn process_pdf_with_diagnostics(
     match_context.embedder = embed::SharedEmbedder::from(embedder);
 
     let mut diagnostics = RunDiagnostics::default();
-    let json = run_template(&dom, &pages_map, &match_context, tokenizer, &mut diagnostics)?;
+    let (json, _provenance) =
+        run_template(&dom, &pages_map, &match_context, tokenizer, &mut diagnostics)?;
     Ok((json, blocks, doc, diagnostics))
 }
 
@@ -128,32 +131,54 @@ pub fn process_parsed_with_diagnostics(
     template_str: &str,
     tokenizer: Option<&Tokenizer>,
 ) -> Result<(String, RunDiagnostics)> {
-    let dom = parse_template(template_str)?;
-    let mut diagnostics = RunDiagnostics::default();
-    let json = run_template(&dom, pages_map, match_context, tokenizer, &mut diagnostics)?;
+    let (json, diagnostics, _provenance) =
+        process_parsed_with_provenance(pages_map, match_context, template_str, tokenizer)?;
     Ok((json, diagnostics))
 }
 
+/// [`process_parsed_with_diagnostics`] plus the run's provenance sidecar
+/// (D-025): one [`provenance::OutputProvenance`] per output, index-aligned
+/// with the outputs array, carrying source element ids/pages and section
+/// page spans. The JSON payload stays byte-identical to
+/// [`process_parsed`]'s — the sidecar is a separate value, never serialized
+/// into the outputs.
+pub fn process_parsed_with_provenance(
+    pages_map: &BTreeMap<u32, PageContents>,
+    match_context: &MatchContext,
+    template_str: &str,
+    tokenizer: Option<&Tokenizer>,
+) -> Result<(String, RunDiagnostics, RunProvenance)> {
+    let dom = parse_template(template_str)?;
+    let mut diagnostics = RunDiagnostics::default();
+    let (json, provenance) =
+        run_template(&dom, pages_map, match_context, tokenizer, &mut diagnostics)?;
+    Ok((json, diagnostics, provenance))
+}
+
 /// Shared template-execution core for [`process_pdf`] and [`process_parsed`]:
-/// build the index, align the template, process matches, serialize.
+/// build the index, align the template, process matches, serialize. The
+/// provenance sidecar rides alongside the serialized outputs (D-025).
 fn run_template(
     dom: &Root,
     pages_map: &BTreeMap<u32, PageContents>,
     match_context: &MatchContext,
     tokenizer: Option<&Tokenizer>,
     diagnostics: &mut RunDiagnostics,
-) -> Result<String> {
+) -> Result<(String, RunProvenance)> {
     let mut all_outputs: Vec<ProcessedOutput> = Vec::new();
+    let mut provenance = RunProvenance::default();
 
     let index = PdfIndex::new(pages_map, match_context);
 
     if let Some(matched_content) =
         align_template_with_content_diag(&dom.elements, &index, None, None, diagnostics)?
     {
-        let outputs = process_matched_content(&matched_content, &index, tokenizer)?;
+        let (outputs, sidecar) =
+            process_matched_content_with_provenance(&matched_content, &index, tokenizer)?;
         all_outputs.extend(outputs);
+        provenance.outputs.extend(sidecar);
     }
 
     let json = serde_json::to_string_pretty(&all_outputs)?;
-    Ok(json)
+    Ok((json, provenance))
 }
