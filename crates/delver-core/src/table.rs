@@ -91,6 +91,9 @@ pub enum TableStrategy {
     Ruled,
     RowRuled,
     Aligned,
+    /// Table structure supplied by the Databricks `ai_parse_document`
+    /// backend (slice P1 part 2) rather than detected from page geometry.
+    AiParse,
 }
 
 impl TableStrategy {
@@ -99,6 +102,7 @@ impl TableStrategy {
             TableStrategy::Ruled => "ruled",
             TableStrategy::RowRuled => "row-ruled",
             TableStrategy::Aligned => "aligned",
+            TableStrategy::AiParse => "ai-parse",
         }
     }
 
@@ -107,6 +111,7 @@ impl TableStrategy {
             "ruled" => Some(TableStrategy::Ruled),
             "row-ruled" => Some(TableStrategy::RowRuled),
             "aligned" => Some(TableStrategy::Aligned),
+            "ai-parse" => Some(TableStrategy::AiParse),
             _ => None,
         }
     }

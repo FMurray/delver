@@ -13,9 +13,11 @@ use anyhow::{bail, Context, Result};
 use delver_core::embed::Embedder;
 use delver_core::layout::MatchContext;
 use delver_core::process_parsed;
+use delver_core::scan::ScanClass;
 use delver_embed::DatabricksEmbedder;
+use delver_parse_dbx::{map_ai_parse_response, DbxConfig, DbxParseClient};
 use delver_store::blocking::DelverStoreBlocking;
-use delver_store::{DocumentId, IngestOutcome, SearchScope, TextSearchHit};
+use delver_store::{CorpusId, DocumentId, IngestOutcome, SearchScope, TextSearchHit};
 use tokenizers::Tokenizer;
 
 /// Local dev database (docs/DECISIONS.md D-002).
@@ -118,14 +120,94 @@ pub fn partitions_json(pairs: &[(String, String)]) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// Build the jsonb containment filter for `--where` pairs (slice P1).
+///
+/// Plain keys filter document partitions (D-023 semantics, unchanged). The
+/// reserved `scan.` prefix addresses the Part-1 scan block; v1 supports
+/// exactly `scan.class=<native|scanned_no_text|scanned_ocr|mixed>`. Unknown
+/// `scan.*` keys and invalid class values are hard errors (D-006), never a
+/// silent empty result.
+pub fn metadata_filter_json(pairs: &[(String, String)]) -> Result<Option<serde_json::Value>> {
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let mut partitions = serde_json::Map::new();
+    let mut scan = serde_json::Map::new();
+    for (key, value) in pairs {
+        if let Some(field) = key.strip_prefix("scan.") {
+            match field {
+                "class" => {
+                    if ScanClass::parse(value).is_none() {
+                        bail!(
+                            "--where scan.class={value} is not a scan class \
+                             (expected one of: {})",
+                            ScanClass::ALL.join(", ")
+                        );
+                    }
+                    scan.insert("class".to_string(), value.clone().into());
+                }
+                other => bail!(
+                    "--where scan.{other} is not supported \
+                     (supported scan key: scan.class)"
+                ),
+            }
+        } else {
+            partitions.insert(key.clone(), value.clone().into());
+        }
+    }
+    let mut filter = serde_json::Map::new();
+    if !partitions.is_empty() {
+        filter.insert(
+            "partitions".to_string(),
+            serde_json::Value::Object(partitions),
+        );
+    }
+    if !scan.is_empty() {
+        filter.insert("scan".to_string(), serde_json::Value::Object(scan));
+    }
+    Ok(Some(serde_json::Value::Object(filter)))
+}
+
+/// Parsing engine selector for `delver index` (slice P1 part 2).
+///
+/// * `Native`  — delver-core's parser (the default; behavior unchanged).
+/// * `AiParse` — Databricks `ai_parse_document` (requires the DA-007 env
+///   configuration; missing config is a hard error listing the variables).
+/// * `Auto`    — run the Part-1 scan classifier; scanned documents route to
+///   ai-parse (fail-loud when unconfigured, naming both the classification
+///   and the missing config), everything else parses natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IngestEngine {
+    #[default]
+    Native,
+    AiParse,
+    Auto,
+}
+
+impl IngestEngine {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "native" => Ok(IngestEngine::Native),
+            "ai-parse" => Ok(IngestEngine::AiParse),
+            "auto" => Ok(IngestEngine::Auto),
+            other => bail!("unknown engine {other:?} (expected native, ai-parse, or auto)"),
+        }
+    }
+}
+
 /// Read a PDF from disk and ingest it into `corpus` (created if absent).
 /// `partitions` (inferred-from-path first, explicit `--partition` flags
 /// after, so explicit wins on key conflicts) are stored under
 /// `documents.metadata.partitions` — also on idempotent re-ingest, so
-/// existing documents can be (re)tagged (D-023).
+/// existing documents can be (re)tagged (D-023). `engine` selects the
+/// parser ([`IngestEngine`]); D-008 dedup is engine-blind, so re-ingesting
+/// identical bytes at the same parse_version under a different engine is a
+/// no-op returning the existing document — exactly one engine per
+/// parse_version by construction.
 ///
-/// Returns the shared ingest JSON shape:
-/// `{"document_id", "created", "element_count", "corpus", "partitions"}`.
+/// Returns the shared ingest JSON shape: `{"document_id", "created",
+/// "element_count", "corpus", "partitions", "engine", "scan"}` where
+/// `engine`/`scan` reflect the *stored* document's metadata.
 pub fn ingest_file(
     store: &DelverStoreBlocking,
     path: &Path,
@@ -133,31 +215,138 @@ pub fn ingest_file(
     uri: Option<&str>,
     parse_version: i32,
     partitions: &[(String, String)],
+    engine: IngestEngine,
 ) -> Result<serde_json::Value> {
     let corpus_id = store.ensure_corpus(corpus)?;
     let pdf_bytes =
         std::fs::read(path).with_context(|| format!("reading PDF {}", path.display()))?;
-    let outcome: IngestOutcome =
-        store.ingest_document(corpus_id, uri, &pdf_bytes, parse_version)?;
+
+    let outcome: IngestOutcome = match engine {
+        // The pre-slice code path, verbatim: parse inside the store.
+        IngestEngine::Native => store.ingest_document(corpus_id, uri, &pdf_bytes, parse_version)?,
+        IngestEngine::AiParse => {
+            let config = DbxConfig::from_env().map_err(anyhow::Error::from)?;
+            ingest_via_ai_parse(
+                store,
+                corpus_id,
+                uri,
+                &pdf_bytes,
+                parse_version,
+                config,
+                path,
+                None,
+            )?
+        }
+        IngestEngine::Auto => {
+            // The classifier needs a native parse; the parse is then reused
+            // for native ingest, so the native route never parses twice.
+            let parsed = delver_core::parse_pdf_bytes(&pdf_bytes)
+                .with_context(|| format!("parsing {} for scan classification", path.display()))?;
+            let scan = parsed.metadata.get("scan").cloned();
+            let class = scan
+                .as_ref()
+                .and_then(|s| s.get("class"))
+                .and_then(|v| v.as_str())
+                .and_then(ScanClass::parse)
+                .unwrap_or(ScanClass::Native);
+            if class.is_scanned() {
+                let summary = scan_summary(scan.as_ref());
+                match DbxConfig::from_env() {
+                    Ok(config) => ingest_via_ai_parse(
+                        store,
+                        corpus_id,
+                        uri,
+                        &pdf_bytes,
+                        parse_version,
+                        config,
+                        path,
+                        scan,
+                    )?,
+                    Err(e) => bail!(
+                        "--engine auto: {} was classified {class} ({summary}), \
+                         which requires the ai-parse engine, but {e}",
+                        path.display()
+                    ),
+                }
+            } else {
+                store.ingest_parsed(corpus_id, uri, &pdf_bytes, &parsed, parse_version)?
+            }
+        }
+    };
+
     let partitions = partitions_json(partitions);
     if !partitions.as_object().map_or(true, |m| m.is_empty()) {
         store.set_document_partitions(outcome.document_id, &partitions)?;
     }
     let element_count = store.element_count(outcome.document_id)?;
+    // Receipt fields reflect what is actually stored — on idempotent
+    // re-ingest (created: false) that is the original engine's metadata.
+    let metadata = store
+        .document_metadata(outcome.document_id)?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let engine_stored = metadata
+        .get("parser")
+        .and_then(|v| v.as_str())
+        .unwrap_or("native");
     Ok(serde_json::json!({
         "document_id": outcome.document_id,
         "created": outcome.created,
         "element_count": element_count,
         "corpus": corpus,
         "partitions": partitions,
+        "engine": engine_stored,
+        "scan": metadata.get("scan").cloned().unwrap_or(serde_json::Value::Null),
     }))
 }
 
+/// Upload → ai_parse_document → map → `ingest_parsed`. When `auto` routed
+/// here, `scan` carries the Part-1 classification that made the decision; it
+/// is merged into the stored metadata alongside the parser provenance.
+#[allow(clippy::too_many_arguments)]
+fn ingest_via_ai_parse(
+    store: &DelverStoreBlocking,
+    corpus_id: CorpusId,
+    uri: Option<&str>,
+    pdf_bytes: &[u8],
+    parse_version: i32,
+    config: DbxConfig,
+    path: &Path,
+    scan: Option<serde_json::Value>,
+) -> Result<IngestOutcome> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document.pdf");
+    let client = DbxParseClient::new(config);
+    let response = client
+        .parse_document_bytes(pdf_bytes, file_name)
+        .with_context(|| format!("ai_parse_document over {}", path.display()))?;
+    let mut parsed = map_ai_parse_response(&response)?;
+    if let (Some(map), Some(scan)) = (parsed.metadata.as_object_mut(), scan) {
+        map.insert("scan".to_string(), scan);
+    }
+    Ok(store.ingest_parsed(corpus_id, uri, pdf_bytes, &parsed, parse_version)?)
+}
+
+/// Short human summary of a scan block for fail-loud messages.
+fn scan_summary(scan: Option<&serde_json::Value>) -> String {
+    let field = |key: &str| {
+        scan.and_then(|s| s.get(key))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    format!(
+        "scanned_page_ratio {}, confidence {}",
+        field("scanned_page_ratio"),
+        field("confidence")
+    )
+}
+
 /// Full-text search over a corpus (or one document when `doc` is given).
-/// `partitions` (`--where key=value`, D-023) restricts corpus scope to
-/// documents whose stored partitions contain every pair; it cannot be
-/// combined with `doc` (a single document either matches or the search is
-/// pointless — fail loud).
+/// `filters` (`--where key=value`, D-023; `scan.class=...` since slice P1)
+/// restricts corpus scope to documents whose stored metadata contains every
+/// pair; it cannot be combined with `doc` (a single document either matches
+/// or the search is pointless — fail loud).
 ///
 /// Returns the shared search JSON shape: an array of
 /// `{"element_id", "document_id", "page", "rank", "snippet"}` ranked by
@@ -168,26 +357,30 @@ pub fn search_store(
     corpus: &str,
     doc: Option<DocumentId>,
     limit: i64,
-    partitions: &[(String, String)],
+    filters: &[(String, String)],
 ) -> Result<serde_json::Value> {
-    let hits = if partitions.is_empty() {
-        let scope = match doc {
-            Some(doc) => SearchScope::Document(doc),
-            None => SearchScope::Corpus(store.ensure_corpus(corpus)?),
-        };
-        store.text_search(scope, query, limit)?
-    } else {
-        if doc.is_some() {
-            bail!("--where filters corpus documents and cannot be combined with --doc");
+    let hits = match metadata_filter_json(filters)? {
+        None => {
+            let scope = match doc {
+                Some(doc) => SearchScope::Document(doc),
+                None => SearchScope::Corpus(store.ensure_corpus(corpus)?),
+            };
+            store.text_search(scope, query, limit)?
         }
-        let corpus_id = store.ensure_corpus(corpus)?;
-        store.text_search_filtered(corpus_id, query, limit, Some(&partitions_json(partitions)))?
+        Some(filter) => {
+            if doc.is_some() {
+                bail!("--where filters corpus documents and cannot be combined with --doc");
+            }
+            let corpus_id = store.ensure_corpus(corpus)?;
+            store.text_search_filtered(corpus_id, query, limit, Some(&filter))?
+        }
     };
     Ok(search_hits_json(&hits))
 }
 
 /// Execute a DocQL template across every document of `corpus` that matches
-/// the `--where` partition filter (all documents when empty), Stage C D-023.
+/// the `--where` filter (all documents when empty), Stage C D-023 —
+/// partition pairs and `scan.class=...` since slice P1.
 ///
 /// Returns a JSON object keyed by document id (ascending), each value the
 /// document's outputs array — exactly what `run_template_on_doc` would
@@ -196,13 +389,13 @@ pub fn search_store(
 pub fn run_template_on_corpus(
     store: &DelverStoreBlocking,
     corpus: &str,
-    partitions: &[(String, String)],
+    filters: &[(String, String)],
     template_str: &str,
     tokenizer: Option<&Tokenizer>,
     embedder: Option<Arc<dyn Embedder>>,
 ) -> Result<String> {
     let corpus_id = store.ensure_corpus(corpus)?;
-    let filter = (!partitions.is_empty()).then(|| partitions_json(partitions));
+    let filter = metadata_filter_json(filters)?;
     let docs = store.documents_matching(corpus_id, filter.as_ref())?;
     let mut by_doc = serde_json::Map::new();
     for doc in docs {
@@ -360,15 +553,24 @@ mod python {
         }
 
         /// Ingest a PDF file into `corpus`. Returns JSON:
-        /// `{"document_id", "created", "element_count", "corpus"}`.
-        #[pyo3(signature = (path, corpus, uri=None, parse_version=None))]
+        /// `{"document_id", "created", "element_count", "corpus",
+        /// "partitions", "engine", "scan"}`. `engine` is `"native"`
+        /// (default), `"ai-parse"` (Databricks ai_parse_document; requires
+        /// the DELVER_DBX_*/DATABRICKS_* env config), or `"auto"` (scan
+        /// classification routes scanned documents to ai-parse).
+        #[pyo3(signature = (path, corpus, uri=None, parse_version=None, engine=None))]
         fn ingest(
             &self,
             path: String,
             corpus: String,
             uri: Option<String>,
             parse_version: Option<i32>,
+            engine: Option<String>,
         ) -> PyResult<String> {
+            let engine = match engine.as_deref() {
+                None => crate::IngestEngine::Native,
+                Some(name) => crate::IngestEngine::parse(name).map_err(to_py_err)?,
+            };
             let value = crate::ingest_file(
                 &self.store,
                 std::path::Path::new(&path),
@@ -376,6 +578,7 @@ mod python {
                 uri.as_deref(),
                 parse_version.unwrap_or(1),
                 &[],
+                engine,
             )
             .map_err(to_py_err)?;
             Ok(value.to_string())

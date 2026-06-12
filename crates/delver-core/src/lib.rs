@@ -7,6 +7,7 @@ pub mod layout;
 pub mod logging;
 pub mod matcher;
 pub mod parse;
+pub mod scan;
 pub mod search_index;
 pub mod table;
 pub mod udt;
@@ -67,6 +68,15 @@ pub fn process_pdf(
 
     let json = run_template(&dom, &pages_map, &match_context, tokenizer)?;
     Ok((json, blocks, doc))
+}
+
+/// Parse PDF bytes end to end (load + [`parse::parse_document`]) without
+/// running a template — for callers that need the `ParsedDocument` itself,
+/// e.g. engine routing on the scan classification (slice P1) followed by
+/// `ingest_parsed`.
+pub fn parse_pdf_bytes(pdf_bytes: &[u8]) -> Result<parse::ParsedDocument> {
+    let doc = Document::load_mem(pdf_bytes)?;
+    Ok(parse_document(&doc)?)
 }
 
 /// Execute a template against already-parsed page content (D-012).

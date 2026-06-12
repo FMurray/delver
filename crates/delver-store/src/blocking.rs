@@ -88,11 +88,11 @@ impl DelverStoreBlocking {
         corpus: CorpusId,
         query: &str,
         limit: i64,
-        partitions: Option<&serde_json::Value>,
+        metadata_filter: Option<&serde_json::Value>,
     ) -> Result<Vec<TextSearchHit>, StoreError> {
         self.runtime.block_on(
             self.store
-                .text_search_filtered(corpus, query, limit, partitions),
+                .text_search_filtered(corpus, query, limit, metadata_filter),
         )
     }
 
@@ -108,10 +108,17 @@ impl DelverStoreBlocking {
     pub fn documents_matching(
         &self,
         corpus: CorpusId,
-        partitions: Option<&serde_json::Value>,
+        metadata_filter: Option<&serde_json::Value>,
     ) -> Result<Vec<DocumentId>, StoreError> {
         self.runtime
-            .block_on(self.store.documents_matching(corpus, partitions))
+            .block_on(self.store.documents_matching(corpus, metadata_filter))
+    }
+
+    pub fn document_metadata(
+        &self,
+        doc: DocumentId,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        self.runtime.block_on(self.store.document_metadata(doc))
     }
 
     #[allow(clippy::too_many_arguments)]

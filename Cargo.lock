@@ -1570,6 +1570,7 @@ dependencies = [
  "clap",
  "delver-core",
  "delver-embed",
+ "delver-parse-dbx",
  "delver-store",
  "env_logger",
  "libc",
@@ -1632,6 +1633,17 @@ dependencies = [
  "delver-core",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "delver-parse-dbx"
+version = "0.1.0"
+dependencies = [
+ "delver-core",
+ "lopdf",
+ "serde_json",
+ "ureq",
+ "uuid",
 ]
 
 [[package]]

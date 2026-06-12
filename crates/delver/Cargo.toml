@@ -16,6 +16,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 delver-core = { path = "../delver-core" }
 delver-embed = { path = "../delver-embed" }
+delver-parse-dbx = { path = "../delver-parse-dbx" }
 delver-store = { path = "../delver-store" }
 clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }

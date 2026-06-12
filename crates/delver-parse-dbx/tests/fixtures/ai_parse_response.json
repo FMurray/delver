@@ -1,0 +1,72 @@
+{
+  "document": {
+    "pages": [
+      { "id": 0, "image_uri": null },
+      { "id": 1, "image_uri": null },
+      { "id": 2, "image_uri": null }
+    ],
+    "elements": [
+      {
+        "id": 0,
+        "type": "title",
+        "content": "Annual Report on Form 10-K",
+        "confidence": 0.98,
+        "bbox": [ { "coord": [120, 80, 1100, 150], "page_id": 0 } ]
+      },
+      {
+        "id": 1,
+        "type": "section_header",
+        "content": "Item 7. Management's Discussion and Analysis",
+        "confidence": 0.97,
+        "bbox": [ { "coord": [100, 200, 980, 245], "page_id": 0 } ]
+      },
+      {
+        "id": 2,
+        "type": "text",
+        "content": "Revenue grew steadily across all reporting segments during the fiscal year, driven by volume growth and disciplined pricing.",
+        "confidence": 0.96,
+        "bbox": [ { "coord": [100, 260, 1140, 420], "page_id": 0 } ]
+      },
+      {
+        "id": 3,
+        "type": "page_footer",
+        "content": "Page 1 of 3",
+        "confidence": 0.91,
+        "bbox": [ { "coord": [520, 1540, 700, 1565], "page_id": 0 } ]
+      },
+      {
+        "id": 4,
+        "type": "table",
+        "content": "<table><thead><tr><th>Metric</th><th>2015</th><th>2014</th></tr></thead><tbody><tr><td>Sales</td><td>10,328</td><td>10,990</td></tr><tr><td>Operating income</td><td>2,310</td><td>2,405</td></tr><tr><td colspan=\"3\">Amounts in millions of dollars</td></tr></tbody></table>",
+        "confidence": 0.89,
+        "bbox": [ { "coord": [90, 180, 1150, 720], "page_id": 1 } ]
+      },
+      {
+        "id": 5,
+        "type": "figure",
+        "content": null,
+        "confidence": 0.84,
+        "bbox": [ { "coord": [200, 800, 1000, 1400], "page_id": 1 } ],
+        "description": "Bar chart comparing segment revenue for 2014 and 2015."
+      },
+      {
+        "id": 6,
+        "type": "footnote",
+        "content": "(1) Excludes discontinued operations.",
+        "confidence": 0.92,
+        "bbox": [ { "coord": [100, 1480, 900, 1510], "page_id": 2 } ]
+      }
+    ]
+  },
+  "error_status": [],
+  "metadata": {
+    "id": "01ef-fixture-run-0001",
+    "version": "2.0",
+    "file_metadata": {
+      "file_path": "/Volumes/main/default/scratch/delver-tmp-fixture.pdf",
+      "file_name": "delver-tmp-fixture.pdf",
+      "file_size": 12345,
+      "file_modification_time": "2026-06-11T00:00:00Z"
+    }
+  }
+}

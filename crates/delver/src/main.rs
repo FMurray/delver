@@ -8,12 +8,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use delver::{
     build_embedder, connect_store, infer_partitions_from_path, ingest_file, load_tokenizer,
-    parse_key_value, run_template_on_corpus, run_template_on_doc, search_store,
+    parse_key_value, run_template_on_corpus, run_template_on_doc, search_store, IngestEngine,
 };
 use delver_core::logging::{init_debug_logging, DebugDataStore};
 use delver_core::process_pdf;
@@ -107,9 +107,35 @@ struct IndexArgs {
     #[clap(long = "partition", value_name = "KEY=VALUE")]
     partition: Vec<String>,
 
+    /// Parsing engine: native (delver-core, default), ai-parse (Databricks
+    /// ai_parse_document; requires DATABRICKS_HOST+DATABRICKS_TOKEN or
+    /// DELVER_DBX_PROFILE, plus DELVER_DBX_WAREHOUSE_ID and
+    /// DELVER_DBX_VOLUME), or auto (scan classification routes scanned
+    /// documents to ai-parse)
+    #[clap(long, value_enum, default_value_t = EngineArg::Native)]
+    engine: EngineArg,
+
     /// Postgres URL (default: $DATABASE_URL, then the local dev database)
     #[clap(long)]
     db: Option<String>,
+}
+
+/// CLI surface of [`IngestEngine`] (kebab-case values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EngineArg {
+    Native,
+    AiParse,
+    Auto,
+}
+
+impl From<EngineArg> for IngestEngine {
+    fn from(arg: EngineArg) -> Self {
+        match arg {
+            EngineArg::Native => IngestEngine::Native,
+            EngineArg::AiParse => IngestEngine::AiParse,
+            EngineArg::Auto => IngestEngine::Auto,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -237,6 +263,7 @@ fn run_index(args: IndexArgs) -> Result<()> {
         args.uri.as_deref(),
         args.parse_version,
         &partitions,
+        args.engine.into(),
     )?;
     println!("{value}");
     Ok(())

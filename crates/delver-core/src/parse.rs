@@ -426,6 +426,11 @@ pub struct PageContents {
     /// walk (D-018); drained once detection has run. Always empty on hydrated
     /// pages — hydration never re-runs extraction (D-016).
     pub cell_fragments: Vec<CellFragment>,
+    /// Transient scanned-PDF detection signals accumulated during the walk
+    /// (slice P1); consumed by `scan::classify_document` in `parse_document`.
+    /// Default (empty) on hydrated pages — the classified result persists in
+    /// `documents.metadata.scan` instead.
+    pub scan: crate::scan::PageScanSignals,
 }
 
 impl PageContents {
@@ -436,6 +441,7 @@ impl PageContents {
             image_store: ImageStore::default(),
             aux_store: AuxStore::default(),
             cell_fragments: Vec::new(),
+            scan: crate::scan::PageScanSignals::default(),
         }
     }
 
@@ -1282,12 +1288,21 @@ fn handle_operator<'a>(
             text_object_state
                 .operator_log
                 .push(format!("{} {:?}", op.operator, op.operands));
+            let glyphs_before = text_object_state.glyphs.len();
             collect_text_glyphs(
                 text_object_state,
                 &mut current_gs.text_state,
                 &op.operands,
                 current_gs.ctm,
             )?;
+            // Scan detection (slice P1): count shown glyphs by rendering
+            // mode — `Tr 3` glyphs are invisible (the OCR-layer convention).
+            let shown = (text_object_state.glyphs.len() - glyphs_before) as u64;
+            if shown > 0 {
+                page_contents
+                    .scan
+                    .record_glyphs(shown, current_gs.text_state.render);
+            }
             // NOTE: Don't finalize here, wait for ET or explicit text state change
         }
         // Handling XObjects (Images)
@@ -1341,6 +1356,16 @@ fn handle_operator<'a>(
                                 image_object: xobject.clone(), // Clone the object (Stream)
                             };
                             page_contents.add_image(image_element);
+
+                            // Scan detection (slice P1): the true device-space
+                            // placement of an image XObject is the CTM image
+                            // of the unit square (PDF 32000-1 §8.9.5.2). The
+                            // legacy bbox above is a placeholder kept for
+                            // compatibility; coverage must not inherit it.
+                            let envelope = unit_square_envelope(&current_gs.ctm);
+                            page_contents
+                                .scan
+                                .record_image(envelope, stream_filter_names(&stream.dict));
                         }
                     } else {
                         warn!(xobject_name=?String::from_utf8_lossy(name), "XObject is not a stream");
@@ -1362,6 +1387,43 @@ fn handle_operator<'a>(
         _ => {}
     }
     Ok(())
+}
+
+/// Device-space envelope of the unit square under `ctm` — the true placement
+/// of a drawn image XObject (PDF 32000-1 §8.9.5.2). Used by scan detection.
+fn unit_square_envelope(ctm: &Matrix) -> (f32, f32, f32, f32) {
+    let corners = [
+        ctm.transform_point(0.0, 0.0),
+        ctm.transform_point(1.0, 0.0),
+        ctm.transform_point(0.0, 1.0),
+        ctm.transform_point(1.0, 1.0),
+    ];
+    let mut x0 = f32::MAX;
+    let mut y0 = f32::MAX;
+    let mut x1 = f32::MIN;
+    let mut y1 = f32::MIN;
+    for (x, y) in corners {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Filter name(s) of a stream dictionary (`/Filter` name or array of names);
+/// scan detection records them per page (CCITTFaxDecode/JBIG2Decode/full-page
+/// DCTDecode are scan-typical encodings).
+fn stream_filter_names(dict: &Dictionary) -> Vec<String> {
+    match dict.get(b"Filter") {
+        Ok(Object::Name(name)) => vec![String::from_utf8_lossy(name).into_owned()],
+        Ok(Object::Array(items)) => items
+            .iter()
+            .filter_map(|o| o.as_name().ok())
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn pdf_page_transform(page_dict: &Dictionary) -> (Rect, Matrix) {
@@ -1564,17 +1626,20 @@ fn get_page_elements(
         }
     };
     let page_dict = doc.get_dictionary(page_id)?;
+
+    // Calculate page transform and mediabox (also seeds the scan-detection
+    // signals with the page box, slice P1).
+    let (mediabox, page_ctm) = pdf_page_transform(page_dict);
+    page_contents.scan.page_box = (mediabox.x0, mediabox.y0, mediabox.x1, mediabox.y1);
+
     let resources = match doc.get_dict_in_dict(page_dict, b"Resources") {
         Ok(resources) => resources,
         Err(_) => {
             warn!(page=%page_number, "No Resources dictionary found for page");
-            // Return a default or empty PageContents if there are no resources
-            return Ok(PageContents::new());
+            // No resources: nothing was added, but keep the seeded page box.
+            return Ok(page_contents);
         }
     };
-
-    // Calculate page transform and mediabox
-    let (mediabox, page_ctm) = pdf_page_transform(page_dict);
 
     // Initialize graphics state with this transform
     let mut gs_stack = vec![GraphicsState {
@@ -1997,10 +2062,21 @@ pub fn parse_document(doc: &Document) -> Result<ParsedDocument, Error> {
     let mut refs = Vec::new();
     detect_figures(&mut pages, &mut refs);
     extract_embedded_files(doc, &mut pages);
+
+    // Scanned-PDF classification (slice P1): per-page classes plus the
+    // document aggregate, persisted under metadata "scan". Computed from the
+    // walk signals already sitting on each page.
+    let mut metadata = document_info_metadata(doc);
+    let (producer, creator) = document_producer_creator(doc);
+    let scan = crate::scan::classify_document(&pages, producer, creator);
+    if let (Some(map), Ok(value)) = (metadata.as_object_mut(), serde_json::to_value(&scan)) {
+        map.insert("scan".to_string(), value);
+    }
+
     Ok(ParsedDocument {
         pages,
         refs,
-        metadata: document_info_metadata(doc),
+        metadata,
     })
 }
 
@@ -2234,6 +2310,24 @@ pub fn document_info_metadata(doc: &Document) -> serde_json::Value {
         }
     }
     serde_json::Value::Object(out)
+}
+
+/// Info-dict Producer and Creator strings (scan-detection fingerprint
+/// signal; scanner hardware and OCR software identify themselves here).
+pub fn document_producer_creator(doc: &Document) -> (Option<String>, Option<String>) {
+    let read = |key: &[u8]| -> Option<String> {
+        doc.trailer
+            .get(b"Info")
+            .map(|o| resolve_obj(doc, o))
+            .and_then(|o| o.as_dict())
+            .ok()
+            .and_then(|info| info.get(key).ok())
+            .map(|o| resolve_obj(doc, o))
+            .and_then(|o| o.as_str().ok())
+            .map(pdf_text_string)
+            .filter(|s| !s.is_empty())
+    };
+    (read(b"Producer"), read(b"Creator"))
 }
 
 pub fn get_refs(doc: &Document) -> Result<MatchContext, LopdfError> {

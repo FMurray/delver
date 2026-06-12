@@ -1,0 +1,19 @@
+[package]
+name = "delver-parse-dbx"
+version = "0.1.0"
+edition = "2021"
+
+# Databricks `ai_parse_document` parsing backend (slice P1 part 2,
+# docs/DECISIONS-aiparse.md). Mirrors delver-embed's dependency stance:
+# ureq is already pinned in Cargo.lock, so the crate builds with --offline
+# against the locked tree; no new external crates anywhere. NOT a delver-core
+# dependency in the other direction: core stays free of HTTP.
+
+[dependencies]
+delver-core = { path = "../delver-core" }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+ureq = { version = "2.12.1", features = ["json"] }
+
+[dev-dependencies]
+lopdf = { workspace = true }

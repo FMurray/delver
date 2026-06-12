@@ -229,27 +229,30 @@ impl DelverStore {
     }
 
     /// Corpus-scoped full-text search additionally filtered by document
-    /// partition values (Stage C, D-023): when `partitions` is given, only
-    /// documents whose `metadata.partitions` contains it (jsonb containment)
-    /// are searched. `None` is exactly [`Self::text_search`] corpus scope.
+    /// metadata containment (Stage C D-023, extended for scan classes in
+    /// slice P1): when `metadata_filter` is given, only documents whose
+    /// `metadata` jsonb contains it are searched — e.g.
+    /// `{"partitions": {"state": "CA"}}` or `{"scan": {"class":
+    /// "scanned_no_text"}}`. `None` is exactly [`Self::text_search`]
+    /// corpus scope.
     pub async fn text_search_filtered(
         &self,
         corpus: CorpusId,
         query: &str,
         limit: i64,
-        partitions: Option<&serde_json::Value>,
+        metadata_filter: Option<&serde_json::Value>,
     ) -> Result<Vec<TextSearchHit>, StoreError> {
         let sql = format!(
             "{SEARCH_PROJECTION} JOIN documents d ON d.id = e.document_id \
              WHERE d.corpus_id = $1 \
-               AND ($4::jsonb IS NULL OR d.metadata @> jsonb_build_object('partitions', $4::jsonb)) \
+               AND ($4::jsonb IS NULL OR d.metadata @> $4::jsonb) \
                AND {SEARCH_PREDICATE}"
         );
         let rows = sqlx::query(&sql)
             .bind(corpus)
             .bind(query)
             .bind(limit)
-            .bind(partitions)
+            .bind(metadata_filter)
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(search_hit_from_row).collect()
@@ -281,26 +284,42 @@ impl DelverStore {
         Ok(())
     }
 
-    /// Document ids in `corpus` whose `metadata.partitions` contains
-    /// `partitions` (jsonb containment); `None` lists the whole corpus.
+    /// Document ids in `corpus` whose `metadata` jsonb contains
+    /// `metadata_filter` (e.g. `{"partitions": {...}}` and/or
+    /// `{"scan": {"class": ...}}`); `None` lists the whole corpus.
     /// Ordered by id so multi-document query output is deterministic
-    /// (Stage C, D-023).
+    /// (Stage C D-023, extended in slice P1).
     pub async fn documents_matching(
         &self,
         corpus: CorpusId,
-        partitions: Option<&serde_json::Value>,
+        metadata_filter: Option<&serde_json::Value>,
     ) -> Result<Vec<DocumentId>, StoreError> {
         let ids: Vec<DocumentId> = sqlx::query_scalar(
             "SELECT id FROM documents \
               WHERE corpus_id = $1 \
-                AND ($2::jsonb IS NULL OR metadata @> jsonb_build_object('partitions', $2::jsonb)) \
+                AND ($2::jsonb IS NULL OR metadata @> $2::jsonb) \
               ORDER BY id",
         )
         .bind(corpus)
-        .bind(partitions)
+        .bind(metadata_filter)
         .fetch_all(&self.pool)
         .await?;
         Ok(ids)
+    }
+
+    /// The `metadata` jsonb of one document (`None` for unknown ids).
+    /// Lightweight alternative to [`Self::load_document`] when only the
+    /// Info/scan/parser metadata is needed (e.g. the CLI index receipt).
+    pub async fn document_metadata(
+        &self,
+        doc: DocumentId,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let metadata: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM documents WHERE id = $1")
+                .bind(doc)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(metadata)
     }
 
     /// Elements on one page whose bbox overlaps the query rectangle
