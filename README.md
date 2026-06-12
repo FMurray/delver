@@ -1,185 +1,236 @@
 # Delver
 
-A high-performance, declarative tool for parsing and splitting unstructured documents, with an initial focus on scanned PDF files (without OCR). This tool allows users to define custom parsing logic using a simple templating system, processing raw file bytes to produce structured outputs.
+**Delver** is a declarative document-extraction engine written in Rust, and **DocQL** is its query language.
 
----
+Point it at a PDF and a template, and it will:
 
-## Table of Contents
+- **parse** the document into typed elements — text, tables, annotations, figures, vector paths, images, embedded files — with bounding boxes, fonts, and reading order;
+- **match document structure declaratively** — find sections by fuzzy text, regex, layout heuristics, or embedding similarity, and scope everything nested inside them;
+- **extract typed records from tables** — declare a `TYPE … AS TABLE` schema and get coerced, provenance-tracked rows out of detected tables (currency symbols, parenthesized negatives, and percent signs handled);
+- **persist everything in a Postgres-backed semantic index** — content-hash-deduplicated documents, full-text search, bbox queries, pgvector embeddings;
+- **query ad hoc across documents** — run one template over a whole corpus, filtered by partitions (`--where year=2016`).
 
-- [Introduction](#introduction)
-- [Motivation](#motivation)
-- [Goals](#goals)
-- [Features](#features)
-- [Using DocQL](#using-docql)
-  - [DocQL Syntax](#docql-syntax)
-  - [Examples](#examples)
-- [Technical Details](#technical-details)
-  - [Architecture Overview](#architecture-overview)
-  - [Key Components](#key-components)
-- [Technical Choices](#technical-choices)
-- [Dependencies](#dependencies)
-- [Future Enhancements](#future-enhancements)
-- [Contributing](#contributing)
-- [License](#license)
+DocQL is inspired by SQL and DOM parsing: instead of writing imperative parsing code, you declare the shape of what you want and Delver aligns the document to it.
 
----
-
-## Introduction
-
-Processing unstructured data poses significant challenges due to the lack of inherent structure and metadata. Delver is an engine for DocQL, a declarative query language for semantic extraction from unstructured documents. Inspired by the principles of SQL and DOM parsing, Delver/DocQL enables users to define semantic patterns and relationships between elements, making document parsing intuitive, modular, and scalable.
-
-## Motivation
-
-- **Complexity of Unstructured Data**: Handling unstructured documents requires more than simple pattern matching.
-- **Need for Performance**: Processing large volumes of data necessitates a high-performance solution.
-- **Flexibility**: Users require a tool that can be customized to their specific parsing needs.
-- **Semantic Understanding**: Focusing on the semantics of document elements can greatly improve parsing accuracy.
-
-## Goals
-
-- Define a structured query language (DocQL) for extracting meaningful sections and content from raw documents.
-- Replace brittle heuristics with composable, testable semantic match rules.
-- Allow hierarchical expressions to traverse and segment documents with awareness of layout and semantics
-- Support multiple matching techniques like string similarity, cosine similarity.
-- Ensure high performance through efficient implementation in Rust.
-- Offer optional integration with local and remote machine learning models and GPU resources.
-
-## Features
-
-- **DocQL Syntax**: Express powerful hierarchical match logic using a custom declarative language inspired by SQL and HTML.
-- **DOM Construction**: Build a logical document tree from raw elements using semantic and layout-based queries.
-- **Search Index**: search over text and image metrics, spatial properties, document metadata (ref counts, annotations)
-- **High Performance**: Built in Rust for speed and efficiency, suitable for processing large documents.
-- **Extensible Architecture**: Supports integration with machine learning models as optional extras.
-- **Document Viewer**: View and annotate Delver outputs
-- **Tracing**: OpenTelemetry tracing for Delver engine pipeline
-- **Python Bindings**: Accessible from Python via PyO3 bindings for easy integration into existing workflows.
-
-## Using DocQL
-
-DocQL enables structured queries over document layout, allowing you to define how sections, tables, and text blocks should be matched and transformed.
-
-### DocQL Syntax
-
-DocQL supports a tree-based syntax where sections and elements are matched based on text, font, layout metadata, or model-based classification. Blocks can be nested, and additional attributes control chunking and model routing.
-
-#### Parameters
-
-- `match`: Defines what to match in the document.
-- `as`: Assigns a label to the matched content for metadata.
-- `chunk_size`: Specifies the size of each text chunk in tokens.
-- `chunk_overlap`: Specifies the number of overlapping tokens between chunks.
-- `add_meta`: Adds metadata to each chunk.
-- `model`: Specifies a machine learning model to process the matched content.
-- `fuzziness`: (Optional) Sets the Levenshtein distance for fuzzy matching.
-
-### Examples
-
-#### Example 1: Splitting Text Between Headings
-
-```plaintext
-Section(match="Section 1: Management Discussion & Analysis", as="section1") {
-  Section(match="Section 1.1: Risks", as="section1_1") {
-    Section(match="Section 1.1b: Fiscal Risks", as="section1_1b") {
-      TextChunk(
-        chunkSize=500,
-        chunkOverlap=150,
-        addMeta=[section1, section1_1, section1_1b]
-      )
-    }
-  }
+```text
+Section(match="PERFORMANCE BY BUSINESS SEGMENT", as="segments") {
+  TextChunk(chunkSize=500, chunkOverlap=150)
+  Table(as="segment_performance", type="SegmentPerformance")
 }
 ```
 
-This template will:
-
-- Identify the section starting with "About Me" and label it as `mysection`.
-- Split all the text between the "About Me" heading and the "My Projects" heading into chunks of 500 tokens, overlapping by 150 tokens.
-- Add the `mysection` metadata to each chunk.
-
-
-## Technical Details
-
-### Architecture Overview
-
-The system is composed of layered stages: parsing DocQL templates, matching document nodes to build a semantic DOM, and executing transformations or model inferences on matched content.
-
-### Key Components
-
-#### Template Parser
-
-- **Function**: Parses the user-defined templates into executable parsing instructions.
-- **Implementation**: Uses Rust parser combinator crates like `Nom` or `winnow` for efficient parsing.
-
-#### Document Processor
-
-- **Function**: Processes the document according to the parsing instructions, extracting and transforming content.
-- **Implementation**: Utilizes `lopdf` for low-level PDF parsing and manipulation.
-
-#### Semantic Matcher
-
-- **Function**: Identifies document elements based on semantic patterns (e.g., headings, tables).
-- **Implementation**: Analyzes document structure and metadata.
-
-#### Fuzzy Matcher
-
-- **Function**: Performs approximate string matching to handle text variations and typos.
-- **Implementation**: Uses algorithms like Levenshtein distance.
-
-#### Tokenization Module
-
-- **Function**: Tokenizes text content for chunking operations.
-- **Implementation**: Integrates with the `tokenizers` Rust crate for efficient tokenization.
-
-#### Machine Learning Integration
-
-- **Function**: Processes matched content using specified machine learning models.
-- **Implementation**: Provides interfaces for optional model invocation, keeping dependencies modular.
-
-#### Python Bindings
-
-- **Function**: Exposes core functionalities to Python applications.
-- **Implementation**: Uses `PyO3` to generate Python bindings.
-
-## Technical Choices
-
-- **Language**: Rust for core implementation to ensure performance and safety.
-- **Template Parsing**: Parser combinator crates (`Nom` or `winnow`) for flexible and efficient DSL parsing.
-- **PDF Manipulation**: `lopdf` crate for low-level PDF access.
-- **Tokenization**: `tokenizers` crate for efficient and customizable tokenization.
-- **Fuzzy Matching**: Implementing Levenshtein distance algorithms for approximate matching.
-- **Python Bindings**: `PyO3` to facilitate integration with Python ecosystems.
-- **Modularity**: Optional dependencies for machine learning models and GPU resources.
-
-## Dependencies
-
-- **Rust Crates**:
-  - `lopdf` for PDF manipulation.
-  - `tokenizers` for text tokenization.
-  - `pest` for parsing the template DSL.
-  - `PyO3` for Python bindings.
-- **Optional**:
-  - Machine learning models (e.g., vision-language models).
-  - GPU libraries for hardware acceleration.
-
-## Future Enhancements
-
-- **OCR Support**: Incorporate OCR capabilities to extract text from scanned images.
-- **Advanced DocQL Features**: Expand the expressiveness of the query language to support joins, negations, and layout-based conditions.
-- **GUI Development**: Create a user-friendly graphical interface for defining templates.
-- **Support for More Formats**: Extend support to additional document formats (e.g., DOCX, HTML).
-- **Cloud Integration**: Offer cloud-based processing options for scalability.
-- **Advanced NLP Features**: Integrate natural language processing techniques for better semantic understanding.
-- **Model Training**: Train model on index features to enhance matching
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues, fork the repository, and open pull requests.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+**Status**: `0.2.0-rc.1` — a working release candidate under active development. The CLI, Python bindings, Postgres store, table extraction, and viewer described below all work today; features marked *experimental* are called out honestly. **License: TBD** (not yet chosen — do not redistribute until one is added).
 
 ---
 
-*Note: This README.md serves as both a design document and a product requirements document (PRD) for the Unstructured Data Splitter tool. It outlines the project's goals, features, technical implementation, and future plans, providing a comprehensive overview for developers and users alike.*
+## Table of contents
+
+- [Quickstart (5 minutes)](#quickstart-5-minutes)
+- [A taste of DocQL: typed tables](#a-taste-of-docql-typed-tables)
+- [Python](#python)
+- [Viewer](#viewer)
+- [Repository map](#repository-map)
+- [Status and roadmap](#status-and-roadmap)
+
+---
+
+## Quickstart (5 minutes)
+
+### Prerequisites
+
+- **Rust** (we build with 1.88) — `rustup` recommended.
+- **Postgres 17 with pgvector**, listening on `localhost:5433`. Two supported paths:
+  - **Docker**: `scripts/dev-db.sh` (wraps `docker compose -f docker-compose.dev.yml up -d --wait db`, image `pgvector/pgvector:pg17`).
+  - **Homebrew** (if Docker isn't an option): see [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md#path-b-homebrew-postgres) — five commands, fully equivalent.
+
+Everything defaults to `postgres://delver:delver@localhost:5433/delver`; override with `--db` or `DATABASE_URL`. Schema migrations run automatically on first connect.
+
+### Build and fetch a test document
+
+```bash
+cargo build -p delver
+mkdir -p ~/datasets && curl -sL -o ~/datasets/3M_2015_10K.pdf \
+  https://raw.githubusercontent.com/patronus-ai/financebench/main/pdfs/3M_2015_10K.pdf
+```
+
+The fixture is a 158-page SEC 10-K filing from the public [FinanceBench](https://github.com/patronus-ai/financebench) repo (1.2 MB). Keep datasets **outside** the repo — see `scripts/fetch-testdata.sh` for the full corpus fetcher and its compliance notes.
+
+### 1. Index — parse and persist
+
+```bash
+./target/debug/delver index ~/datasets/3M_2015_10K.pdf --corpus demo
+```
+
+```json
+{"corpus":"demo","created":true,"document_id":"838c2f8a-12b9-48ba-8b1a-bd511689b6e3","element_count":26657,"partitions":{}}
+```
+
+Ingest is idempotent: re-indexing identical bytes returns the same document with `"created":false`.
+
+### 2. Query — run a DocQL template
+
+Use the `document_id` from *your* receipt (the ids below are from the run that produced these snippets):
+
+```bash
+./target/debug/delver query --doc 838c2f8a-12b9-48ba-8b1a-bd511689b6e3 \
+  --template crates/delver/tests/10k.tmpl --pretty | head -8
+```
+
+```json
+[
+  {
+    "type": "Text",
+    "text": "Table of Contents   low   UNITED STATES SECURITIES AND EXCHANGE COMMISSION Washington, D.C. 20549   FORM 10-K …",
+    "metadata": {
+      "chunk_char_count": 3712,
+      "chunk_element_count": 87,
+      "page_numbers": [
+```
+
+That template chunks the whole filing, carves out the *Management's Discussion and Analysis* section, and collects the tables inside it — 181 outputs (175 text chunks + 6 tables) for this document. `--pdf <file>` runs the same template with a fresh parse, no database needed.
+
+### 3. Search — full-text over the corpus
+
+```bash
+./target/debug/delver search "research and development" --corpus demo --limit 3
+```
+
+```json
+[{"document_id":"838c2f8a-12b9-48ba-8b1a-bd511689b6e3","element_id":"fe227241-c7c2-4359-b67e-e8509324b18c","page":6,"rank":0.232880637049675,"snippet":"Research and development, covering basic scientific research and the application of scientific advances in the development of new and"}, ...]
+```
+
+All three subcommands print exactly one JSON document on stdout (diagnostics go to stderr), so they compose with `jq`, pipes, and `head`.
+
+## A taste of DocQL: typed tables
+
+Declare a record type, match a section, and coerce the tables inside it — `segments.tmpl`:
+
+```text
+TYPE SegmentPerformance AS TABLE (
+  metric TEXT,
+  y2015 DECIMAL,
+  y2014 DECIMAL,
+  y2013 DECIMAL,
+);
+
+Section(
+  match="PERFORMANCE BY BUSINESS SEGMENT",
+  end_match="PERFORMANCE BY GEOGRAPHIC AREA",
+  as="segments"
+) {
+  Table(as="segment_performance", type="SegmentPerformance")
+}
+```
+
+```bash
+./target/debug/delver query --doc 838c2f8a-12b9-48ba-8b1a-bd511689b6e3 \
+  --template segments.tmpl --pretty
+```
+
+Real output excerpt (the Industrial segment table on page 26 — headers `2015/2014/2013` fuzzy-matched onto `y2015/y2014/y2013`, `$`-filler columns skipped, parens coerced to negatives, percent signs stripped and recorded):
+
+```json
+{
+  "type": "TypedTable",
+  "type_name": "SegmentPerformance",
+  "name": "segment_performance",
+  "records": [
+    {"metric": "Sales (millions)",       "y2015": 10328.0, "y2014": 10990.0, "y2013": 10657.0},
+    {"metric": "Organic local currency", "y2015": 0.7,     "y2014": 4.9,     "y2013": 4.6},
+    {"metric": "Translation",            "y2015": -7.3,    "y2014": -1.8,    "y2013": -1.7}
+  ],
+  "coerced_ok": 35,
+  "coerced_err": 1,
+  "errors": [{"row": 4, "col": 4, "raw": "—", "reason": "cannot parse \"—\" as DECIMAL"}],
+  "provenance": {"element_id": "79108707-b2e0-4c4f-818b-9b2d6714e75a", "page": 26, "source_rows": [1, 2, 3, 4, 5, 6, 7, 8, 9]}
+}
+```
+
+Bad cells never abort a run: they become `null` plus an `errors` entry, and every record keeps provenance back to the table element and grid rows it came from.
+
+**[Full language reference → docs/DOCQL.md](docs/DOCQL.md)** — all element types, match rules, coercion semantics, partitions, and multi-document queries, with runnable examples.
+
+## Python
+
+Delver ships Python bindings (`delver_pdf`, PyO3). Build them into a virtualenv with [uv](https://docs.astral.sh/uv/) and [maturin](https://www.maturin.rs/):
+
+```bash
+uv tool install maturin            # if you don't have maturin yet
+uv venv .venv && source .venv/bin/activate
+maturin develop --uv -m crates/delver/Cargo.toml --features extension-module
+```
+
+(Plain alternative: `python3 -m venv .venv && source .venv/bin/activate && pip install maturin`, then the same `maturin develop` without `--uv`.)
+
+```python
+import json, os
+import delver_pdf
+
+# One-shot: parse a PDF and run a DocQL template (no database needed)
+pdf = os.path.expanduser("~/datasets/3M_2015_10K.pdf")
+outputs = json.loads(delver_pdf.process_pdf_file(pdf, "crates/delver/tests/10k.tmpl"))
+print(len(outputs), "outputs")                      # -> 181 outputs
+
+# Persistent store: ingest + search (uses $DATABASE_URL, else the local dev DB)
+store = delver_pdf.DelverStore()
+receipt = json.loads(store.ingest(pdf, "demo"))     # idempotent, same receipt as the CLI
+hits = json.loads(store.search("research and development", "demo", limit=3))
+print(hits[0]["page"], "-", hits[0]["snippet"][:60])
+
+# Run a DocQL template against the stored document
+tables = json.loads(store.run_template(receipt["document_id"], 'Table(as="tables")'))
+print(len(tables), "tables")                        # -> 125 tables in this 10-K
+```
+
+CLI and Python route through one shared service layer, so the JSON shapes are identical.
+
+## Viewer
+
+A web viewer for inspecting parsed documents and iterating on templates:
+
+```bash
+./scripts/dev-viewer.sh        # builds and serves on http://127.0.0.1:3017
+```
+
+What you can do there:
+
+- **Upload / index** PDFs into the store (drag-and-drop; ingest is the same idempotent path as the CLI).
+- **Render pages** (pdfium rasters, WebP) with **element overlays**: text, annotations, figures, paths, images — and **tables with their full cell grid** (header cells tinted; click a table for the per-cell text grid, strategy, and confidence).
+- **Edit and run DocQL** in a CodeMirror editor with language support (live parse diagnostics, completions) — press **Ctrl+Enter** to execute the template against the open document; failures render as readable error banners, results as pretty JSON.
+- Drive it headlessly via the plain REST API (`/api/v/docs`, `…/pages/{n}/image.webp`, `…/pages/{n}/elements`, `/api/v/upload`).
+
+Requires `cargo-leptos` (we use 0.2.42) and a pdfium dylib — the script resolves pdfium automatically; see [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md#viewer) for details.
+
+## Repository map
+
+| Crate | What it is |
+|---|---|
+| [`crates/delver-core`](crates/delver-core) | The engine: PDF parsing into typed elements, table detection, DocQL template compiler, matching, chunking. Pure and synchronous — no database dependency. |
+| [`crates/delver-store`](crates/delver-store) | Postgres persistence (SQLx + pgvector): idempotent ingest, hydration back into the in-memory index, full-text & bbox queries. Async with a blocking facade. |
+| [`crates/delver-embed`](crates/delver-embed) | `Embedder` backends for embedding-based matching: an HTTP serving-endpoint client and a deterministic mock for tests. |
+| [`crates/delver`](crates/delver) | The `delver` CLI (`process` / `index` / `query` / `search`) and the `delver_pdf` Python module — both over one shared service layer. |
+| [`crates/viewer`](crates/viewer) | Leptos (SSR + wasm) web viewer: page rasters, element/table overlays, DocQL editor, REST API. |
+
+Depth lives in `docs/`:
+
+- [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) — full environment setup, test data, store internals, CLI reference, troubleshooting.
+- [docs/DOCQL.md](docs/DOCQL.md) — the DocQL language reference.
+- [docs/DECISIONS.md](docs/DECISIONS.md) and [docs/DECISIONS-viewer.md](docs/DECISIONS-viewer.md) — the append-only design logs (the "why" behind everything above; docs here cite their `D-…`/`DV-…` entries).
+- [docs/PARSER.md](docs/PARSER.md), [docs/COLLATION.md](docs/COLLATION.md), [docs/TEMPLATE_SYNTAX.md](docs/TEMPLATE_SYNTAX.md) — architecture notes on the parse pipeline and template/content alignment.
+
+## Status and roadmap
+
+Working today (verified on real SEC filings): parsing with text/table/annotation/path/figure/blob extraction, the persistent index, fuzzy/regex/heuristic section matching, `TYPE … AS TABLE` typed extraction, partitions and multi-document queries, Python bindings, and the viewer.
+
+**Experimental / not yet there:**
+
+- **`EmbeddingSim` matching and `method="semantic"` chunking** require an embedding endpoint (`--embed-endpoint` / `DELVER_EMBED_ENDPOINT`); without one they fail loudly rather than silently skipping. The bundled backend targets an HTTP serving-endpoint API; a local backend is future work.
+- **Table cell spans** (merged cells) are not detected yet; `model=`/`targetSchema=` enrichment attributes on `Table`/`Image` parse but are not executed (a warning is logged).
+- **OCR / scanned-PDF support** is not in this release — Delver currently targets born-digital PDFs.
+- Some PDFs with unusual encodings can fail ingest (see [troubleshooting](docs/GETTING-STARTED.md#troubleshooting)).
+
+Contributions and issue reports are welcome.
+
+## License
+
+**TBD.** This repository does not yet have a license file; until one is added, the code is source-available for evaluation but not licensed for redistribution or production use.
