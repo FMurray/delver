@@ -3,11 +3,15 @@
 //! currently-open stored document via the same hydrate + `process_parsed`
 //! path the CLI `query --doc` uses (DV-006).
 //!
-//! Slice V2 (DV-012) additions: consumes the [`InsertBus`] (discover-mode
-//! "insert into query" actions render their snippet against the live buffer
-//! and land at the CodeMirror cursor), binds Ctrl/Cmd-Enter inside the
-//! editor to execute, and surfaces LSP completions through the CodeMirror
-//! show-hint addon (Ctrl-Space).
+//! Slice V4 (DV-016): the buffer is no longer panel-local — the editor
+//! reads/writes the app-level [`QueryBuilder`] buffer signal that the
+//! no-code palette tree also drives, making this panel "view source" for
+//! the builder. Programmatic buffer changes (form edits, slot inserts) are
+//! mirrored into CodeMirror with cursor/scroll preserved; tree-node clicks
+//! select the node's span here. The DV-012 insert bus is consumed by the
+//! builder now (`components::builder`), not at the editor cursor.
+//! Ctrl/Cmd-Enter execution and LSP completions (Ctrl-Space, show-hint)
+//! are unchanged.
 
 use futures::channel::mpsc;
 #[cfg(feature = "hydrate")]
@@ -20,8 +24,7 @@ use serde_json::json;
 use serde_json::Value;
 use server_fn::{codec::JsonEncoding, BoxedStream, ServerFnError, Websocket};
 
-use crate::components::insert::InsertBus;
-use crate::snippets::render_snippet;
+use crate::components::builder::QueryBuilder;
 use crate::store::TemplateRun;
 
 #[cfg(feature = "hydrate")]
@@ -30,12 +33,6 @@ use codemirror::{DocApi, Editor, EditorOptions};
 use wasm_bindgen::prelude::*;
 #[cfg(feature = "hydrate")]
 use web_sys::HtmlTextAreaElement;
-
-/// Default editor content: a VALID runnable starter (the previous `//`
-/// comment placeholder was a DocQL syntax error — the grammar has no
-/// comments — so the editor opened with a red diagnostic).
-#[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
-const STARTER_TEMPLATE: &str = "TextChunk(chunkSize=500, chunkOverlap=150)";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LspDiagnostic {
@@ -129,7 +126,7 @@ pub fn doc_id_from_path(pathname: &str) -> Option<String> {
 // threaded; the discover-mode panels live in other component trees).
 
 #[cfg(feature = "hydrate")]
-mod cm {
+pub(crate) mod cm {
     use super::*;
     use std::cell::{Cell, RefCell};
 
@@ -146,12 +143,22 @@ mod cm {
         pub fn get_value(this: &CmInstance) -> String;
         #[wasm_bindgen(method, js_name = setValue)]
         pub fn set_value(this: &CmInstance, value: &str);
-        #[wasm_bindgen(method, js_name = replaceRange)]
-        pub fn replace_range(this: &CmInstance, text: &str, from: &JsValue);
         #[wasm_bindgen(method, js_name = setOption)]
         pub fn set_option(this: &CmInstance, key: &str, value: &JsValue);
         #[wasm_bindgen(method)]
         pub fn focus(this: &CmInstance);
+        #[wasm_bindgen(method, js_name = setCursor)]
+        pub fn set_cursor(this: &CmInstance, pos: &JsValue);
+        #[wasm_bindgen(method, js_name = posFromIndex)]
+        pub fn pos_from_index(this: &CmInstance, index: u32) -> JsValue;
+        #[wasm_bindgen(method, js_name = setSelection)]
+        pub fn set_selection(this: &CmInstance, anchor: &JsValue, head: &JsValue);
+        #[wasm_bindgen(method, js_name = getScrollInfo)]
+        pub fn get_scroll_info(this: &CmInstance) -> JsValue;
+        #[wasm_bindgen(method, js_name = scrollTo)]
+        pub fn scroll_to(this: &CmInstance, x: &JsValue, y: &JsValue);
+        #[wasm_bindgen(method, js_name = scrollIntoView)]
+        pub fn scroll_into_view(this: &CmInstance, what: &JsValue, margin: u32);
     }
 
     thread_local! {
@@ -199,29 +206,35 @@ mod cm {
         (get("line"), get("ch"))
     }
 
-    /// Insert `text` at the cursor (on its own line when the cursor line has
-    /// content), or replace the whole buffer when it still holds the pristine
-    /// starter. Returns false when no editor is mounted.
-    pub fn insert_at_cursor(text: &str) -> bool {
+    /// Mirror a programmatic buffer change (form edit, slot insert, chip
+    /// insert) into the editor, preserving cursor and scroll. No-op when the
+    /// editor already holds `text` — which is every editor-originated
+    /// change, so the buffer↔editor loop converges immediately.
+    pub fn sync_value(text: &str) {
         with_instance(|cm| {
-            if cm.get_value().trim() == STARTER_TEMPLATE.trim() {
-                cm.set_value(&format!("{text}\n"));
-            } else {
+            if cm.get_value() != text {
                 let cursor = cm.get_cursor();
-                let (line, ch) = cursor_parts(&cursor);
-                let line_text = cm.get_line(line).unwrap_or_default();
-                let before: String = line_text.chars().take(ch as usize).collect();
-                let mut snippet = String::new();
-                if !before.trim().is_empty() {
-                    snippet.push_str("\n\n");
-                }
-                snippet.push_str(text);
-                snippet.push('\n');
-                cm.replace_range(&snippet, &cursor);
+                let scroll = cm.get_scroll_info();
+                cm.set_value(text);
+                cm.set_cursor(&cursor);
+                let part = |k: &str| {
+                    js_sys::Reflect::get(&scroll, &k.into()).unwrap_or(JsValue::NULL)
+                };
+                cm.scroll_to(&part("left"), &part("top"));
             }
-            cm.focus();
-        })
-        .is_some()
+        });
+    }
+
+    /// Select and reveal a range given in UTF-16 code units (CodeMirror's
+    /// index space — see `query_tree::byte_to_utf16`). Tree-node clicks use
+    /// this to keep "view source" in sync with the builder.
+    pub fn select_span(start: usize, end: usize) {
+        with_instance(|cm| {
+            let anchor = cm.pos_from_index(start as u32);
+            let head = cm.pos_from_index(end as u32);
+            cm.set_selection(&anchor, &head);
+            cm.scroll_into_view(&anchor, 40);
+        });
     }
 
     /// The async show-hint `hint` function: looks up the word prefix at the
@@ -341,7 +354,9 @@ pub fn query_panel() -> impl IntoView {
     let location = use_location();
     let query_params = use_query_map();
 
-    // Pre-fill the editor from ?template=… (urlencoded DocQL source).
+    // ?template=… deep links pre-fill the SHARED builder buffer (seeded by
+    // app::QueryParamSync so the palette tree sees it even with this panel
+    // closed); this panel only reads the run flag.
     let initial_template = query_params
         .get_untracked()
         .get("template")
@@ -352,7 +367,11 @@ pub fn query_panel() -> impl IntoView {
         .map(|r| r == "1" || r == "true")
         .unwrap_or(false);
 
-    let (query, set_query) = signal(initial_template.clone().unwrap_or_default());
+    // The app-level builder buffer is the source of truth (DV-016); `query`
+    // and `set_query` are the read/write halves of the same signal.
+    let builder = expect_context::<QueryBuilder>();
+    let query = builder.buffer;
+    let set_query = builder.buffer;
     let (diagnostics, set_diagnostics) = signal(Vec::<LspDiagnostic>::new());
 
     let current_doc = Memo::new(move |_| doc_id_from_path(&location.pathname.get()));
@@ -494,14 +513,10 @@ pub fn query_panel() -> impl IntoView {
 
                 let editor = Editor::from_text_area(&textarea_element, &options);
 
-                // Initial content: URL-provided template, else a valid
-                // runnable starter.
-                let initial = query.get_untracked();
-                if initial.trim().is_empty() {
-                    editor.set_value(STARTER_TEMPLATE);
-                } else {
-                    editor.set_value(&initial);
-                }
+                // Initial content: the shared builder buffer (possibly
+                // empty — the palette's root slot is the empty state now,
+                // DV-016; the old always-on starter template would hide it).
+                editor.set_value(&query.get_untracked());
 
                 // Set up change handler
                 let on_change_effect = on_change_clone.clone();
@@ -569,52 +584,16 @@ pub fn query_panel() -> impl IntoView {
         });
     }
 
-    // Consume the insert bus (DV-012): render the snippet spec against the
-    // live buffer (names stay unique) and insert at the cursor. Created
-    // AFTER the editor-init effect so a panel opened by an insert action has
-    // its editor by the time this first runs.
-    if let Some(bus) = use_context::<InsertBus>() {
-        Effect::new(move |_| {
-            let Some((spec, _nonce)) = bus.0.get() else {
-                return;
-            };
-            #[cfg(feature = "hydrate")]
-            {
-                let pristine = cm::with_instance(|cm| {
-                    cm.get_value().trim() == STARTER_TEMPLATE.trim()
-                })
-                .unwrap_or(false);
-                let buffer = if pristine {
-                    String::new()
-                } else {
-                    cm::with_instance(|cm| cm.get_value())
-                        .unwrap_or_else(|| query.get_untracked())
-                };
-                let text = render_snippet(&spec, &buffer);
-                if !cm::insert_at_cursor(&text) {
-                    set_query.update(|q| {
-                        if !q.trim().is_empty() {
-                            q.push_str("\n\n");
-                        }
-                        q.push_str(&text);
-                        q.push('\n');
-                    });
-                }
-            }
-            #[cfg(not(feature = "hydrate"))]
-            {
-                let text = render_snippet(&spec, &query.get_untracked());
-                set_query.update(|q| {
-                    if !q.trim().is_empty() {
-                        q.push_str("\n\n");
-                    }
-                    q.push_str(&text);
-                    q.push('\n');
-                });
-            }
-            bus.0.set(None); // consumed — re-mounts must not re-insert
-        });
-    }
+    // Mirror programmatic buffer changes (builder form edits, slot inserts,
+    // insert-bus chips — all routed through components::builder now) into
+    // the editor. Created AFTER the editor-init effect so the instance
+    // exists on the first run; editor-originated changes are equal-value
+    // no-ops, so the loop converges immediately.
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| {
+        let text = query.get();
+        cm::sync_value(&text);
+    });
 
     view! {
         <div class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg transition-all duration-300 ease-in-out z-20">

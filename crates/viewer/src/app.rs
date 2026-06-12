@@ -12,6 +12,7 @@
 // use crate::rendering;
 // use crate::ui_controls;
 // use crate::utils;
+use crate::components::builder::{BuilderSync, QueryBuilder};
 use crate::components::file_upload::FileUpload;
 use crate::components::insert::InsertBus;
 use crate::components::palette::QueryPalette;
@@ -86,10 +87,14 @@ pub fn App() -> impl IntoView {
     provide_context(QueryContext(show_query, set_show_query));
     provide_context(InspectorContext(show_inspector, set_show_inspector));
     provide_context(InsertBus::new());
+    // V4 (DV-016): the query builder state — ONE buffer signal shared by
+    // the palette tree and the editor, plus the parse snapshot + selection.
+    provide_context(QueryBuilder::new());
 
     view! {
         <Router>
             <QueryParamSync />
+            <BuilderSync />
             <div class="h-screen flex flex-col bg-gray-50">
                 <MainNav />
                 <div class="flex flex-1 overflow-hidden">
@@ -110,16 +115,23 @@ pub fn App() -> impl IntoView {
     }
 }
 
-/// Opens the query panel when the URL carries a template deep link
-/// (`?template=…[&run=1]`). Must live inside `<Router>` so the query map is
-/// available; runs during SSR so deep links render server-side.
+/// Opens the query panel and seeds the shared builder buffer when the URL
+/// carries a template deep link (`?template=…[&run=1]`). Must live inside
+/// `<Router>` so the query map is available; runs during SSR so deep links
+/// render server-side. Seeding happens here (not in the panel) so the
+/// palette tree sees the template even while the panel is closed, and the
+/// value is identical on server and client (it derives from the URL).
 #[component]
 fn QueryParamSync() -> impl IntoView {
     let QueryContext(_, set_show_query) =
         use_context::<QueryContext>().expect("query context in QueryParamSync");
+    let builder = use_context::<QueryBuilder>().expect("builder context in QueryParamSync");
     let params = leptos_router::hooks::use_query_map();
-    if params.get_untracked().get("template").is_some() {
+    if let Some(template) = params.get_untracked().get("template") {
         set_show_query.set(true);
+        if !template.trim().is_empty() {
+            builder.buffer.set(template);
+        }
     }
     ().into_view()
 }
