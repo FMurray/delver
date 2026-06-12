@@ -10,9 +10,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use delver_core::diagnostics::RunDiagnostics;
 use delver_core::embed::Embedder;
 use delver_core::layout::MatchContext;
-use delver_core::process_parsed;
+use delver_core::process_parsed_with_diagnostics;
 use delver_core::scan::ScanClass;
 use delver_embed::DatabricksEmbedder;
 use delver_parse_dbx::{map_ai_parse_response, DbxConfig, DbxParseClient};
@@ -399,8 +400,13 @@ pub fn run_template_on_corpus(
     let docs = store.documents_matching(corpus_id, filter.as_ref())?;
     let mut by_doc = serde_json::Map::new();
     for doc in docs {
-        let outputs = run_template_on_doc(store, doc, template_str, tokenizer, embedder.clone())
-            .with_context(|| format!("running template on document {doc}"))?;
+        let (outputs, diagnostics) =
+            run_template_on_doc_with_diagnostics(store, doc, template_str, tokenizer, embedder.clone())
+                .with_context(|| format!("running template on document {doc}"))?;
+        // Per-document near-miss warnings (D-024); stdout stays pure outputs.
+        for warning in diagnostics.warnings() {
+            eprintln!("warning: [doc {doc}] {warning}");
+        }
         by_doc.insert(doc.to_string(), serde_json::from_str(&outputs)?);
     }
     Ok(serde_json::to_string_pretty(&serde_json::Value::Object(
@@ -421,6 +427,21 @@ pub fn run_template_on_doc(
     tokenizer: Option<&Tokenizer>,
     embedder: Option<Arc<dyn Embedder>>,
 ) -> Result<String> {
+    let (json, _diagnostics) =
+        run_template_on_doc_with_diagnostics(store, doc, template_str, tokenizer, embedder)?;
+    Ok(json)
+}
+
+/// [`run_template_on_doc`] plus the run's near-miss diagnostics (D-024):
+/// match configs that yielded zero candidates above threshold, each with its
+/// top-3 closest candidates. The outputs JSON is identical.
+pub fn run_template_on_doc_with_diagnostics(
+    store: &DelverStoreBlocking,
+    doc: DocumentId,
+    template_str: &str,
+    tokenizer: Option<&Tokenizer>,
+    embedder: Option<Arc<dyn Embedder>>,
+) -> Result<(String, RunDiagnostics)> {
     let loaded = store.load_document(doc)?;
     if loaded.elements.is_empty() {
         bail!("document {doc} has no stored elements (unknown id or empty document)");
@@ -428,7 +449,15 @@ pub fn run_template_on_doc(
     let pages = delver_store::hydrate_pages(&loaded.elements);
     let mut match_context = MatchContext::default();
     match_context.embedder = embedder.into();
-    process_parsed(&pages, &match_context, template_str, tokenizer)
+    process_parsed_with_diagnostics(&pages, &match_context, template_str, tokenizer)
+}
+
+/// Print one `warning:` line per near miss on stderr (D-024). Stdout is
+/// reserved for data (D-013); an all-matching run prints nothing.
+pub fn print_match_warnings(diagnostics: &RunDiagnostics) {
+    for warning in diagnostics.warnings() {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn search_hits_json(hits: &[TextSearchHit]) -> serde_json::Value {

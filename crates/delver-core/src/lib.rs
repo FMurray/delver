@@ -1,4 +1,5 @@
 pub mod chunker;
+pub mod diagnostics;
 pub mod docql;
 pub mod embed;
 pub mod fonts;
@@ -13,9 +14,10 @@ pub mod table;
 pub mod udt;
 // pub mod viewer;
 
+use crate::diagnostics::RunDiagnostics;
 use crate::docql::{parse_template, process_matched_content, ProcessedOutput, Root};
 use crate::layout::{group_text_into_lines_and_blocks, MatchContext, TextBlock};
-use crate::matcher::align_template_with_content;
+use crate::matcher::align_template_with_content_diag;
 use crate::parse::{get_refs, parse_document, PageContents, TextElement};
 use anyhow::Result;
 use lopdf::Document;
@@ -40,6 +42,20 @@ pub fn process_pdf(
     tokenizer: Option<&Tokenizer>,
     embedder: Option<std::sync::Arc<dyn embed::Embedder>>,
 ) -> Result<(String, Vec<TextBlock>, Document)> {
+    let (json, blocks, doc, _diagnostics) =
+        process_pdf_with_diagnostics(pdf_bytes, template_str, tokenizer, embedder)?;
+    Ok((json, blocks, doc))
+}
+
+/// [`process_pdf`] plus the run's [`RunDiagnostics`] (D-024): match configs
+/// that yielded zero candidates, each with its top-3 near misses. The JSON
+/// payload is identical to [`process_pdf`]'s.
+pub fn process_pdf_with_diagnostics(
+    pdf_bytes: &[u8],
+    template_str: &str,
+    tokenizer: Option<&Tokenizer>,
+    embedder: Option<std::sync::Arc<dyn embed::Embedder>>,
+) -> Result<(String, Vec<TextBlock>, Document, RunDiagnostics)> {
     let dom = parse_template(template_str)?;
 
     let doc = Document::load_mem(pdf_bytes)?;
@@ -66,8 +82,9 @@ pub fn process_pdf(
     let mut match_context = get_refs(&doc)?;
     match_context.embedder = embed::SharedEmbedder::from(embedder);
 
-    let json = run_template(&dom, &pages_map, &match_context, tokenizer)?;
-    Ok((json, blocks, doc))
+    let mut diagnostics = RunDiagnostics::default();
+    let json = run_template(&dom, &pages_map, &match_context, tokenizer, &mut diagnostics)?;
+    Ok((json, blocks, doc, diagnostics))
 }
 
 /// Parse PDF bytes end to end (load + [`parse::parse_document`]) without
@@ -96,8 +113,25 @@ pub fn process_parsed(
     template_str: &str,
     tokenizer: Option<&Tokenizer>,
 ) -> Result<String> {
+    let (json, _diagnostics) =
+        process_parsed_with_diagnostics(pages_map, match_context, template_str, tokenizer)?;
+    Ok(json)
+}
+
+/// [`process_parsed`] plus the run's [`RunDiagnostics`] (D-024): match
+/// configs that yielded zero candidates, each with its top-3 near misses.
+/// The JSON payload is identical to [`process_parsed`]'s; an all-matching
+/// run returns an empty diagnostics value.
+pub fn process_parsed_with_diagnostics(
+    pages_map: &BTreeMap<u32, PageContents>,
+    match_context: &MatchContext,
+    template_str: &str,
+    tokenizer: Option<&Tokenizer>,
+) -> Result<(String, RunDiagnostics)> {
     let dom = parse_template(template_str)?;
-    run_template(&dom, pages_map, match_context, tokenizer)
+    let mut diagnostics = RunDiagnostics::default();
+    let json = run_template(&dom, pages_map, match_context, tokenizer, &mut diagnostics)?;
+    Ok((json, diagnostics))
 }
 
 /// Shared template-execution core for [`process_pdf`] and [`process_parsed`]:
@@ -107,12 +141,15 @@ fn run_template(
     pages_map: &BTreeMap<u32, PageContents>,
     match_context: &MatchContext,
     tokenizer: Option<&Tokenizer>,
+    diagnostics: &mut RunDiagnostics,
 ) -> Result<String> {
     let mut all_outputs: Vec<ProcessedOutput> = Vec::new();
 
     let index = PdfIndex::new(pages_map, match_context);
 
-    if let Some(matched_content) = align_template_with_content(&dom.elements, &index, None, None)? {
+    if let Some(matched_content) =
+        align_template_with_content_diag(&dom.elements, &index, None, None, diagnostics)?
+    {
         let outputs = process_matched_content(&matched_content, &index, tokenizer)?;
         all_outputs.extend(outputs);
     }

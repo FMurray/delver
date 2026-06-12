@@ -44,3 +44,6 @@ lazy_static.workspace = true
 # EmbeddingSim through the delver-embed MockEmbedder via the core trait.
 [dev-dependencies]
 delver-embed = { path = "../delver-embed" }
+# Already a direct dependency above; repeated here so integration tests can
+# assert TextScorer::whole_score ≡ strsim::normalized_levenshtein (D-024).
+strsim = { workspace = true }

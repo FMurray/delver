@@ -8,10 +8,179 @@ use crate::{
 use lopdf::Object;
 use ordered_float::NotNan;
 use rstar::{RTree, RTreeObject, AABB};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 const DEFAULT_PAGE_WIDTH: f32 = 612.0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Text() match scoring (D-024): typographic folding + substring-aware fuzzy
+// scoring. `Text("Management's Discussion", threshold=0.6)` must find the
+// heading "Item 7. Management's Discussion and Analysis of …" even though the
+// pattern is a fragment of the element's whole text.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fold the typographic characters that differ between user-typed patterns
+/// and PDF-extracted text (D-024): single quotes U+2018/U+2019 → `'`, double
+/// quotes U+201C/U+201D → `"`, en/em dashes U+2013/U+2014 → `-`. Borrows when
+/// nothing folds, so the common all-ASCII path stays allocation-free.
+pub fn fold_typographic(s: &str) -> Cow<'_, str> {
+    fn fold(c: char) -> Option<char> {
+        match c {
+            '\u{2018}' | '\u{2019}' => Some('\''),
+            '\u{201C}' | '\u{201D}' => Some('"'),
+            '\u{2013}' | '\u{2014}' => Some('-'),
+            _ => None,
+        }
+    }
+    if s.chars().any(|c| fold(c).is_some()) {
+        Cow::Owned(s.chars().map(|c| fold(c).unwrap_or(c)).collect())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Deterministic cap on windowed-score start positions per candidate, so one
+/// pathological mega-element cannot stall a query. Real elements are
+/// line/row-grained (D-018) and sit far below this.
+const WINDOW_START_CAP: usize = 2048;
+
+/// Scorer for one `Text(...)` pattern (D-024), offering the two scoring
+/// modes `find_text_matches` runs as two passes:
+///
+/// * [`TextScorer::whole_score`] — `normalized_levenshtein(raw pattern,
+///   raw candidate)`: the pre-D-024 scorer **verbatim** (no folding). Pass 1
+///   uses only this, so any template the old semantics matched keeps
+///   identical candidates, scores, and ranks (the regression baselines
+///   depend on this; even one marginal fold-induced score flip — e.g.
+///   `Management's Report` vs `Management's Discussion` crossing 0.6 once
+///   apostrophes fold — would suppress the rescue pass or shift a boundary).
+/// * [`TextScorer::rescue_score`] — substring-aware scoring on
+///   **quote-folded** strings ([`fold_typographic`] applied to pattern and
+///   candidate alike) for pass 2, which runs **only when pass 1 found
+///   nothing** (the silent-`[]` failure mode this decision exists to fix).
+///   When the candidate is meaningfully longer than the pattern
+///   (`2·candidate_chars > 3·pattern_chars`, i.e. ratio > 1.5): a folded
+///   exact-substring containment check scores 1.0 outright; else the
+///   maximum `normalized_levenshtein` over token-aligned windows of roughly
+///   pattern length (for each word start, the smallest word-window reaching
+///   the pattern's char count, and that window minus its last word).
+///   Near-equal lengths never enter windowed mode and keep their folded
+///   whole-string score (this is where pure quote-mismatch misses get
+///   rescued).
+///
+/// Matching stays case-sensitive everywhere, exactly like the pre-D-024
+/// whole-string scorer: an all-caps `Text("PERFORMANCE BY BUSINESS
+/// SEGMENT")` pattern is authored to hit the all-caps heading, and
+/// case-folding the containment check would let title-case body mentions
+/// ("…refer to the section entitled \"Performance by Business Segment\"…")
+/// outrank the real heading.
+pub struct TextScorer {
+    raw_pattern: String,
+    folded_pattern: String,
+    folded_pattern_chars: usize,
+}
+
+impl TextScorer {
+    pub fn new(pattern: &str) -> Self {
+        let folded_pattern = fold_typographic(pattern).into_owned();
+        let folded_pattern_chars = folded_pattern.chars().count();
+        TextScorer {
+            raw_pattern: pattern.to_string(),
+            folded_pattern,
+            folded_pattern_chars,
+        }
+    }
+
+    /// Pre-D-024 scoring, verbatim: raw pattern vs the candidate's whole
+    /// text, no folding. In `[0.0, 1.0]`.
+    pub fn whole_score(&self, candidate: &str) -> f64 {
+        use strsim::normalized_levenshtein;
+        normalized_levenshtein(&self.raw_pattern, candidate)
+    }
+
+    /// Substring-aware scoring on quote-folded strings (pass 2): the folded
+    /// whole-string score, upgraded by containment/windowed evidence when
+    /// the candidate is meaningfully longer than the pattern. In
+    /// `[0.0, 1.0]`.
+    pub fn rescue_score(&self, candidate: &str) -> f64 {
+        use strsim::normalized_levenshtein;
+        let folded = fold_typographic(candidate);
+        let candidate = folded.as_ref();
+        let whole = normalized_levenshtein(&self.folded_pattern, candidate);
+
+        // Windowed mode never applies to near-equal lengths or an empty
+        // pattern (which must not take the containment shortcut).
+        let candidate_chars = candidate.chars().count();
+        if self.folded_pattern_chars == 0 || 2 * candidate_chars <= 3 * self.folded_pattern_chars {
+            return whole;
+        }
+
+        // Containment shortcut: quote-folded exact substring.
+        if candidate.contains(&self.folded_pattern) {
+            return 1.0;
+        }
+
+        whole.max(self.windowed_max(candidate))
+    }
+
+    /// Maximum normalized-Levenshtein score of the folded pattern over
+    /// token-aligned windows of the (already folded) candidate. Windows
+    /// start at word boundaries and span the smallest run of words whose
+    /// slice (original inter-word spacing preserved) reaches the pattern's
+    /// char count; the same run minus its last word brackets from below.
+    /// Deterministic, document order.
+    fn windowed_max(&self, candidate: &str) -> f64 {
+        use strsim::normalized_levenshtein;
+
+        // Word boundaries as byte ranges into `candidate`.
+        let words: Vec<(usize, usize)> = candidate
+            .split_whitespace()
+            .map(|w| {
+                let start = w.as_ptr() as usize - candidate.as_ptr() as usize;
+                (start, start + w.len())
+            })
+            .collect();
+        if words.is_empty() {
+            return normalized_levenshtein(&self.folded_pattern, candidate);
+        }
+
+        let mut best = 0.0_f64;
+        for i in 0..words.len().min(WINDOW_START_CAP) {
+            let start = words[i].0;
+            let mut window_chars = 0usize;
+            let mut prev_end = start;
+            for (j, &(_, word_end)) in words.iter().enumerate().skip(i) {
+                // Chars added by this word plus the gap before it.
+                window_chars += candidate[prev_end..word_end].chars().count();
+                prev_end = word_end;
+                let is_last = j + 1 == words.len();
+                if window_chars >= self.folded_pattern_chars || is_last {
+                    best = best
+                        .max(normalized_levenshtein(
+                            &self.folded_pattern,
+                            &candidate[start..word_end],
+                        ));
+                    if j > i {
+                        // Bracket from below: the same window minus its last
+                        // word (closest token window shorter than the pattern).
+                        let below_end = words[j - 1].1;
+                        best = best.max(normalized_levenshtein(
+                            &self.folded_pattern,
+                            &candidate[start..below_end],
+                        ));
+                    }
+                    break;
+                }
+            }
+            if best >= 1.0 {
+                break;
+            }
+        }
+        best
+    }
+}
 
 /// Typed handle for text elements - prevents mixing with image handles
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -653,6 +822,14 @@ impl PdfIndex {
 
     /// Find elements that might match a text string - cache-efficient SoA access
     /// Returns typed handles and scores for zero-copy access
+    ///
+    /// Two-pass scoring (D-024): pass 1 is the pre-D-024 whole-string
+    /// normalized Levenshtein (on quote-folded text) and wins outright when
+    /// it finds anything — templates the old semantics matched are
+    /// untouched. Only when pass 1 yields zero candidates does pass 2 rerun
+    /// the scan with substring-aware scoring ([`TextScorer::rescue_score`]),
+    /// so fragment patterns like `Text("Management's Discussion")` can match
+    /// the full heading instead of silently returning nothing.
     pub fn find_text_matches(
         &self,
         text: &str,
@@ -660,7 +837,34 @@ impl PdfIndex {
         start_content_index: Option<usize>,
         max_content_index: Option<usize>,
     ) -> Vec<(TextHandle, f64)> {
-        use strsim::normalized_levenshtein;
+        let scorer = TextScorer::new(text);
+
+        let whole_matches = self.scan_text_matches(
+            threshold,
+            start_content_index,
+            max_content_index,
+            |candidate| scorer.whole_score(candidate),
+        );
+        if !whole_matches.is_empty() {
+            return whole_matches;
+        }
+        self.scan_text_matches(
+            threshold,
+            start_content_index,
+            max_content_index,
+            |candidate| scorer.rescue_score(candidate),
+        )
+    }
+
+    /// One scoring pass of [`find_text_matches`]: scan the text column over
+    /// `[start, max)` and keep candidates scoring at or above `threshold`.
+    fn scan_text_matches(
+        &self,
+        threshold: f64,
+        start_content_index: Option<usize>,
+        max_content_index: Option<usize>,
+        score_fn: impl Fn(&str) -> f64,
+    ) -> Vec<(TextHandle, f64)> {
         let start = start_content_index.unwrap_or(0);
 
         // Cache-efficient: iterate through text store directly
@@ -675,7 +879,7 @@ impl PdfIndex {
                 }
             }
 
-            let score = normalized_levenshtein(text, text_content);
+            let score = score_fn(text_content);
 
             if score >= threshold {
                 // Find the corresponding document index for this text element
@@ -685,7 +889,7 @@ impl PdfIndex {
                         // Check if we've exceeded the max_content_index limit
                         if let Some(max_idx) = max_content_index {
                             if doc_idx >= max_idx {
-                                tracing::debug!("[find_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
+                                tracing::debug!("[scan_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
                                 break;
                             }
                         }
@@ -694,7 +898,7 @@ impl PdfIndex {
                     }
                 } else {
                     tracing::debug!(
-                        "[find_text_matches] Match found but no doc_idx for text_idx {}",
+                        "[scan_text_matches] Match found but no doc_idx for text_idx {}",
                         text_store_idx
                     );
                 }
@@ -702,6 +906,56 @@ impl PdfIndex {
         }
 
         results
+    }
+
+    /// Top-`k` text elements by [`TextScorer::rescue_score`] for `pattern`
+    /// within the same `[start, max)` scope `find_text_matches` searches,
+    /// regardless of any threshold — the near-miss diagnostic scan (D-024).
+    /// Ordered best first; ties resolve to document order. Only runs after a
+    /// match yielded zero candidates, so the extra pass is off the hot path.
+    pub fn top_text_match_scores(
+        &self,
+        pattern: &str,
+        start_content_index: Option<usize>,
+        max_content_index: Option<usize>,
+        k: usize,
+    ) -> Vec<(TextHandle, f64)> {
+        let start = start_content_index.unwrap_or(0);
+        let scorer = TextScorer::new(pattern);
+
+        let mut scored: Vec<(usize, TextHandle, f64)> = self
+            .text_store
+            .text
+            .iter()
+            .enumerate()
+            .filter_map(|(text_store_idx, text_content)| {
+                let doc_idx = self.find_doc_index_for_text(text_store_idx)?;
+                if doc_idx < start {
+                    return None;
+                }
+                if let Some(max_idx) = max_content_index {
+                    if doc_idx >= max_idx {
+                        return None;
+                    }
+                }
+                Some((
+                    doc_idx,
+                    TextHandle(text_store_idx as u32),
+                    scorer.rescue_score(text_content),
+                ))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(_, handle, score)| (handle, score))
+            .collect()
     }
 
     /// Text handles whose document index lies in `[start, end)`, in document

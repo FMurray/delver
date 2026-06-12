@@ -535,3 +535,64 @@ three additive functions, no existing signature changed.
   different partitions in one corpus: inference + explicit-override receipts, `--where` on
   search/query incl. multi-pair AND and no-match cases, multi-doc shape, corpus-vs-doc output
   equality, and the rejected flag combinations).
+
+**D-024 · 2026-06-12 · Substring-aware `Text()` matching + near-miss observability (fix/partial-match).**
+User-reported bug: `Match<Section> M { Text("Management's Discussion", threshold=0.6) }` returned
+`[]` with zero stderr against the 10-K — `find_text_matches` scored the pattern against each
+element's WHOLE text (the fragment ≈ 0.26 < 0.6 vs the real heading "Item 7. Management's
+Discussion and Analysis of …"), and a matched-nothing run was indistinguishable from a wrong
+document id.
+- **Scoring rule (exact, two-pass — `search_index::TextScorer`)**: pass 1 is the pre-D-024
+  scorer **verbatim** (raw, unfolded `normalized_levenshtein(pattern, whole element text)`) and
+  wins outright when it yields ≥1 candidate at the threshold — every template the old semantics
+  matched keeps byte-identical candidates, scores, and ranks. Only when pass 1 finds **zero**
+  candidates does pass 2 rescan with rescue scoring on **quote-folded** strings: candidates not
+  meaningfully longer than the pattern (`2·candidate_chars ≤ 3·pattern_chars`, i.e. ratio ≤ 1.5)
+  keep their folded whole-string score (this is where pure quote-mismatch misses get rescued);
+  longer candidates take the **containment shortcut** (folded exact substring → score 1.0) or
+  else the max normalized Levenshtein over **token-aligned windows** (per word start: the
+  smallest word run reaching the pattern's char count, plus that run minus its last word;
+  window starts capped at 2048/element — deterministic; real elements are row-grained, D-018).
+- **Why rescue-on-empty instead of a unified score** (both simpler shapes were built and
+  measured against the byte-exact baselines): (1) flat containment-1.0 in one pass let verbatim
+  cross-references outrank real headings — p9's “This Annual Report on Form 10-K, including
+  ‘Management's Discussion and …’” beat the split p16 heading row (0.837) for the MD&A start,
+  and p45's `Refer to Item 7A, “Quantitative and …”` stole the end marker; no monotone
+  coverage-damping can demote a 0.44-coverage buried match below 0.78 AND let a 0.24-coverage
+  fragment clear 0.6. (2) Folding inside pass 1 flipped a marginal candidate (`Management's
+  Report`: 0.565 raw → 0.609 folded ≥ 0.6), which then suppressed the rescue. Rescue-on-empty
+  fires exactly in the silent-`[]` failure mode being fixed, by construction.
+- **Folding set** (`search_index::fold_typographic`; rescue pass + near-miss ranking only):
+  U+2018/U+2019 → `'`, U+201C/U+201D → `"`, U+2013/U+2014 → `-`; applied to pattern and
+  candidate alike; `Cow`-borrowing when nothing folds. The corpus carries U+2019 (the PDF
+  parser decodes ASCII `'` as StandardEncoding *quoteright*), users type `'`. Matching stays
+  **case-sensitive** everywhere — deliberate deviation from the case-folded-containment
+  sketch: all-caps `Text("PERFORMANCE BY BUSINESS SEGMENT")` is authored for the all-caps
+  heading, and case-folded containment made the title-case p19 body mention (“…refer to the
+  section entitled ‘Performance by Business Segment’…”) win the boundary.
+- **Near-miss diagnostics**: when a match config yields zero candidates (section `match=` —
+  recorded just before the section silently fails to match — or an explicit `end_match=`
+  before its parent/natural-boundary fallback), the matcher records
+  `MatchMiss { match_name, pattern, threshold, near_misses }` with the top-3 closest
+  candidates in the searched scope (`NearMiss { text ≤80 chars, score, page }`, best first,
+  rescue-scored; `Text` clauses only — `FirstMatch` recursed; Regex/Heuristic/EmbeddingSim
+  record the miss without ranking), deduplicated by (name, pattern, threshold). Surface
+  (additive; crates/viewer untouched this slice): `diagnostics::RunDiagnostics` returned by
+  new `process_parsed_with_diagnostics` / `process_pdf_with_diagnostics` /
+  `run_template_on_doc_with_diagnostics`, threaded through new
+  `matcher::align_template_with_content_diag` — every pre-existing function keeps its
+  signature and delegates. CLI `query`/`process` print one `warning: match 'X' matched
+  nothing at threshold 0.6 — closest: '…' (0.48, p43); …` line per miss on **stderr**
+  (`query --corpus` prefixes `[doc <id>]`); stdout stays pure outputs and an all-matching run
+  prints nothing (D-013/D-017 hold).
+- **Verified**: both regression baselines byte-identical with 0-byte stderr (414 534 /
+  466 678); the user's exact fragment query now returns outputs attributed to section `M`
+  (the start lands on the earliest bonus-ranked element *containing* the fragment — the p9
+  cross-reference — because the real p16 heading is split “Item 7. Management's” /
+  “ Discussion and Analysis…” across two row elements, so no single element holds the fragment
+  with better rank; boundary-bonus tuning is out of scope); a nothing-matches template →
+  stdout `[]`, exit 0, one stderr warning. Workspace suite 256 passed / 0 failed / 1 ignored
+  (pre-existing gated live test); new tests in crates/delver-core/tests/partial_match.rs and
+  crates/delver/tests/near_miss_cli.rs (incl. a DB-gated run of the user's exact query against
+  the real 10-K). Rescue + near-miss scans run only on zero-match (~3.5 s extra on the
+  158-page 10-K, debug build); the hot path is pass 1, unchanged.

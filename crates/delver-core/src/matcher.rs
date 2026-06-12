@@ -1,3 +1,4 @@
+use crate::diagnostics::{MatchMiss, NearMiss, RunDiagnostics, NEAR_MISS_TOP_K};
 use crate::docql::{
     ComparisonExpr, ComparisonOp, ComparisonValue, Element, ElementType, HeuristicProperty,
     MatchConfig, MatchType, Value,
@@ -137,12 +138,34 @@ pub fn align_template_with_content<'a>(
     inherited_metadata: Option<&HashMap<String, Value>>,
     parent_or_prev_sibling_match_context: Option<&TemplateContentMatch<'a>>,
 ) -> Result<Option<Vec<TemplateContentMatch<'a>>>> {
+    let mut discarded = RunDiagnostics::default();
+    align_template_with_content_diag(
+        template_elements,
+        index,
+        inherited_metadata,
+        parent_or_prev_sibling_match_context,
+        &mut discarded,
+    )
+}
+
+/// [`align_template_with_content`] plus near-miss observability (D-024):
+/// every match config that yields zero candidates above its threshold records
+/// a [`MatchMiss`] (with the top-3 closest fuzzy-text candidates in the
+/// searched scope) into `diagnostics`. Matching behavior is identical.
+pub fn align_template_with_content_diag<'a>(
+    template_elements: &'a [Element],
+    index: &'a PdfIndex,
+    inherited_metadata: Option<&HashMap<String, Value>>,
+    parent_or_prev_sibling_match_context: Option<&TemplateContentMatch<'a>>,
+    diagnostics: &mut RunDiagnostics,
+) -> Result<Option<Vec<TemplateContentMatch<'a>>>> {
     align_template_with_content_with_depth(
         template_elements,
         index,
         inherited_metadata,
         parent_or_prev_sibling_match_context,
         0,
+        diagnostics,
     )
 }
 
@@ -153,6 +176,7 @@ fn align_template_with_content_with_depth<'a>(
     inherited_metadata: Option<&HashMap<String, Value>>,
     parent_or_prev_sibling_match_context: Option<&TemplateContentMatch<'a>>,
     recursion_depth: usize,
+    diagnostics: &mut RunDiagnostics,
 ) -> Result<Option<Vec<TemplateContentMatch<'a>>>> {
     if template_elements.is_empty() {
         return Ok(None);
@@ -293,6 +317,7 @@ fn align_template_with_content_with_depth<'a>(
                 context_for_child,
                 effective_start_index,
                 recursion_depth,
+                diagnostics,
             )? {
                 tracing::debug!(
                     "  PASS 1: Found Section '{}' boundaries",
@@ -487,6 +512,7 @@ enum RelationshipType {
 }
 
 /// Finds section match that comes after prev_match
+#[allow(clippy::too_many_arguments)]
 fn match_section<'a, 'map_lt>(
     template: &'a Element,
     index: &'a PdfIndex,
@@ -495,6 +521,7 @@ fn match_section<'a, 'map_lt>(
     prev_match_for_context: Option<&TemplateContentMatch<'a>>,
     current_search_start_index: usize,
     recursion_depth: usize,
+    diagnostics: &mut RunDiagnostics,
 ) -> Result<Option<TemplateContentMatch<'a>>> {
     let Some(match_config) = template.match_config.as_ref() else {
         return Ok(None);
@@ -522,6 +549,16 @@ fn match_section<'a, 'map_lt>(
         max_search_index,
     )?
     else {
+        // Zero candidates above threshold: the section will silently not
+        // match. Record the near-miss diagnostic (D-024) before returning.
+        record_match_miss(
+            diagnostics,
+            index,
+            template,
+            match_config,
+            effective_search_start_index,
+            max_search_index,
+        );
         return Ok(None);
     };
 
@@ -538,6 +575,7 @@ fn match_section<'a, 'map_lt>(
         &template.children,
         match_config, // Pass the match_config for consistent threshold handling
         prev_match_for_context,
+        diagnostics,
     )?;
 
     // Choose end marker:
@@ -674,6 +712,7 @@ fn match_section<'a, 'map_lt>(
             Some(&result.metadata), // Pass the updated metadata including section info
             Some(&result),
             recursion_depth + 1, // Increment depth for child processing
+            diagnostics,
         )? {
             result.children = child_matches;
         }
@@ -690,6 +729,69 @@ fn match_owner(template: &Element, config: &MatchConfig) -> String {
         .name
         .clone()
         .unwrap_or_else(|| template.name.clone())
+}
+
+/// Record a near-miss diagnostic for a match config that yielded zero
+/// candidates above its threshold (D-024): the top-3 closest fuzzy-text
+/// candidates in the same `[start, max)` scope the match searched. Only
+/// `Text(...)` clauses have graded scores to rank (recursing into
+/// `FirstMatch` alternatives); other matcher types record the miss with no
+/// candidate ranking.
+fn record_match_miss(
+    diagnostics: &mut RunDiagnostics,
+    index: &PdfIndex,
+    template: &Element,
+    config: &MatchConfig,
+    start_index: usize,
+    max_index: Option<usize>,
+) {
+    // The fuzzy-text clauses reachable from this config (self, or FirstMatch
+    // alternatives), in declaration order.
+    fn text_clauses<'c>(config: &'c MatchConfig, out: &mut Vec<&'c MatchConfig>) {
+        match &config.match_type {
+            MatchType::Text => out.push(config),
+            MatchType::FirstMatch(alternatives) => {
+                for alternative in alternatives {
+                    text_clauses(alternative, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut clauses = Vec::new();
+    text_clauses(config, &mut clauses);
+
+    // Best-scoring candidates across all text clauses (each clause scores
+    // against its own pattern), best first, top-3 overall.
+    let mut near_misses: Vec<NearMiss> = Vec::new();
+    for clause in &clauses {
+        for (handle, score) in index.top_text_match_scores(
+            &clause.pattern,
+            Some(start_index),
+            max_index,
+            NEAR_MISS_TOP_K,
+        ) {
+            let text = index.text(handle);
+            near_misses.push(NearMiss::new(text.text, score, text.page_number));
+        }
+    }
+    near_misses.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    near_misses.truncate(NEAR_MISS_TOP_K);
+
+    // Report the first text clause's pattern/threshold (the only graded
+    // clause kind); fall back to the config's own fields for Regex/Heuristic/
+    // EmbeddingSim-only definitions.
+    let (pattern, threshold) = clauses
+        .first()
+        .map(|c| (c.pattern.clone(), c.threshold))
+        .unwrap_or_else(|| (config.pattern.clone(), config.threshold));
+
+    diagnostics.record(MatchMiss {
+        match_name: match_owner(template, config),
+        pattern,
+        threshold,
+        near_misses,
+    });
 }
 
 /// Finds potential start boundary candidates using multiple indices
@@ -747,6 +849,7 @@ fn find_start_boundary_candidates<'a>(
 
 /// Finds potential end boundary candidates
 /// Returns a list of candidates sorted by score
+#[allow(clippy::too_many_arguments)]
 fn find_end_boundary_candidates<'a>(
     start_content: &'a PageContent,
     template: &Element,
@@ -754,6 +857,7 @@ fn find_end_boundary_candidates<'a>(
     _children: &[Element],
     _match_config: &MatchConfig,
     prev_match: Option<&TemplateContentMatch<'a>>,
+    diagnostics: &mut RunDiagnostics,
 ) -> Result<Option<Vec<BoundaryCandidate>>> {
     let mut candidates = Vec::new();
 
@@ -772,6 +876,11 @@ fn find_end_boundary_candidates<'a>(
             search_start_index,
             None,
         )?;
+        if end_text_matches.is_empty() {
+            // The explicit end marker missed entirely; the section will fall
+            // back to a parent/natural boundary. Surface why (D-024).
+            record_match_miss(diagnostics, index, template, config, search_start_index, None);
+        }
         for (text_handle, score) in end_text_matches {
             let txt_ref = index.text(text_handle);
             let element = PageContent::Text(TextElement {

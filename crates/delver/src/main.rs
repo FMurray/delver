@@ -13,10 +13,11 @@ use uuid::Uuid;
 
 use delver::{
     build_embedder, connect_store, infer_partitions_from_path, ingest_file, load_tokenizer,
-    parse_key_value, run_template_on_corpus, run_template_on_doc, search_store, IngestEngine,
+    parse_key_value, print_match_warnings, run_template_on_corpus,
+    run_template_on_doc_with_diagnostics, search_store, IngestEngine,
 };
 use delver_core::logging::{init_debug_logging, DebugDataStore};
-use delver_core::process_pdf;
+use delver_core::process_pdf_with_diagnostics;
 use delver_store::DocumentId;
 use tokenizers::Tokenizer;
 
@@ -239,7 +240,9 @@ fn run_process(args: ProcessArgs) -> Result<()> {
     let template_str = fs::read_to_string(&args.template)?;
     let tokenizer = Tokenizer::from_pretrained(&args.tokenizer_model, None).ok();
     let embedder = build_embedder(args.embed_endpoint.as_deref())?;
-    let (json, _blocks, _doc) = process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref(), embedder)?;
+    let (json, _blocks, _doc, diagnostics) =
+        process_pdf_with_diagnostics(&pdf_bytes, &template_str, tokenizer.as_ref(), embedder)?;
+    print_match_warnings(&diagnostics);
 
     match args.output {
         Some(path) => fs::write(&path, json)?,
@@ -277,19 +280,22 @@ fn run_query(args: QueryArgs) -> Result<()> {
     let json = match (&args.pdf, args.doc, &args.corpus) {
         (Some(pdf_path), None, None) => {
             let pdf_bytes = fs::read(pdf_path)?;
-            let (json, _blocks, _doc) =
-                process_pdf(&pdf_bytes, &template_str, tokenizer.as_ref(), embedder)?;
+            let (json, _blocks, _doc, diagnostics) =
+                process_pdf_with_diagnostics(&pdf_bytes, &template_str, tokenizer.as_ref(), embedder)?;
+            print_match_warnings(&diagnostics);
             json
         }
         (None, Some(doc), None) => {
             let store = connect_store(args.db.as_deref())?;
-            run_template_on_doc(
+            let (json, diagnostics) = run_template_on_doc_with_diagnostics(
                 &store,
                 DocumentId(doc),
                 &template_str,
                 tokenizer.as_ref(),
                 embedder,
-            )?
+            )?;
+            print_match_warnings(&diagnostics);
+            json
         }
         (None, None, Some(corpus)) => {
             let partitions = args
