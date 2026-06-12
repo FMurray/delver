@@ -6,7 +6,7 @@
 # │ This repository is PUBLIC. Datasets fetched by this script are for      │
 # │ LOCAL testing only: never commit, redistribute, deploy, or upload them. │
 # │ Data lands OUTSIDE the repo ($DELVER_TESTDATA, default ~/datasets).     │
-# │ Customer-derived corpora (PMBench, CustomerBench, Ares) are PROHIBITED. │
+# │ Customer-derived corpora from any engagement or source  are PROHIBITED. │
 # └─────────────────────────────────────────────────────────────────────────┘
 set -euo pipefail
 

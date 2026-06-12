@@ -51,7 +51,7 @@ The repo carries only `scripts/fetch-testdata.sh`. Never commit, redistribute, o
 datasets. Approved for local testing: FinanceBench (SEC filings; QA labels CC-BY-NC → local
 dev only), OfficeQA (HF-gated; public-source Treasury Bulletins; includes hard-133 =
 `officeqa_pro.csv`), OmniDocBench (optional; layout ground truth). **PROHIBITED (customer-derived):
-PMBench, CustomerBench, Ares hackathon data.**
+internal PM-notes/customer-document eval sets and customer hackathon materials.**
 
 **D-008 · 2026-06-11 · Idempotent ingest.**
 `documents` are keyed by sha256 content hash + `parse_version`. Re-ingesting identical bytes
