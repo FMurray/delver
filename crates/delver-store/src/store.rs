@@ -451,10 +451,10 @@ impl DelverStore {
         )
         .bind(corpus)
         .bind(sha)
-        .bind(uri)
+        .bind(uri.map(pg_text))
         .bind(parsed.page_count() as i32)
         .bind(parse_version)
-        .bind(&parsed.metadata)
+        .bind(pg_json(parsed.metadata.clone()))
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -595,6 +595,35 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Column-major staging buffers for the UNNEST bulk insert.
+/// Postgres TEXT and jsonb reject NUL (0x00), but real-world PDFs produce it
+/// (broken ToUnicode CMaps, damaged xref recovery). Replace with U+FFFD at
+/// the store boundary so ingest never fails on parser output — lossy only
+/// for a byte Postgres could not store regardless. First wild hit:
+/// Berkeley tech report EECS-2025-77.
+fn pg_text(s: &str) -> String {
+    if s.contains('\0') {
+        s.replace('\0', "\u{FFFD}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Recursively sanitize every string (values AND keys) in a JSON tree for
+/// jsonb binding; see [`pg_text`].
+fn pg_json(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(pg_text(&s)),
+        Value::Array(a) => Value::Array(a.into_iter().map(pg_json).collect()),
+        Value::Object(m) => Value::Object(
+            m.into_iter()
+                .map(|(k, val)| (pg_text(&k), pg_json(val)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 #[derive(Default)]
 struct FlatElements {
     ids: Vec<uuid::Uuid>,
@@ -652,9 +681,9 @@ impl FlatElements {
                     flat.pages.push(text.page_number as i32);
                     flat.kinds.push(ElementKind::Text.as_str().to_string());
                     flat.order_idxs.push(order_idx as i32);
-                    flat.texts.push(Some(text.text.to_string()));
+                    flat.texts.push(Some(pg_text(text.text)));
                     flat.font_sizes.push(Some(text.font_size));
-                    flat.font_names.push(text.font_name.map(str::to_string));
+                    flat.font_names.push(text.font_name.map(pg_text));
                     // u64 -> i64 is a bit-preserving cast; the key is
                     // informational (process-local font interner, see D-010).
                     flat.style_keys
@@ -695,18 +724,18 @@ impl FlatElements {
                         .push(ElementKind::from_aux(aux.kind).as_str().to_string());
                     flat.order_idxs.push(order_idx as i32);
                     // Annotation Contents lands in elements.text → FTS-able.
-                    flat.texts.push(aux.text.clone());
+                    flat.texts.push(aux.text.as_deref().map(pg_text));
                     flat.font_sizes.push(None);
                     flat.font_names.push(None);
                     flat.style_keys.push(None);
                     flat.push_bbox(aux.bbox.x0, aux.bbox.y0, aux.bbox.x1, aux.bbox.y1);
-                    flat.metadatas.push(aux.metadata.clone());
+                    flat.metadatas.push(pg_json(aux.metadata.clone()));
 
                     if let Some(blob) = &aux.blob {
                         flat.blob_ids.push(aux.id);
                         flat.blob_datas.push(blob.data.clone());
-                        flat.blob_mimes.push(blob.mime.clone());
-                        flat.blob_filenames.push(blob.filename.clone());
+                        flat.blob_mimes.push(blob.mime.as_deref().map(pg_text));
+                        flat.blob_filenames.push(blob.filename.as_deref().map(pg_text));
                     }
                     if let Some(table) = &aux.table {
                         for cell in &table.cells {
@@ -716,7 +745,7 @@ impl FlatElements {
                             flat.cell_row_spans.push(cell.row_span as i32);
                             flat.cell_col_spans.push(cell.col_span as i32);
                             flat.cell_texts
-                                .push((!cell.text.is_empty()).then(|| cell.text.clone()));
+                                .push((!cell.text.is_empty()).then(|| pg_text(&cell.text)));
                             flat.cell_x0s.push(cell.bbox.0 as f64);
                             flat.cell_y0s.push(cell.bbox.1 as f64);
                             flat.cell_x1s.push(cell.bbox.2 as f64);
@@ -830,4 +859,25 @@ fn element_from_row(row: &PgRow) -> Result<ElementRow, StoreError> {
         // Filled by `attach_table_cells` for kind=table rows.
         table_cells: None,
     })
+}
+
+#[cfg(test)]
+mod pg_sanitize_tests {
+    use super::{pg_json, pg_text};
+    use serde_json::json;
+
+    #[test]
+    fn nul_bytes_replaced_in_text() {
+        assert_eq!(pg_text("clean"), "clean");
+        assert_eq!(pg_text("bad\0text\0"), "bad\u{FFFD}text\u{FFFD}");
+    }
+
+    #[test]
+    fn nul_bytes_replaced_throughout_json_tree() {
+        let dirty = json!({"k\0ey": ["a\0", {"nested": "v\0"}, 7], "ok": true});
+        let clean = pg_json(dirty);
+        let s = clean.to_string();
+        assert!(!s.contains('\u{0000}'));
+        assert_eq!(clean["k\u{FFFD}ey"][1]["nested"], "v\u{FFFD}");
+    }
 }
