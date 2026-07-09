@@ -846,14 +846,25 @@ impl PdfIndex {
             |candidate| scorer.whole_score(candidate),
         );
         if !whole_matches.is_empty() {
+            tracing::debug!(
+                pass = 1,
+                hits = whole_matches.len(),
+                "text_match: whole-string Levenshtein pass matched (pre-D-024 scoring wins outright)"
+            );
             return whole_matches;
         }
-        self.scan_text_matches(
+        let rescued = self.scan_text_matches(
             threshold,
             start_content_index,
             max_content_index,
             |candidate| scorer.rescue_score(candidate),
-        )
+        );
+        tracing::debug!(
+            pass = 2,
+            hits = rescued.len(),
+            "text_match: pass 1 empty — substring-aware quote-folded rescue pass ran (D-024)"
+        );
+        rescued
     }
 
     /// One scoring pass of [`find_text_matches`]: scan the text column over
@@ -889,7 +900,11 @@ impl PdfIndex {
                         // Check if we've exceeded the max_content_index limit
                         if let Some(max_idx) = max_content_index {
                             if doc_idx >= max_idx {
-                                tracing::debug!("[scan_text_matches] Stopping search: doc_idx {} >= max_content_index {}", doc_idx, max_idx);
+                                tracing::trace!(
+                                    doc_idx,
+                                    max_idx,
+                                    "text_match: scan reached scope end"
+                                );
                                 break;
                             }
                         }
@@ -897,9 +912,9 @@ impl PdfIndex {
                         results.push((TextHandle(text_store_idx as u32), score));
                     }
                 } else {
-                    tracing::debug!(
-                        "[scan_text_matches] Match found but no doc_idx for text_idx {}",
-                        text_store_idx
+                    tracing::trace!(
+                        text_store_idx,
+                        "text_match: hit has no document index (orphan text row)"
                     );
                 }
             }
@@ -1096,7 +1111,18 @@ impl PdfIndex {
         });
 
         // --- 5. cap to k ---------------------------------------------------
-        handles.into_iter().take(k).map(|h| (h, 1.0)).collect()
+        let results: Vec<(TextHandle, f32)> =
+            handles.into_iter().take(k).map(|h| (h, 1.0)).collect();
+        tracing::debug!(
+            seed_text = %crate::trace_preview(&seed.text, 60),
+            seed_font_size = seed.font_size,
+            range_start = start_idx,
+            range_end = end_idx,
+            k,
+            candidates = results.len(),
+            "style_similarity: probed packed style-key buckets (font/size/z/pos/caps) for elements styled like the seed"
+        );
+        results
     }
 
     /// Compute style key for any TextElement (not necessarily in the index)
@@ -1382,38 +1408,13 @@ impl PdfIndex {
         end_element: Option<&PageContent>,
     ) -> Vec<PageContent> {
         let start_id = start_element.id();
-        let end_id = end_element.map(|e| e.id());
-
-        tracing::debug!(
-            "[get_elements_between_markers] Looking for start_id: {}",
-            start_id
-        );
-        if let Some(end_id) = end_id {
-            tracing::debug!(
-                "[get_elements_between_markers] Looking for end_id: {}",
-                end_id
-            );
-        } else {
-            tracing::debug!("[get_elements_between_markers] No end element specified");
-        }
-
-        tracing::debug!(
-            "[get_elements_between_markers] element_id_to_index contains {} mappings",
-            self.element_id_to_index.len()
-        );
 
         let start_idx_inclusive = match self.element_id_to_index.get(&start_id) {
-            Some(&idx) => {
-                tracing::debug!(
-                    "[get_elements_between_markers] Found start_id at index: {}",
-                    idx
-                );
-                idx
-            }
+            Some(&idx) => idx,
             None => {
                 tracing::debug!(
-                    "[get_elements_between_markers] Start element ID {} not found in index",
-                    start_id
+                    %start_id,
+                    "between_markers: start element not in index — empty slice"
                 );
                 return Vec::new(); // Start element not found in index
             }
@@ -1423,53 +1424,42 @@ impl PdfIndex {
             Some(end) => {
                 let end_id = end.id();
                 match self.element_id_to_index.get(&end_id) {
-                    Some(&idx) => {
-                        tracing::debug!(
-                            "[get_elements_between_markers] Found end_id at index: {}",
-                            idx
-                        );
-                        idx // This index is exclusive for the slice
-                    }
+                    Some(&idx) => idx, // This index is exclusive for the slice
                     None => {
-                        tracing::debug!("[get_elements_between_markers] End element ID {} not found in index, using document end", end_id);
+                        tracing::debug!(
+                            %end_id,
+                            "between_markers: end element not in index — using document end"
+                        );
                         self.order.len() // End element not found, go to end of document
                     }
                 }
             }
-            None => {
-                tracing::debug!(
-                    "[get_elements_between_markers] No end element, using document end"
-                );
-                self.order.len() // No end element, go to end of document
-            }
+            None => self.order.len(), // No end element, go to end of document
         };
-
-        tracing::debug!("[get_elements_between_markers] start_idx_inclusive: {}, end_idx_exclusive: {}, total_content_len: {}", 
-                 start_idx_inclusive, end_idx_exclusive, self.order.len());
 
         // Now, start_idx_inclusive will be used directly for the slice start.
         // Ensure start_idx_inclusive is not past end_idx_exclusive or bounds.
         if start_idx_inclusive >= end_idx_exclusive || start_idx_inclusive >= self.order.len() {
-            tracing::debug!("[get_elements_between_markers] Invalid range: start {} >= end {} or start >= content_len {}", 
-                     start_idx_inclusive, end_idx_exclusive, self.order.len());
+            tracing::debug!(
+                start = start_idx_inclusive,
+                end = end_idx_exclusive,
+                doc_len = self.order.len(),
+                "between_markers: empty/inverted range — no elements"
+            );
             return Vec::new();
         }
 
         // Ensure the slice end is within bounds.
         let effective_end_idx = std::cmp::min(end_idx_exclusive, self.order.len());
 
-        tracing::debug!(
-            "[get_elements_between_markers] Effective slice: [{}..{}]",
-            start_idx_inclusive,
-            effective_end_idx
-        );
-
         // Use cache-efficient content_slice method
         let result = self.content_slice(start_idx_inclusive, effective_end_idx);
 
         tracing::debug!(
-            "[get_elements_between_markers] Returning {} elements",
-            result.len()
+            start = start_idx_inclusive,
+            end = effective_end_idx,
+            elements = result.len(),
+            "between_markers: resolved marker ids to a document-order slice"
         );
         result
     }

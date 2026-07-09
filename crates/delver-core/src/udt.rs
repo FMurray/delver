@@ -195,6 +195,7 @@ pub fn extract_typed_records(table: &TableStructure, ty: &TableTypeDef) -> Typed
             }
         }
     }
+    let header_claimed: Vec<bool> = mapping.iter().map(|slot| slot.is_some()).collect();
     let mut next_col = 0usize;
     for slot in mapping.iter_mut() {
         if slot.is_some() {
@@ -208,6 +209,32 @@ pub fn extract_typed_records(table: &TableStructure, ty: &TableTypeDef) -> Typed
             *slot = Some(next_col);
         }
     }
+
+    // Narrate the column mapping (D-027): which grid column each declared
+    // field ended up bound to, and whether the header fuzzy-match or the
+    // positional fallback claimed it.
+    tracing::debug!(
+        type_name = %ty.name,
+        n_cols,
+        filler_cols = filler.iter().filter(|f| **f).count(),
+        header_row = first_header_row.is_some(),
+        mapping = ?ty
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(fi, field)| match mapping[fi] {
+                Some(col) => format!(
+                    "{} -> col {} ({}, header {:?})",
+                    field.name,
+                    col,
+                    if header_claimed[fi] { "header-match" } else { "positional" },
+                    header_texts.get(col).map(String::as_str).unwrap_or("")
+                ),
+                None => format!("{} -> UNMAPPED (null in every record)", field.name),
+            })
+            .collect::<Vec<_>>(),
+        "typed_table: columns mapped to declared fields"
+    );
 
     let mut out = TypedExtraction {
         records: Vec::with_capacity(body.len()),

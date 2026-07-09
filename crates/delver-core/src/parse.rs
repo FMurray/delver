@@ -654,7 +654,10 @@ fn collect_text_glyphs(
     Ok(())
 }
 
-#[tracing::instrument(skip(fragments))]
+// Per-text-run span: trace level so the default --trace filter's
+// `delver_core::parse=info` directive keeps the semantic phase spans without
+// the firehose (D-027); opt in with RUST_LOG=delver_core::parse=trace.
+#[tracing::instrument(level = "trace", skip_all)]
 fn finalize_text_run(
     tos: &mut TextObjectState,
     ts: &TextState,
@@ -1097,7 +1100,11 @@ impl<'a> PageObjects<'a> {
     }
 }
 
+// Per-content-stream-operator span (millions on a real filing): trace level
+// so the default --trace filter's `delver_core::parse=info` directive gates
+// it (D-027); opt in with RUST_LOG=delver_core::parse=trace.
 #[tracing::instrument(
+    level = "trace",
     skip_all,
     fields(
         operator = %op.operator,
@@ -2058,17 +2065,68 @@ impl ParsedDocument {
 /// Info-dict metadata. This is the full-parse entry point used by both the
 /// fresh-query pipeline and store ingest, so the two stay element-identical.
 pub fn parse_document(doc: &Document) -> Result<ParsedDocument, Error> {
-    let mut pages = get_page_content(doc)?;
+    let _parse_span = tracing::info_span!("parse").entered();
+
+    let mut pages = {
+        let _span = tracing::info_span!("content_stream").entered();
+        let pages = get_page_content(doc)?;
+        // Pages walk in parallel (rayon), so per-phase narration happens
+        // here on the calling thread, after the join (D-027).
+        if tracing::enabled!(tracing::Level::INFO) {
+            let mut texts = 0usize;
+            let mut images = 0usize;
+            let mut aux_by_kind: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for contents in pages.values() {
+                texts += contents.text_store.id.len();
+                images += contents.image_store.id.len();
+                for aux in contents.aux_store.iter() {
+                    *aux_by_kind.entry(format!("{:?}", aux.kind)).or_insert(0) += 1;
+                }
+            }
+            tracing::info!(
+                pages = pages.len(),
+                texts,
+                images,
+                aux_by_kind = ?aux_by_kind,
+                "content-stream walk done: glyph runs grouped into row elements, paths captured, tables detected"
+            );
+        }
+        pages
+    };
+
     let mut refs = Vec::new();
-    detect_figures(&mut pages, &mut refs);
-    extract_embedded_files(doc, &mut pages);
+    {
+        let _span = tracing::info_span!("figures").entered();
+        detect_figures(&mut pages, &mut refs);
+        tracing::info!(
+            ref_edges = refs.len(),
+            "figure grouping done (image + adjacent caption line, D-016)"
+        );
+    }
+    {
+        let _span = tracing::info_span!("embedded_files").entered();
+        extract_embedded_files(doc, &mut pages);
+    }
 
     // Scanned-PDF classification (slice P1): per-page classes plus the
     // document aggregate, persisted under metadata "scan". Computed from the
     // walk signals already sitting on each page.
     let mut metadata = document_info_metadata(doc);
     let (producer, creator) = document_producer_creator(doc);
-    let scan = crate::scan::classify_document(&pages, producer, creator);
+    let scan = {
+        let _span = tracing::info_span!("scan_classify").entered();
+        let scan = crate::scan::classify_document(&pages, producer, creator);
+        tracing::info!(
+            class = %scan.class,
+            scanned_page_ratio = scan.scanned_page_ratio,
+            confidence = scan.confidence,
+            producer_hint = ?scan.producer_hint,
+            pages = scan.pages.len(),
+            "scan classification: per-doc verdict from image coverage + visible/invisible glyph counts"
+        );
+        scan
+    };
     if let (Some(map), Ok(value)) = (metadata.as_object_mut(), serde_json::to_value(&scan)) {
         map.insert("scan".to_string(), value);
     }

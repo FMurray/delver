@@ -5,7 +5,7 @@ use crate::provenance::{OutputProvenance, SectionSpan};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use image;
-use log::{error, info, warn};
+use log::{error, warn};
 use lopdf::Object;
 use pest::iterators::Pair;
 use pest::Parser as PestParser;
@@ -531,7 +531,7 @@ impl Value {
 }
 
 pub fn parse_template(template_str: &str) -> Result<Root, Error> {
-    info!("Parsing template: {}", template_str);
+    let _span = tracing::info_span!("compile_template", bytes = template_str.len()).entered();
     let pairs = match TemplateParser::parse(Rule::template, template_str) {
         Ok(mut pairs) => pairs.next().unwrap(),
         Err(e) => {
@@ -554,6 +554,18 @@ pub fn parse_template(template_str: &str) -> Result<Root, Error> {
     resolve_table_types(&mut root.elements, &root.types)?;
     resolve_chunk_templates(&mut root.elements, &root.sub_corpora)?;
     compile_match_configs(&mut root.elements)?;
+    tracing::info!(
+        top_level_elements = root.elements.len(),
+        element_names = ?root
+            .elements
+            .iter()
+            .map(|e| format!("{:?} '{}'", e.element_type, e.name))
+            .collect::<Vec<_>>(),
+        match_definitions = root.match_definitions.len(),
+        types = ?root.types.keys().collect::<Vec<_>>(),
+        sub_corpora = ?root.sub_corpora.keys().collect::<Vec<_>>(),
+        "template compiled: match clauses validated, regexes cached, TYPEs resolved"
+    );
     Ok(root)
 }
 
@@ -1883,7 +1895,11 @@ fn process_matched_content_recursive(
                         &order_by_id,
                         section,
                     )?;
-                    tracing::debug!("chunk outputs: {:?}", chunk_outputs);
+                    tracing::debug!(
+                        element = %match_item.template_element.name,
+                        outputs = chunk_outputs.len(),
+                        "collate: chunk outputs appended"
+                    );
                     for (chunk_output, chunk_provenance) in chunk_outputs {
                         sink.push(ProcessedOutput::Text(chunk_output), chunk_provenance);
                     }
@@ -2266,6 +2282,17 @@ fn process_table_element_simple(
         None => (None, None),
     };
 
+    tracing::debug!(
+        name = %name,
+        page = table.page,
+        n_rows = table.n_rows,
+        n_cols = table.n_cols,
+        strategy = ?table.strategy,
+        confidence = table.confidence,
+        parent = ?parent_name,
+        "collate: table output (structural, untyped) — deferred to array tail (D-018)"
+    );
+
     ProcessedOutput::Table(TableOutput {
         name,
         page: table.page,
@@ -2303,6 +2330,15 @@ fn process_typed_table_element(
     parent_info: Option<(String, usize)>,
 ) -> ProcessedOutput {
     let extraction = crate::udt::extract_typed_records(table, type_def);
+    tracing::info!(
+        type_name = %type_def.name,
+        page = table.page,
+        records = extraction.records.len(),
+        coerced_ok = extraction.coerced_ok,
+        coerced_err = extraction.coerced_err,
+        coercion_errors = extraction.errors.len(),
+        "typed_table: grid coerced into typed records (D-021)"
+    );
 
     let mut json_metadata: HashMap<String, serde_json::Value> = metadata
         .iter()
@@ -2567,6 +2603,17 @@ fn process_text_chunk_elements_simple(
             })?,
     };
 
+    let _span = tracing::info_span!(
+        "chunk",
+        element = %template_element.name,
+        method = ?method,
+        chunk_size,
+        chunk_overlap,
+        source_elements = elements.len(),
+        tokenizer = tokenizer.is_some(),
+    )
+    .entered();
+
     // template="..." interpolation (Stage C, D-022, TextChunk only):
     // SubCorpus {name} placeholders were already substituted at template
     // compile, so the only chunk-time variable left is {text}.
@@ -2652,6 +2699,15 @@ fn process_text_chunk_elements_simple(
             .collect()
         }
     };
+
+    tracing::info!(
+        chunks = chunks.len(),
+        segments = chunks
+            .iter()
+            .filter_map(|(_, segments)| *segments)
+            .sum::<usize>(),
+        "chunk: contiguous element slices formed"
+    );
 
     // -------- 4. Extract parent information --------
     let (parent_name, parent_index) = if let Some((name, index)) = parent_info {

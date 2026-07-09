@@ -183,8 +183,9 @@ fn align_template_with_content_with_depth<'a>(
     }
 
     tracing::debug!(
-        "align_template_with_content_with_depth: {:?}",
-        template_elements
+        depth = recursion_depth,
+        template_elements = template_elements.len(),
+        "align: matching template elements against the index"
     );
 
     // Recursion depth guard
@@ -226,9 +227,9 @@ fn align_template_with_content_with_depth<'a>(
                     .unwrap_or(index.doc_len());
 
                 tracing::debug!(
-                    "MATCHER: Processing children within section boundaries {} to {}",
                     start_idx,
-                    end_idx
+                    end_idx,
+                    "align: children constrained to parent section partition"
                 );
                 (start_idx, end_idx)
             } else {
@@ -249,7 +250,15 @@ fn align_template_with_content_with_depth<'a>(
 
     for template_element in template_elements {
         if template_element.element_type == ElementType::Section {
-            tracing::debug!("  PASS 1: Processing Section '{:#?}'", template_element);
+            // One `pass1` span per Section: the start/end boundary search,
+            // candidate scoring, and (for matched sections) the recursive
+            // child alignment all nest under it (D-027).
+            let _pass1_span = tracing::info_span!(
+                "pass1",
+                section = %template_element.name,
+                depth = recursion_depth
+            )
+            .entered();
 
             // Determine which context to pass: previous sibling for most sections,
             // but for the *last* section pass the parent so it can inherit the
@@ -319,11 +328,6 @@ fn align_template_with_content_with_depth<'a>(
                 recursion_depth,
                 diagnostics,
             )? {
-                tracing::debug!(
-                    "  PASS 1: Found Section '{}' boundaries",
-                    template_element.name
-                );
-
                 // Extract partition boundaries and update position tracking
                 if let Some(boundaries) = &section_match.section_boundaries {
                     let start_idx = index
@@ -338,6 +342,14 @@ fn align_template_with_content_with_depth<'a>(
                         .unwrap_or(max_content_boundary); // Use max_content_boundary instead of full document
                                                           // The section partition includes content UP TO but NOT INCLUDING the end marker
                                                           // TextChunks after sections should start AFTER the end marker
+                    tracing::info!(
+                        section = %template_element.name,
+                        start_idx,
+                        end_idx,
+                        start_page = boundaries.start_marker.page_number(),
+                        end_page = boundaries.end_marker.as_ref().map(|e| e.page_number()),
+                        "pass1: section matched — content partition claimed"
+                    );
                     content_partitions.push((start_idx, end_idx));
 
                     // Update position tracking to prevent backtracking
@@ -345,6 +357,12 @@ fn align_template_with_content_with_depth<'a>(
                 }
 
                 section_matches.push(section_match);
+            } else {
+                tracing::info!(
+                    section = %template_element.name,
+                    "pass1: section matched nothing — it contributes no partition \
+                     (near-miss diagnostics recorded when a match config missed)"
+                );
             }
         }
     }
@@ -353,14 +371,15 @@ fn align_template_with_content_with_depth<'a>(
     // to appropriate content partitions
     let mut pass2_matches = Vec::new();
 
+    // One `pass2` span per alignment level, only when the template actually
+    // has pass-2 elements (D-027).
+    let _pass2_span = template_elements
+        .iter()
+        .any(|e| is_pass2_element(&e.element_type))
+        .then(|| tracing::info_span!("pass2", depth = recursion_depth).entered());
+
     for (template_idx, template_element) in template_elements.iter().enumerate() {
         if is_pass2_element(&template_element.element_type) {
-            tracing::debug!(
-                "  PASS 2: Processing {:?} '{}' (template order: {})",
-                template_element.element_type,
-                template_element.name,
-                template_idx
-            );
 
             // Determine which content partition this TextChunk should process
             let (content_start, content_end) = if content_partitions.is_empty() {
@@ -377,10 +396,10 @@ fn align_template_with_content_with_depth<'a>(
                         // TextChunk comes before first section - process content before first section
                         let first_partition_start = content_partitions[0].0;
                         tracing::debug!(
-                            "    '{}' processes content BEFORE first section: {} to {}",
-                            template_element.name,
-                            start_search_index,
-                            first_partition_start
+                            element = %template_element.name,
+                            range_start = start_search_index,
+                            range_end = first_partition_start,
+                            "pass2: element declared before the first section — routed to the pre-section slice"
                         );
                         (start_search_index, first_partition_start)
                     } else {
@@ -397,10 +416,10 @@ fn align_template_with_content_with_depth<'a>(
                                 last_partition_end
                             };
                         tracing::debug!(
-                            "    '{}' processes content AFTER sections: {} to {}",
-                            template_element.name,
-                            content_start_after_section,
-                            max_content_boundary
+                            element = %template_element.name,
+                            range_start = content_start_after_section,
+                            range_end = max_content_boundary,
+                            "pass2: element declared after sections — routed to the post-section slice"
                         );
                         (content_start_after_section, max_content_boundary)
                     }
@@ -451,10 +470,23 @@ fn align_template_with_content_with_depth<'a>(
             };
 
             if let Some(pass2_match) = pass2_match {
-                tracing::debug!("    SUCCESS: Matched '{}'", template_element.name);
+                tracing::info!(
+                    element = %template_element.name,
+                    kind = ?template_element.element_type,
+                    range_start = content_start,
+                    range_end = content_end,
+                    assigned = pass2_match.matched_content.len(),
+                    "pass2: content assigned"
+                );
                 pass2_matches.push(pass2_match);
             } else {
-                tracing::debug!("    FAILURE: No match for '{}'", template_element.name);
+                tracing::info!(
+                    element = %template_element.name,
+                    kind = ?template_element.element_type,
+                    range_start = content_start,
+                    range_end = content_end,
+                    "pass2: no matching content in the assigned slice"
+                );
             }
         }
     }
@@ -566,6 +598,14 @@ fn match_section<'a, 'map_lt>(
         return Ok(None);
     };
     let start_marker: &PageContent = &selected_start_candidate.content;
+    tracing::info!(
+        text = %crate::trace_preview(start_marker.text().unwrap_or(""), 80),
+        page = start_marker.page_number(),
+        score = selected_start_candidate.score,
+        reasons = ?selected_start_candidate.reasons,
+        ranked_candidates = start_candidates.len(),
+        "start_boundary: winner (best-scored candidate)"
+    );
 
     // 2. Find end boundary candidates
     let end_candidates_opt = find_end_boundary_candidates(
@@ -584,20 +624,40 @@ fn match_section<'a, 'map_lt>(
     //      fall back to the parent's end marker (so the last child
     //      runs until the parent boundary).
     //   c) if still none, use document end or next natural boundary
-    let end_marker_option: Option<&PageContent> = end_candidates_opt
-        .as_ref()
-        .and_then(|v| v.first())
-        .map(|c| &c.content)
-        .or_else(|| {
-            prev_match_for_context
+    //
+    // `end_path` records which of those branches actually resolved the
+    // boundary — the trace vocabulary's `end_boundary: resolved` event
+    // narrates it (D-027). Selection logic is unchanged.
+    let mut end_path = "document_end";
+    let best_end_candidate = end_candidates_opt.as_ref().and_then(|v| v.first());
+    let end_marker_option: Option<&PageContent> = match best_end_candidate {
+        Some(candidate) => {
+            end_path = if candidate
+                .reasons
+                .iter()
+                .any(|reason| reason == "Explicit end marker")
+            {
+                "explicit_end_match"
+            } else {
+                "style_similarity"
+            };
+            Some(&candidate.content)
+        }
+        None => {
+            let parent_end = prev_match_for_context
                 .and_then(|parent| parent.section_boundaries.as_ref())
                 .and_then(|sb| sb.end_marker.as_ref())
                 .and_then(|end| {
                     let start_idx = index.element_id_to_index[&start_marker.id()];
                     let end_idx = index.element_id_to_index[&end.id()];
                     (end_idx > start_idx).then_some(end)
-                })
-        });
+                });
+            if parent_end.is_some() {
+                end_path = "parent_end_marker";
+            }
+            parent_end
+        }
+    };
 
     // If we still have no end marker, create a virtual end marker at document end
     // or find the next significant element that could serve as a natural boundary
@@ -624,6 +684,7 @@ fn match_section<'a, 'map_lt>(
                 if let PageContent::Text(start_text) = start_marker {
                     // If next element has similar font size, use it as boundary
                     if (next_text.font_size - start_text.font_size).abs() < 2.0 {
+                        end_path = "next_similar_font";
                         Some(next_content.clone())
                     } else {
                         None // No similar element found, section extends to document end
@@ -638,6 +699,19 @@ fn match_section<'a, 'map_lt>(
             None // No more content, section extends to document end
         }
     };
+
+    match &end_marker_final {
+        Some(end) => tracing::info!(
+            path = end_path,
+            text = %crate::trace_preview(end.text().unwrap_or(""), 80),
+            page = end.page_number(),
+            "end_boundary: resolved"
+        ),
+        None => tracing::info!(
+            path = end_path,
+            "end_boundary: none found — section extends to the document end"
+        ),
+    }
 
     let section_content_handles = extract_section_content_handles(
         page_map_view,
@@ -786,6 +860,16 @@ fn record_match_miss(
         .map(|c| (c.pattern.clone(), c.threshold))
         .unwrap_or_else(|| (config.pattern.clone(), config.threshold));
 
+    tracing::info!(
+        match_name = %match_owner(template, config),
+        pattern = %crate::trace_preview(&pattern, 80),
+        threshold,
+        near_misses = ?near_misses
+            .iter()
+            .map(|nm| format!("{:.3} p{} {:?}", nm.score, nm.page, crate::trace_preview(&nm.text, 40)))
+            .collect::<Vec<_>>(),
+        "match_miss: zero candidates at threshold — closest rescue-scored candidates"
+    );
     diagnostics.record(MatchMiss {
         match_name: match_owner(template, config),
         pattern,
@@ -805,7 +889,15 @@ fn find_start_boundary_candidates<'a>(
 ) -> Result<Option<Vec<BoundaryCandidate>>> {
     let mut candidates = Vec::new();
 
-    tracing::debug!("[find_start_boundary_candidates] Template: {}, Match pattern: '{}', Threshold: {}, Start index: {}", template.name, match_config.pattern, match_config.threshold, start_index);
+    let _span = tracing::info_span!(
+        "start_boundary",
+        matcher = ?match_config.match_type,
+        pattern = %crate::trace_preview(&match_config.pattern, 80),
+        threshold = match_config.threshold,
+        start_index,
+        max_index = max_search_index,
+    )
+    .entered();
     // 1. Match-config candidates (Text/Regex/Heuristic/EmbeddingSim/FirstMatch)
     let text_matches = find_config_matches(
         index,
@@ -814,10 +906,6 @@ fn find_start_boundary_candidates<'a>(
         start_index,
         max_search_index,
     )?;
-    tracing::debug!(
-        "[find_start_boundary_candidates] Match-config candidates found: {}",
-        text_matches.len()
-    );
 
     for (text_handle, score) in text_matches {
         let txt_ref = index.text(text_handle);
@@ -829,20 +917,26 @@ fn find_start_boundary_candidates<'a>(
             bbox: txt_ref.bbox,
             page_number: txt_ref.page_number,
         });
-        candidates.push(score_candidate(
-            &element, index, template, score, prev_match,
-        ));
+        let candidate = score_candidate(&element, index, template, score, prev_match);
+        // One event per candidate the matcher considered: the matcher's raw
+        // confidence (`base_score`), the boundary bonuses it earned
+        // (`reasons`), and the final rank score (D-027).
+        tracing::debug!(
+            score = candidate.score,
+            base_score = score,
+            page = candidate.content.page_number(),
+            text = %crate::trace_preview(candidate.content.text().unwrap_or(""), 60),
+            reasons = ?candidate.reasons,
+            "boundary_candidate"
+        );
+        candidates.push(candidate);
     }
 
     if candidates.is_empty() {
-        tracing::debug!("[find_start_boundary_candidates] No candidates found. Returning None.");
+        tracing::debug!("start_boundary: zero candidates at threshold — section cannot match here");
         Ok(None)
     } else {
         candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        tracing::debug!(
-            "[find_start_boundary_candidates] Returning {} sorted candidates.",
-            candidates.len()
-        );
         Ok(Some(candidates))
     }
 }
@@ -860,6 +954,13 @@ fn find_end_boundary_candidates<'a>(
     diagnostics: &mut RunDiagnostics,
 ) -> Result<Option<Vec<BoundaryCandidate>>> {
     let mut candidates = Vec::new();
+
+    let _span = tracing::info_span!(
+        "end_boundary",
+        explicit_end_match = template.end_match_config.is_some(),
+        start_page = start_content.page_number(),
+    )
+    .entered();
 
     // Get the start marker's index so we can search after it
     let start_marker_index = index.element_id_to_index.get(&start_content.id()).copied();
@@ -879,6 +980,13 @@ fn find_end_boundary_candidates<'a>(
         if end_text_matches.is_empty() {
             // The explicit end marker missed entirely; the section will fall
             // back to a parent/natural boundary. Surface why (D-024).
+            tracing::info!(
+                pattern = %crate::trace_preview(&config.pattern, 80),
+                threshold = config.threshold,
+                "end_boundary: explicit end_match found NOTHING — near-miss \
+                 diagnostics recorded; falling back (parent boundary / style \
+                 similarity / document end)"
+            );
             record_match_miss(diagnostics, index, template, config, search_start_index, None);
         }
         for (text_handle, score) in end_text_matches {
@@ -897,10 +1005,21 @@ fn find_end_boundary_candidates<'a>(
             bc.score += 0.5; // Moderate boost to prioritize explicit markers while allowing high-similarity competition
             bc.reasons.push("Explicit end marker".to_string());
 
+            tracing::debug!(
+                source = "explicit_end_match",
+                score = bc.score,
+                base_score = score,
+                page = bc.content.page_number(),
+                text = %crate::trace_preview(bc.content.text().unwrap_or(""), 60),
+                reasons = ?bc.reasons,
+                "boundary_candidate"
+            );
             candidates.push(bc);
         }
     } else {
-        tracing::debug!("[find_end_boundary_candidates] No 'end_match' attribute key found in template attributes.");
+        tracing::debug!(
+            "end_boundary: no end_match declared — style-similarity candidates only"
+        );
         // If no end_match is specified, we might want a default behavior,
         // for example, consider all elements after start_content on the same page,
         // or up to the start of a *next* identifiable section if one exists soon.
@@ -966,6 +1085,14 @@ fn find_end_boundary_candidates<'a>(
                         .reasons
                         .push(format!("Top‑k similarity {:.2}", sim));
                 } else {
+                    tracing::debug!(
+                        source = "style_similarity",
+                        score = 0.1 * sim,
+                        similarity = sim,
+                        page = pc.page_number(),
+                        text = %crate::trace_preview(pc.text().unwrap_or(""), 60),
+                        "boundary_candidate"
+                    );
                     // Similarity-only matches get much lower base scores to ensure explicit markers rank higher
                     candidates.push(BoundaryCandidate {
                         content: pc,
@@ -1200,6 +1327,17 @@ fn find_embedding_matches(
         return Ok(Vec::new());
     }
 
+    // Endpoint identity comes from the caller's --embed-endpoint/env (the
+    // template's endpoint= is only a hint, D-014); tokens are never logged.
+    let _span = tracing::info_span!(
+        "embed_match",
+        owner = %owner,
+        query = %crate::trace_preview(&config.pattern, 60),
+        threshold = config.threshold,
+        candidates = handles.len(),
+    )
+    .entered();
+
     let query_vec = embedder
         .embed(&[&config.pattern])
         .map_err(|e| anyhow!("match '{owner}': embedding the query failed: {e}"))?
@@ -1208,6 +1346,10 @@ fn find_embedding_matches(
         .ok_or_else(|| anyhow!("match '{owner}': embedder returned no vector for the query"))?;
 
     let texts: Vec<&str> = handles.iter().map(|h| index.text(*h).text).collect();
+    tracing::debug!(
+        batch = texts.len(),
+        "embed_match: embedding scoped candidates as one batch"
+    );
     let vectors = embedder
         .embed(&texts)
         .map_err(|e| anyhow!("match '{owner}': embedding {} candidates failed: {e}", texts.len()))?;
@@ -1391,10 +1533,10 @@ fn match_aux_kind_with_boundaries<'a>(
 
     if matched.is_empty() {
         tracing::debug!(
-            "[match_aux_kind_with_boundaries] No {:?} content in [{}, {})",
-            kind,
-            content_start_idx,
-            content_end_idx
+            kind = ?kind,
+            range_start = content_start_idx,
+            range_end = content_end_idx,
+            "pass2: no aux elements of this kind in the slice"
         );
         return None;
     }
@@ -1430,7 +1572,7 @@ fn match_text_chunk_with_boundaries<'a>(
     }
 
     if !has_text_content {
-        tracing::debug!("[match_text_chunk_with_boundaries] No text content found");
+        tracing::debug!("pass2: no text content in the slice");
         return None;
     }
 
@@ -1533,14 +1675,14 @@ pub fn extract_section_content_handles<'a>(
 ) -> Vec<ContentHandle> {
     // Debugging output
     let describe = |content: &PageContent| match content {
-        PageContent::Text(t) => format!("Text('{}', ID: {})", t.text, t.id),
+        PageContent::Text(t) => format!("Text('{}')", crate::trace_preview(&t.text, 60)),
         PageContent::Image(i) => format!("Image(ID: {})", i.id),
         PageContent::Aux(a) => format!("Aux({:?}, ID: {})", a.kind, a.id),
     };
     tracing::debug!(
-        "[extract_section_content] Start: {}, End: {}",
-        describe(start_marker),
-        end_marker_option.map_or("None".to_string(), describe)
+        start = %describe(start_marker),
+        end = %end_marker_option.map_or("document end".to_string(), describe),
+        "section content slice"
     );
 
     // Get the start and end indices in the document

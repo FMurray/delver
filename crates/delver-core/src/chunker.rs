@@ -276,6 +276,10 @@ pub fn chunk_semantic<'a>(
         })
         .collect();
     let seg_text_refs: Vec<&str> = seg_texts.iter().map(String::as_str).collect();
+    tracing::debug!(
+        batch = seg_text_refs.len(),
+        "semantic chunking: embedding all sentence-ish segments as one batch (D-020)"
+    );
     let vectors = embedder.embed(&seg_text_refs)?;
     if vectors.len() != n_seg {
         return Err(EmbedError(format!(

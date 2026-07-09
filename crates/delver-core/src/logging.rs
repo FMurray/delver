@@ -366,6 +366,39 @@ struct SpanData {
 use std::sync::atomic::{AtomicUsize, Ordering};
 static EVENT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Target predicate of the `process` debug-capture pathway. Public so the
+/// composed trace setup (D-027) applies the exact same gate as
+/// [`init_debug_logging`] — including its historical stdout prints for the
+/// explicitly-allowed targets.
+pub fn debug_capture_target_filter(metadata: &tracing::Metadata<'_>) -> bool {
+    let target = metadata.target();
+
+    if target.contains("matcher_operations")
+        || target.contains("template_match")
+        || target.contains("logging")
+    {
+        println!("LOGGING: Allowing event with target: {}", target);
+        return true;
+    }
+
+    // Filter other targets as needed
+    target.starts_with("delver_pdf") || target.contains("pdf") || target.contains("template")
+}
+
+/// The `process` DebugDataStore capture layer with its target filter attached
+/// per-layer, so it composes with the T1 trace layers (tree/JSON/OTLP)
+/// without gating them (D-027). [`init_debug_logging`] routes through this;
+/// with the capture layer as the only layer, per-layer filtering is
+/// observationally identical to the previous registry-global filter.
+pub fn debug_capture_layer<S>(store: DebugDataStore) -> impl Layer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    DebugLayer::new(store).with_filter(tracing_subscriber::filter::filter_fn(
+        debug_capture_target_filter,
+    ))
+}
+
 pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
     // Reset counter for this session
     EVENT_COUNTER.store(0, Ordering::SeqCst);
@@ -373,32 +406,11 @@ pub fn init_debug_logging(store: DebugDataStore) -> WorkerGuard {
     // Print debug information
     println!("LOGGING: Initializing debug logging system");
 
-    // Create a debug layer with the store
-    let debug_layer = DebugLayer::new(store);
-
     // Create a non-blocking file appender to get the WorkerGuard
     let (_non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
 
-    // Create a filter that explicitly allows our targets
-    let filter = tracing_subscriber::filter::filter_fn(|metadata| {
-        let target = metadata.target();
-
-        if target.contains("matcher_operations")
-            || target.contains("template_match")
-            || target.contains("logging")
-        {
-            println!("LOGGING: Allowing event with target: {}", target);
-            return true;
-        }
-
-        // Filter other targets as needed
-        target.starts_with("delver_pdf") || target.contains("pdf") || target.contains("template")
-    });
-
-    // Install the subscriber
-    let subscriber = tracing_subscriber::registry()
-        .with(debug_layer)
-        .with(filter);
+    // Install the subscriber (debug capture layer + its target filter)
+    let subscriber = tracing_subscriber::registry().with(debug_capture_layer(store));
 
     println!("LOGGING: Setting global default subscriber");
 

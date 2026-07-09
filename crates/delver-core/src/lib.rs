@@ -17,6 +17,19 @@ pub mod udt;
 
 use crate::diagnostics::RunDiagnostics;
 use crate::docql::{parse_template, process_matched_content_with_provenance, ProcessedOutput, Root};
+
+/// Char-safe truncation for trace/span fields (D-027): keeps trace output
+/// line-grained where element text can be row-length. Only evaluated when a
+/// subscriber has the emitting callsite enabled.
+pub(crate) fn trace_preview(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let cut: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{cut}…")
+    } else {
+        cut
+    }
+}
 use crate::layout::{group_text_into_lines_and_blocks, MatchContext, TextBlock};
 use crate::matcher::align_template_with_content_diag;
 use crate::parse::{get_refs, parse_document, PageContents, TextElement};
@@ -168,17 +181,30 @@ fn run_template(
     let mut all_outputs: Vec<ProcessedOutput> = Vec::new();
     let mut provenance = RunProvenance::default();
 
-    let index = PdfIndex::new(pages_map, match_context);
+    let index = {
+        let _span = tracing::info_span!("build_index").entered();
+        let index = PdfIndex::new(pages_map, match_context);
+        tracing::info!(
+            elements = index.doc_len(),
+            pages = index.by_page.len(),
+            "in-memory PdfIndex built (document order + style buckets + rtree)"
+        );
+        index
+    };
 
-    if let Some(matched_content) =
+    let matched = {
+        let _span = tracing::info_span!("match_template").entered();
         align_template_with_content_diag(&dom.elements, &index, None, None, diagnostics)?
-    {
+    };
+    if let Some(matched_content) = matched {
+        let _span = tracing::info_span!("collate").entered();
         let (outputs, sidecar) =
             process_matched_content_with_provenance(&matched_content, &index, tokenizer)?;
         all_outputs.extend(outputs);
         provenance.outputs.extend(sidecar);
     }
 
+    tracing::info!(outputs = all_outputs.len(), "template outputs assembled");
     let json = serde_json::to_string_pretty(&all_outputs)?;
     Ok((json, provenance))
 }
