@@ -42,9 +42,11 @@ if [ ! -x "$bin" ]; then
     echo "Downloading ${base}/${name}.tar.gz"
     curl -fSL --retry 3 -o "$tmp/${name}.tar.gz" "${base}/${name}.tar.gz"
     curl -fsSL --retry 3 -o "$tmp/${name}.sha256sum.txt" "${base}/${name}.sha256sum.txt"
-    (cd "$tmp" && shasum -a 256 -c "${name}.sha256sum.txt" >/dev/null) \
-        || { echo "sha256 verification FAILED for ${name}.tar.gz" >&2; exit 1; }
+    # The release .sha256sum.txt lists the EXTRACTED file paths, not the
+    # tarball — extract first, then verify from the same directory.
     tar -xzf "$tmp/${name}.tar.gz" -C "$tmp"
+    (cd "$tmp" && shasum -a 256 -c "${name}.sha256sum.txt" >/dev/null) \
+        || { echo "sha256 verification FAILED for ${name} contents" >&2; exit 1; }
     mv "$tmp/${name}/jaeger" "$bin"
     chmod +x "$bin"
     echo "Installed $bin"
