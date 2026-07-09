@@ -11,6 +11,8 @@ lopdf = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "rt", "macros"] }
+# End-to-end execution tracing (D-027); already Cargo.lock-pinned.
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 
 # Store-specific deps (not in the workspace table)

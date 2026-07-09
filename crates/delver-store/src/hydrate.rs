@@ -19,6 +19,7 @@ use lopdf::{dictionary, Object, Stream};
 use crate::types::{ElementKind, ElementRow};
 
 /// Rebuild the per-page content map from stored rows.
+#[tracing::instrument(name = "hydrate", skip_all, fields(rows = rows.len()))]
 pub fn hydrate_pages(rows: &[ElementRow]) -> BTreeMap<u32, PageContents> {
     // Defensive: rows are stored/loaded ordered by order_idx, but hydration
     // correctness depends on it, so sort rather than assume.
@@ -80,6 +81,10 @@ pub fn hydrate_pages(rows: &[ElementRow]) -> BTreeMap<u32, PageContents> {
             }),
         }
     }
+    tracing::info!(
+        pages = pages.len(),
+        "hydrate: stored rows rebuilt into the fresh-parse page shape — no detection re-runs (D-011/D-016/D-018)"
+    );
     pages
 }
 

@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 
+use tracing::Instrument;
+
 use crate::error::StoreError;
 use crate::types::{
     BlobRow, CorpusId, DocumentId, ElementId, ElementKind, ElementRow, ImagePayload, IngestOutcome,
@@ -50,9 +52,32 @@ pub struct DelverStore {
     pool: PgPool,
 }
 
+/// Database URL with any userinfo password replaced by `***` — safe for
+/// trace fields (D-027: never log secrets).
+fn redact_db_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end + 3..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return url.to_string();
+    };
+    match rest[..at].find(':') {
+        Some(colon) => format!(
+            "{}{}:***{}",
+            &url[..scheme_end + 3],
+            &rest[..colon],
+            &rest[at..]
+        ),
+        None => url.to_string(),
+    }
+}
+
 impl DelverStore {
     /// Connect to Postgres, run embedded migrations, and record schema/build
     /// metadata in `index_meta`.
+    #[tracing::instrument(name = "connect", skip_all, fields(url = %redact_db_url(url)))]
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(8)
@@ -61,6 +86,7 @@ impl DelverStore {
             .await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;
+        tracing::debug!(schema_version = SCHEMA_VERSION, "migrations applied");
 
         sqlx::query(
             "INSERT INTO index_meta (id, schema_version, delver_version) \
@@ -83,6 +109,7 @@ impl DelverStore {
     }
 
     /// Get-or-create a corpus by unique name.
+    #[tracing::instrument(name = "ensure_corpus", skip(self))]
     pub async fn ensure_corpus(&self, name: &str) -> Result<CorpusId, StoreError> {
         let id: CorpusId = sqlx::query_scalar(
             "INSERT INTO corpora (name) VALUES ($1) \
@@ -100,6 +127,11 @@ impl DelverStore {
     /// Idempotent per D-008: if (corpus, sha256(bytes), parse_version) already
     /// exists, returns the existing document with `created: false` without
     /// re-parsing or writing any rows.
+    #[tracing::instrument(
+        name = "ingest",
+        skip_all,
+        fields(corpus = ?corpus, bytes = pdf_bytes.len(), parse_version, parsed_by_caller = false)
+    )]
     pub async fn ingest_document(
         &self,
         corpus: CorpusId,
@@ -109,6 +141,10 @@ impl DelverStore {
     ) -> Result<IngestOutcome, StoreError> {
         let sha = sha256(pdf_bytes);
         if let Some(existing) = self.find_document(corpus, &sha, parse_version).await? {
+            tracing::info!(
+                document_id = %existing,
+                "ingest: dedup hit — identical bytes at this parse_version already stored (D-008); nothing re-parsed or written"
+            );
             return Ok(IngestOutcome {
                 document_id: existing,
                 created: false,
@@ -127,6 +163,11 @@ impl DelverStore {
     /// Persist an already-parsed document (same dedup contract as
     /// [`Self::ingest_document`]). Element ids from `parsed` are stored
     /// verbatim, so a hydrated index is id-identical to the caller's parse.
+    #[tracing::instrument(
+        name = "ingest",
+        skip_all,
+        fields(corpus = ?corpus, bytes = pdf_bytes.len(), parse_version, parsed_by_caller = true)
+    )]
     pub async fn ingest_parsed(
         &self,
         corpus: CorpusId,
@@ -137,6 +178,10 @@ impl DelverStore {
     ) -> Result<IngestOutcome, StoreError> {
         let sha = sha256(pdf_bytes);
         if let Some(existing) = self.find_document(corpus, &sha, parse_version).await? {
+            tracing::info!(
+                document_id = %existing,
+                "ingest: dedup hit — identical bytes at this parse_version already stored (D-008); nothing re-parsed or written"
+            );
             return Ok(IngestOutcome {
                 document_id: existing,
                 created: false,
@@ -147,6 +192,7 @@ impl DelverStore {
     }
 
     /// Number of element rows stored for a document (0 if the id is unknown).
+    #[tracing::instrument(name = "element_count", level = "debug", skip(self))]
     pub async fn element_count(&self, doc: DocumentId) -> Result<i64, StoreError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM elements WHERE document_id = $1")
             .bind(doc)
@@ -159,6 +205,7 @@ impl DelverStore {
     /// document order, and the document's ref edges (D-016). Unknown ids
     /// yield an empty `LoadedDocument` (callers treat no elements as
     /// "unknown or empty", matching the pre-slice contract).
+    #[tracing::instrument(name = "load_document", skip(self), fields(doc = %doc))]
     pub async fn load_document(&self, doc: DocumentId) -> Result<LoadedDocument, StoreError> {
         let metadata: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT metadata FROM documents WHERE id = $1")
@@ -173,6 +220,14 @@ impl DelverStore {
             .map(element_from_row)
             .collect::<Result<_, _>>()?;
         self.attach_table_cells(&mut elements).await?;
+        tracing::info!(
+            rows = elements.len(),
+            tables_with_cells = elements
+                .iter()
+                .filter(|e| e.table_cells.as_ref().map_or(false, |c| !c.is_empty()))
+                .count(),
+            "load_document: element rows fetched in order_idx order, table cells attached"
+        );
 
         let refs = sqlx::query(
             "SELECT r.from_element, r.to_element, r.kind, r.metadata \
@@ -215,14 +270,31 @@ impl DelverStore {
                 return self.text_search_filtered(corpus, query, limit, None).await
             }
             SearchScope::Document(doc) => {
-                let sql =
-                    format!("{SEARCH_PROJECTION} WHERE e.document_id = $1 AND {SEARCH_PREDICATE}");
-                sqlx::query(&sql)
-                    .bind(doc)
-                    .bind(query)
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await?
+                let span = tracing::info_span!(
+                    "text_search",
+                    scope = "document",
+                    doc = %doc,
+                    query,
+                    limit,
+                );
+                async {
+                    let sql = format!(
+                        "{SEARCH_PROJECTION} WHERE e.document_id = $1 AND {SEARCH_PREDICATE}"
+                    );
+                    let rows = sqlx::query(&sql)
+                        .bind(doc)
+                        .bind(query)
+                        .bind(limit)
+                        .fetch_all(&self.pool)
+                        .await?;
+                    tracing::info!(
+                        hits = rows.len(),
+                        "text_search: plainto_tsquery over elements.text_fts, ts_rank ordered"
+                    );
+                    Ok::<_, StoreError>(rows)
+                }
+                .instrument(span)
+                .await?
             }
         };
         rows.iter().map(search_hit_from_row).collect()
@@ -235,6 +307,11 @@ impl DelverStore {
     /// `{"partitions": {"state": "CA"}}` or `{"scan": {"class":
     /// "scanned_no_text"}}`. `None` is exactly [`Self::text_search`]
     /// corpus scope.
+    #[tracing::instrument(
+        name = "text_search",
+        skip_all,
+        fields(scope = "corpus", corpus = ?corpus, query, limit, filter = ?metadata_filter)
+    )]
     pub async fn text_search_filtered(
         &self,
         corpus: CorpusId,
@@ -255,6 +332,10 @@ impl DelverStore {
             .bind(metadata_filter)
             .fetch_all(&self.pool)
             .await?;
+        tracing::info!(
+            hits = rows.len(),
+            "text_search: plainto_tsquery over elements.text_fts, jsonb-containment partition filter, ts_rank ordered"
+        );
         rows.iter().map(search_hit_from_row).collect()
     }
 
@@ -262,6 +343,11 @@ impl DelverStore {
     /// `"partitions"` (Stage C, D-023). The whole `partitions` object is
     /// replaced (last `delver index` wins); other metadata keys are
     /// untouched. Unknown document ids are an error (D-006).
+    #[tracing::instrument(
+        name = "set_partitions",
+        skip_all,
+        fields(doc = %doc, partitions = %partitions)
+    )]
     pub async fn set_document_partitions(
         &self,
         doc: DocumentId,
@@ -289,6 +375,11 @@ impl DelverStore {
     /// `{"scan": {"class": ...}}`); `None` lists the whole corpus.
     /// Ordered by id so multi-document query output is deterministic
     /// (Stage C D-023, extended in slice P1).
+    #[tracing::instrument(
+        name = "documents_matching",
+        skip_all,
+        fields(corpus = ?corpus, filter = ?metadata_filter)
+    )]
     pub async fn documents_matching(
         &self,
         corpus: CorpusId,
@@ -304,6 +395,10 @@ impl DelverStore {
         .bind(metadata_filter)
         .fetch_all(&self.pool)
         .await?;
+        tracing::info!(
+            documents = ids.len(),
+            "documents_matching: jsonb containment over documents.metadata, ordered by id"
+        );
         Ok(ids)
     }
 
@@ -325,6 +420,11 @@ impl DelverStore {
     /// Elements on one page whose bbox overlaps the query rectangle
     /// (`bbox && box(...)`, GiST-indexed). Coordinates are top-left based,
     /// matching parsed element bboxes.
+    #[tracing::instrument(
+        name = "elements_in_bbox",
+        skip(self),
+        fields(doc = %doc)
+    )]
     pub async fn elements_in_bbox(
         &self,
         doc: DocumentId,
@@ -354,6 +454,10 @@ impl DelverStore {
             .map(element_from_row)
             .collect::<Result<_, _>>()?;
         self.attach_table_cells(&mut elements).await?;
+        tracing::info!(
+            rows = elements.len(),
+            "elements_in_bbox: GiST bbox-overlap hits on one page"
+        );
         Ok(elements)
     }
 
@@ -427,6 +531,11 @@ impl DelverStore {
         Ok(id)
     }
 
+    #[tracing::instrument(
+        name = "persist",
+        skip_all,
+        fields(page_count = parsed.page_count(), parse_version)
+    )]
     async fn insert_parsed(
         &self,
         corpus: CorpusId,
@@ -439,6 +548,28 @@ impl DelverStore {
         // (order_idx) and the per-row style keys we persist.
         let index = PdfIndex::new(&parsed.pages, &MatchContext::default());
         let flat = FlatElements::from_index(&index);
+
+        if tracing::enabled!(tracing::Level::INFO) {
+            let mut by_kind: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for kind in &flat.kinds {
+                *by_kind.entry(kind.as_str()).or_insert(0) += 1;
+            }
+            tracing::info!(
+                elements = flat.ids.len(),
+                by_kind = ?by_kind,
+                table_cells = flat.cell_table_ids.len(),
+                image_payloads = flat.image_ids.len(),
+                blobs = flat.blob_ids.len(),
+                ref_edges = parsed.refs.len(),
+                scan_class = parsed
+                    .metadata
+                    .get("scan")
+                    .and_then(|s| s.get("class"))
+                    .and_then(|v| v.as_str()),
+                "persist: element rows staged for UNNEST bulk insert (order_idx = global document order)"
+            );
+        }
 
         let mut tx = self.pool.begin().await?;
 
@@ -582,6 +713,10 @@ impl DelverStore {
         }
 
         tx.commit().await?;
+        tracing::info!(
+            document_id = %document_id,
+            "persist: transaction committed — document created"
+        );
 
         Ok(IngestOutcome {
             document_id,
