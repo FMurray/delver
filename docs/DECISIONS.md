@@ -631,3 +631,74 @@ Collation already holds them at assembly time; they are now threaded into a side
 - **Tests**: crates/delver-core/tests/provenance_sidecar.rs — index alignment, chunk source
   ids/pages against knowable synthetic ids, section name + span (heading page through table
   page), tail-deferred table entries keeping document order, sectionless top-level chunks.
+
+**D-027 · 2026-07-09 · Slice T1: end-to-end execution tracing (CLI → store → parse → match → collate), OTLP-first, default byte-exact off.**
+tracing-rs is back, and the traces narrate the SEMANTIC pipeline — which template compiled to
+what, which boundary candidates were considered at what score/bonus, which end-boundary path
+resolved (`explicit_end_match` | `style_similarity` | `parent_end_marker` | `next_similar_font`
+| `document_end`), what pass 2 assigned, what the store did. Full span vocabulary, activation
+matrix, and three annotated real traces: docs/TRACING.md.
+- **Span vocabulary over log lines**: stable span names (`cli.*` roots, `connect`, `ingest`,
+  `persist`, `load_document`, `hydrate`, `compile_template`, `build_index`, `match_template`,
+  `pass1`/`start_boundary`/`end_boundary`/`pass2`, `collate`, `chunk`, `embed_match`,
+  `text_search`, ...) with structured fields; per-candidate `boundary_candidate` events carry
+  score + base_score + page + reasons so a reader can see WHY a boundary won. The ~50 D-017
+  `tracing::debug!` call sites in matcher/search_index/docql were normalized into this
+  vocabulary (concise fields, char-truncated text previews — no more whole-template `{:?}`
+  dumps); `end_marker` selection in match_section was restructured (behavior-identically) to
+  RECORD which fallback branch fired. Store fns gained `#[tracing::instrument]` (skip_all +
+  explicit fields; `connect` logs a password-REDACTED url; embedder events log endpoint names,
+  never tokens).
+- **Activation & the default-off contract**: default = byte-exact pre-T1 behavior —
+  `index`/`query`/`search` install NO subscriber (stdout identical, stderr 0), `process` keeps
+  `init_debug_logging` verbatim. `--trace` (env `DELVER_TRACE=1`) exports OTLP; `--trace-stderr`
+  prints a tracing-tree hierarchy on stderr; `--trace-json <path>` writes fmt-json span/event
+  lines (FmtSpan NEW|CLOSE) via tracing-appender. Flags compose; stdout stays byte-identical in
+  EVERY mode (trace output rides stderr/file/collector only, D-013). `process` trace modes
+  COMPOSE the debug-capture layer with the trace layers: logging.rs gained
+  `debug_capture_layer()` (the DebugLayer + its historical target filter as a per-layer filter)
+  and `init_debug_logging` now routes through it — observationally identical when it is the
+  only layer. Filtering: `RUST_LOG` wins; default
+  `warn,delver=trace,delver_core=trace,delver_store=trace,delver_core::parse=info` — deps at
+  warn (sqlx slow-statement warnings still surface), and the per-operator content-stream
+  firehose is opt-in: the two hot `#[tracing::instrument]`s in parse.rs (`handle_operator`,
+  `finalize_text_run`) were demoted to `level = "trace"` (they defaulted to INFO and would have
+  emitted millions of spans per filing; `RUST_LOG=delver_core::parse=trace` re-enables). The
+  parse phases themselves are new info-level spans (`content_stream`/`figures`/
+  `embedded_files`/`scan_classify` + per-doc verdict event) emitted AFTER the rayon page-walk
+  joins, so span parentage never crosses worker threads.
+- **OTLP exporter is hand-rolled** (crates/delver/src/otel.rs): a ~150-line
+  tracing-subscriber Layer buffers finished spans (ids/parents/attrs/events from span
+  extensions) and one blocking POST flushes on TraceGuard drop — OTLP/HTTP JSON
+  (`resourceSpans/scopeSpans/spans`, hex ids, int64-as-string nanos, `service.name=delver` +
+  `delver.subcommand` resource attrs) to `$OTEL_EXPORTER_OTLP_ENDPOINT` (default
+  localhost:4318). Trace/span ids derive from the pinned uuid crate (16/8 bytes, nonzero);
+  one trace per CLI run rooted at the `cli.*` span; events attach to their current span
+  (orphans — e.g. inside rayon workers — export nowhere but still hit tree/json sinks);
+  defensive caps 100k spans / 4096 events-per-span. Rationale vs the
+  opentelemetry/tracing-opentelemetry family: the crate closure was not in Cargo.lock when the
+  slice started (index firewalled; the sanctioned proxy landed mid-slice) and a short-lived CLI
+  needs exactly "buffer, flush once" — fewer deps won even after the proxy made `cargo add`
+  possible. Every other layer also reuses locked deps: tracing-tree was already
+  workspace-pinned, the tracing-subscriber `fmt`/`json` feature deps were already lock edges,
+  ureq is delver-embed's pinned version. `--trace` PROBES the collector first (empty
+  resourceSpans POST) and falls back to the stderr tree with one warning when unreachable — the
+  flag never silently drops the trace. On success the flush prints
+  `trace: exported N spans … — http://localhost:16686/trace/<id>` on stderr.
+  `scripts/dev-otel.sh` bootstraps a local single-binary Jaeger v2 (GitHub release download +
+  sha256 verify into ~/.delver/bin, OTLP :4318, UI :16686, no Docker — org-gated).
+- **Verified**: both 10-K regression baselines byte-identical with 0-byte stderr (414 534 /
+  466 678) AND byte-identical again under `--trace-stderr`/`--trace`; `process` stdout
+  LOGGING-lines identical + JSON semantically identical (its metadata key order was already
+  nondeterministic per run pre-T1 — HashMap serialization; `query` canonicalizes through
+  serde_json::Value, which is why its bytes are stable). Tests
+  (crates/delver/tests/trace_cli.rs, D-009 gated): default stderr exactly 0 for
+  index/query/search; traced stdout byte-equality; span-name presence (pass1,
+  boundary_candidate, end_boundary, ingest, text_search, ...); `--trace-json` line shape;
+  OTLP end-to-end against an in-test loopback collector (probe + export bodies asserted:
+  service.name, root/parent edges, boundary_candidate events on start_boundary) — chosen after
+  the sandbox declined to execute a downloaded Jaeger binary (external-binary execution is the
+  owner's call; the script is committed for them to run); byte-exact baseline test self-skips
+  (with message) when the shared-DB documents or the HF tokenizer cache are absent. OTLP JSON
+  encoding unit-tested against the spec shape. Workspace suite: 276 passed / 0 failed /
+  1 ignored (pre-existing gated live test), `--offline`.
