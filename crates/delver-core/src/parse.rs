@@ -108,6 +108,9 @@ struct TextObjectState<'a> {
     _char_bbox: Option<Rect>,
     _char_tx: f32,
     _char_ty: f32,
+    /// Pen tracking for word-gap inference (D-029); `None` until the current
+    /// run has shown a glyph, reset at every run finalize.
+    pen: Option<PenState>,
 }
 
 impl<'a> Default for TextObjectState<'a> {
@@ -125,8 +128,107 @@ impl<'a> Default for TextObjectState<'a> {
             _char_bbox: None,
             _char_tx: 0.0,
             _char_ty: 0.0,
+            pen: None,
         }
     }
+}
+
+impl<'a> TextObjectState<'a> {
+    /// A text-positioning operator (Td/TD/T*/BT — absolute per the text line
+    /// matrix) ran since the last glyph: the next glyph's origin comes from
+    /// the text matrix instead of the pen's advance chain. Tm also
+    /// repositions, but it finalizes the run first, which resets the pen.
+    fn mark_pen_repositioned(&mut self) {
+        if let Some(pen) = &mut self.pen {
+            pen.repositioned = true;
+        }
+    }
+}
+
+// ─── Word-gap inference (slice TW0, D-029) ──────────────────────────────────
+//
+// TeX-family and print-driver PDFs encode inter-word spacing as glyph
+// positioning (TJ kern adjustments, Td pen moves, large Tc letterspacing)
+// rather than space glyphs, so plain buffer concatenation stores
+// "locationvector" and phrase search fails. While a run assembles, the true
+// pen is tracked in user space (pre-CTM, composing font size, Tz horizontal
+// scaling, Tc/Tw spacing, and the text matrix); when the gap between the
+// previous glyph's ink end and the next glyph's origin says "word break",
+// one ASCII space is pushed into the buffer, paired with a synthetic
+// zero-area space glyph so glyphs↔chars stay 1:1 (the D-018 cell-fragment
+// splitter's invariant) and no bbox ever changes. Gaps are measured along
+// the text direction, so an affine CTM scales gap and font size alike and
+// cancels out of the ratio.
+
+/// Minimum word-break gap, as a fraction of the effective font size (em).
+/// Calibration (EECS-2025-77, TeX): interword kerns are ≥ ~0.29 em nominal
+/// (justified shrink can reach ~0.22 em — an accepted miss), letterspacing /
+/// kern residuals ≤ ~0.11 em, TeX thin space ≈ 0.167 em, monospace interword
+/// ≈ 0.53 em. 0.25 em sits above every observed intra-word signal and below
+/// every observed interword gap; it also matches the common extractor
+/// heuristic (~a quarter em) for the same decision.
+const WORD_GAP_MIN_EM: f32 = 0.25;
+
+/// Maximum baseline drift (perpendicular to the text direction, in em) for
+/// two glyphs to count as the same line. Repositioning with more drift —
+/// line breaks, super/subscript moves — never gets an inferred space
+/// (conservative: kerning-style gaps are strictly horizontal).
+const WORD_GAP_MAX_DRIFT_EM: f32 = 0.12;
+
+/// Pen state after the previously shown glyph, in user space (pre-CTM).
+/// `expected` is where the next glyph's origin lands if the stream simply
+/// keeps showing text (full advance: width + Tc + Tw, ×Tz, through the text
+/// matrix; TJ numbers compose into it as they arrive). `ink_end` is the end
+/// of the glyph's own width only — spacing (Tc/Tw/kerns) counts as gap, so
+/// letterspaced word gaps and kern-encoded gaps measure identically.
+#[derive(Clone, Copy, Debug)]
+struct PenState {
+    expected: (f32, f32),
+    ink_end: (f32, f32),
+    /// Effective horizontal em at the previous glyph: font size × Tz scale ×
+    /// |text-matrix x column| (TeX PDFs set `Tf 1` and scale via Tm, so the
+    /// raw size alone is meaningless).
+    em: f32,
+    prev_char: char,
+    /// Whether the previous glyph's width came from real metrics (a miss is
+    /// treated as width 0 in the advance math).
+    prev_width_known: bool,
+    repositioned: bool,
+}
+
+/// Decide whether a single ASCII space belongs between the previous glyph
+/// and a glyph starting at `origin`. `col`/`col_norm` are the text matrix's
+/// x column and its length (the user-space image of text-space +x).
+fn infer_word_gap(
+    pen: &PenState,
+    origin: (f32, f32),
+    col: (f32, f32),
+    col_norm: f32,
+    ch: char,
+    buffer_empty: bool,
+) -> bool {
+    // Never at run start; never adjacent to real whitespace (a real space
+    // already separates the words, and a second one would perturb the
+    // cell-fragment ≥2-whitespace column signal, D-018).
+    if buffer_empty || ch.is_whitespace() || pen.prev_char.is_whitespace() {
+        return false;
+    }
+    if pen.em <= f32::EPSILON || col_norm <= f32::EPSILON {
+        return false;
+    }
+    // Reposition gaps compare a matrix-absolute origin against the pen's
+    // accumulated advances, so they are only as accurate as the glyph widths
+    // behind the pen; skip on a metrics miss. Kern-path gaps (Tc/TJ numbers)
+    // are width-exact — the shared width term cancels out of the difference.
+    if pen.repositioned && !pen.prev_width_known {
+        return false;
+    }
+    let ux = (col.0 / col_norm, col.1 / col_norm);
+    let dx = origin.0 - pen.ink_end.0;
+    let dy = origin.1 - pen.ink_end.1;
+    let along = dx * ux.0 + dy * ux.1;
+    let drift = (dy * ux.0 - dx * ux.1).abs();
+    drift <= WORD_GAP_MAX_DRIFT_EM * pen.em && along >= WORD_GAP_MIN_EM * pen.em
 }
 
 impl<'a> fmt::Debug for TextObjectState<'a> {
@@ -596,11 +698,8 @@ fn process_glyph(
                     f: ts.rise,
                 };
 
-                let mut advance = metrics
-                    .glyph_widths
-                    .get(&cid)
-                    .map(|w| (w / 1000.0) * ts.size)
-                    .unwrap_or(0.0);
+                let glyph_width = metrics.glyph_widths.get(&cid).copied();
+                let mut advance = glyph_width.map(|w| (w / 1000.0) * ts.size).unwrap_or(0.0);
 
                 if ch == ' ' {
                     advance += ts.word_space;
@@ -612,6 +711,57 @@ fn process_glyph(
                 let trm = multiply_matrices(&trm_temp, &ctm);
 
                 let char_bbox = glyph_bound(metrics, cid, &trm);
+
+                // ── Word-gap inference (D-029) ──────────────────────────
+                // This glyph's true user-space origin: the pen's advance
+                // chain while the stream only kerns (the text matrix is not
+                // advanced per glyph in this walk, so mid-string it is
+                // stale), or the text matrix right after a repositioning
+                // operator (Td/TD/T*/BT set it absolutely from the line
+                // matrix, which TJ numbers never pollute).
+                let col = (tos.text_matrix.a, tos.text_matrix.b);
+                let col_norm = (col.0 * col.0 + col.1 * col.1).sqrt();
+                let origin = match &tos.pen {
+                    Some(pen) if !pen.repositioned => pen.expected,
+                    _ => (tos.text_matrix.e, tos.text_matrix.f),
+                };
+                if let Some(pen) = &tos.pen {
+                    if infer_word_gap(pen, origin, col, col_norm, ch, tos.text_buffer.is_empty())
+                    {
+                        // One inserted space per gap, paired with a synthetic
+                        // zero-area glyph at the next glyph's corner: the
+                        // glyphs↔chars 1:1 invariant holds and neither the
+                        // run bbox union nor the cell-fragment geometry can
+                        // move (whitespace glyphs carry no fragment extent).
+                        tos.text_buffer.push(' ');
+                        tos.glyphs.push(PositionedGlyph {
+                            _cid: 32,
+                            _unicode: ' ',
+                            _text_matrix: tos.text_matrix,
+                            _device_matrix: trm,
+                            bbox: Rect {
+                                x0: char_bbox.x0,
+                                y0: char_bbox.y0,
+                                x1: char_bbox.x0,
+                                y1: char_bbox.y0,
+                            },
+                            _advance: 0.0,
+                        });
+                    }
+                }
+                // Advance the pen: full advance (width + Tc/Tw, ×Tz) for the
+                // expected origin, width only for the ink end, both mapped
+                // through the text matrix's linear part.
+                let adv_user = advance * ts.scale;
+                let ink_user = glyph_width.unwrap_or(0.0) / 1000.0 * ts.size * ts.scale;
+                tos.pen = Some(PenState {
+                    expected: (origin.0 + adv_user * col.0, origin.1 + adv_user * col.1),
+                    ink_end: (origin.0 + ink_user * col.0, origin.1 + ink_user * col.1),
+                    em: ts.size * ts.scale * col_norm,
+                    prev_char: ch,
+                    prev_width_known: glyph_width.is_some(),
+                    repositioned: false,
+                });
 
                 tos.glyphs.push(PositionedGlyph {
                     _cid: cid,
@@ -629,10 +779,12 @@ fn process_glyph(
         Object::Integer(i) => {
             let offset = -*i as f32 * (ts.size / 1000.0);
             tos.text_matrix.e += offset;
+            pen_apply_kern(tos, ts, offset);
         }
         Object::Real(f) => {
             let offset = -*f as f32 * (ts.size / 1000.0);
             tos.text_matrix.e += offset;
+            pen_apply_kern(tos, ts, offset);
         }
         Object::Array(arr) => {
             collect_text_glyphs(tos, ts, arr, ctm)?;
@@ -640,6 +792,24 @@ fn process_glyph(
         _ => {}
     }
     Ok(())
+}
+
+/// Compose a TJ numeric adjustment into the pen (D-029). `offset` is the
+/// text-space displacement the caller already applied to `text_matrix.e`
+/// (-n/1000 × size); the pen additionally honors Tz scaling and maps it
+/// through the text matrix's linear part, so kerns and repositioning share
+/// one position space. After a repositioning operator the next origin comes
+/// from the matrix itself (which this kern already adjusted), so the pen
+/// chain is left alone.
+fn pen_apply_kern(tos: &mut TextObjectState, ts: &TextState, offset: f32) {
+    let (a, b) = (tos.text_matrix.a, tos.text_matrix.b);
+    if let Some(pen) = &mut tos.pen {
+        if !pen.repositioned {
+            let dx = offset * ts.scale;
+            pen.expected.0 += dx * a;
+            pen.expected.1 += dx * b;
+        }
+    }
 }
 
 fn collect_text_glyphs(
@@ -664,6 +834,10 @@ fn finalize_text_run(
     page_number: u32,
     fragments: &mut Vec<CellFragment>,
 ) -> Option<TextElement> {
+    // A finalized run never continues: the next glyph starts a new element,
+    // so the word-gap pen must not chain across the boundary (D-029).
+    tos.pen = None;
+
     // If both glyphs and text buffer are empty, there's nothing to return
     if tos.glyphs.is_empty()
     // && tos.text_buffer.trim().is_empty()
@@ -1151,6 +1325,7 @@ fn handle_operator<'a>(
             debug!("Begin text object");
             text_object_state.text_matrix = IDENTITY_MATRIX;
             text_object_state.text_line_matrix = IDENTITY_MATRIX;
+            text_object_state.mark_pen_repositioned();
         }
         "ET" => {
             // Finalize the last text run within the text object
@@ -1270,6 +1445,7 @@ fn handle_operator<'a>(
                 text_object_state.text_line_matrix =
                     pre_translate(text_object_state.text_line_matrix, tx, ty);
                 text_object_state.text_matrix = text_object_state.text_line_matrix;
+                text_object_state.mark_pen_repositioned();
             }
         }
         "TD" => {
@@ -1281,6 +1457,7 @@ fn handle_operator<'a>(
                 text_object_state.text_line_matrix =
                     pre_translate(text_object_state.text_line_matrix, tx, ty);
                 text_object_state.text_matrix = text_object_state.text_line_matrix;
+                text_object_state.mark_pen_repositioned();
             }
         }
         "T*" => {
@@ -1289,6 +1466,7 @@ fn handle_operator<'a>(
             text_object_state.text_line_matrix =
                 pre_translate(text_object_state.text_line_matrix, tx, ty);
             text_object_state.text_matrix = text_object_state.text_line_matrix;
+            text_object_state.mark_pen_repositioned();
         }
         // Text Showing
         "Tj" | "TJ" | "'" | "\"" => {

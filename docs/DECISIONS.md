@@ -702,3 +702,61 @@ matrix, and three annotated real traces: docs/TRACING.md.
   (with message) when the shared-DB documents or the HF tokenizer cache are absent. OTLP JSON
   encoding unit-tested against the spec shape. Workspace suite: 276 passed / 0 failed /
   1 ignored (pre-existing gated live test), `--offline`.
+**D-028 · 2026-07-09 · NUL bytes sanitized at the store boundary (retroactive; commit 7656e49).**
+Postgres TEXT/jsonb reject 0x00 but real-world PDFs produce it (broken ToUnicode CMaps,
+damaged-xref recovery) — first wild hit: the Berkeley TWIX tech report EECS-2025-77, previously
+seen on the AAPL fixture. `delver-store` now routes every string it binds through `pg_text`
+(0x00 → U+FFFD) and every JSON tree through `pg_json` (values AND keys): element/cell/blob
+text, font names, element + document metadata, and uri at ingest. Sanitization lives at the
+store boundary only — parser output is untouched (core stays byte-faithful to the PDF), and the
+replacement is lossy only for a byte Postgres could not store regardless.
+
+**D-029 · 2026-07-09 · Word-gap inference in text-run assembly (slice TW0, fix/word-gaps).**
+User-visible bug found dogfooding EECS-2025-77: TeX-family and print-driver PDFs encode
+inter-word spacing as glyph positioning (TJ kern adjustments, Td pen moves, large-Tc
+letterspacing) instead of space glyphs, so run assembly stored "locationvector" /
+"4.1TWIXSystemArchitecture" and FTS phrase search failed (a joined word is one lexeme).
+`process_glyph` now tracks the true pen in user space (pre-CTM) beside the existing bbox math:
+per glyph it records `expected` (next contiguous origin: width + Tc/Tw, ×Tz, through the text
+matrix's linear part) and `ink_end` (width only); TJ numbers compose into `expected` as they
+arrive, and Td/TD/T*/BT mark the pen "repositioned" so the next origin is read from the text
+matrix instead (which the line matrix keeps clean — the walk's `.e +=` kern shortcut never
+touches it). One decision rule at every glyph: gap = (origin − ink_end) projected on the text
+direction; **insert one ASCII space when gap ≥ `WORD_GAP_MIN_EM` (0.25 em of the effective
+font size — size × Tz × |text-matrix x column|, so `Tf 1` + Tm-scaled TeX output measures
+correctly) and perpendicular drift ≤ `WORD_GAP_MAX_DRIFT_EM` (0.12 em)**.
+- **Threshold rationale** (constants in parse.rs): observed TeX interword kerns ≥ ~0.29 em
+  (justified shrink can reach ~0.22 em — accepted miss), kern/letterspacing residuals ≤
+  ~0.11 em, thin space ≈ 0.167 em, monospace interword ≈ 0.53 em; 0.25 sits in the gap.
+  Measuring `origin − ink_end` (not advance-end) is what makes letterspaced text work: with
+  `0.419 Tc` + compensating +418 kerns (the EECS pattern), net intra-word gap ≈ 0.001 em and
+  word gaps ≈ 0.418 em — positions compose, raw TJ numbers don't. Gaps and em are both
+  x-direction lengths, so any affine CTM cancels out of the ratio.
+- **Over-split guards**: never at run start; never adjacent to real whitespace (a second space
+  would perturb the D-018 ≥2-whitespace cell signal); never more than one space per gap;
+  kern-path gaps are width-exact (the shared width term cancels) while reposition-path gaps
+  are skipped when the previous glyph's width was a metrics miss; drift-exceeding repositions
+  (line breaks, super/subscripts) never insert — line-wrap joins are hyphenation-sensitive and
+  deliberately out of scope (known limit: the fixture's p1 title overlay keeps
+  "fromTemplatized" across a `Td` line break; p3–p6 renditions are fixed).
+- **Invariants**: each inserted space is paired with a synthetic zero-area space glyph at the
+  next glyph's corner, so glyphs↔chars stay 1:1 (the cell-fragment splitter's precondition)
+  and no element bbox, fragment bbox, or fragment x-jump can move. The splitter's device-space
+  x-jump logic (D-018) is deliberately NOT unified with this inference: it detects column
+  boundaries from ink jumps with absolute pt clamps, this composes user-space pen advances in
+  em units — they share the per-glyph stream, not the decision rule. Inserted spaces reach the
+  splitter as ordinary single interior spaces (never a column signal).
+- **Baselines unchanged**: 3M 10-K fresh parse is byte-identical before/after (466 678, text
+  dump of all 11 476 elements byte-equal, 125 tables / 11 615 cells identical) — it embeds
+  space glyphs and its per-glyph-Td residuals stay under threshold; both `query --doc`
+  regression outputs re-verified byte-identical (414 534 / 466 678, stderr 0), so the
+  constants stand. EECS-2025-77 evidence: 1 284 of 1 998 elements gain spaces (+8 526), zero
+  strip-space violations, 9 tables / 182 cells with identical signatures; "locationvector" 7→0,
+  "location vector" 0→7.
+- **Fixture policy**: ~/datasets/papers/EECS-2025-77.pdf (D-007 pattern, `DELVER_TESTDATA`
+  override, READ-ONLY, never committed — its copyright notice restricts redistribution);
+  crates/delver/tests/word_gaps.rs skips-if-absent, and the store-level FTS check (fresh
+  ingest into a unique scratch corpus; `search "location vector"` > 0 hits) is additionally
+  DB-gated. Seven synthetic content-stream tests cover: TJ-kern gap → one space, small ±kern →
+  none, Td same-line move → space, run start → no leading space, Tc+kern composition, newline
+  Td → none, real double-space untouched under wide Tw.
