@@ -123,7 +123,7 @@ Indexing the TWIX paper itself with delver surfaced two things:
   decades. Per-era inferred templates → aligned extraction (scanned era via
   the ai_parse_document outputs, which carry coordinates) attacks exactly the
   failure mode that capped every arm at 5–15% accuracy.
-- **The native-vs-aipd table head-to-head** gains a third contender:
+- **The native-vs-ai_parse_document table head-to-head** gains a third contender:
   TWIX-aligned extraction over the same 108 dual-parsed docs.
 - **The pitch**: "upload 50 invoices, delver infers the template, every
   future invoice extracts for free" — the exact enterprise story TWIX
