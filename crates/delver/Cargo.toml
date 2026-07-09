@@ -22,8 +22,17 @@ clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "valuable"] }
+# fmt+json power --trace-json; env-filter powers RUST_LOG-style filtering.
+# The feature deps (tracing-serde, serde, matchers, ...) were already edges
+# of the locked graph — no new crates (D-027).
+tracing-subscriber = { workspace = true, features = ["env-filter", "valuable", "fmt", "json"] }
 tracing-appender = { workspace = true }
+# Hierarchical stderr tree for --trace-stderr / the no-collector fallback
+# (workspace-pinned; delver-core already builds it).
+tracing-tree = { workspace = true }
+# Transport for the hand-rolled OTLP/HTTP JSON exporter (D-027); the same
+# pinned version delver-embed already uses.
+ureq = { version = "2.12.1", features = ["json"] }
 shellexpand = { workspace = true }
 pyo3 = { version = "0.25.1", features = ["extension-module"], optional = true }
 tokenizers = { version = "0.21.2", features = ["http"] }

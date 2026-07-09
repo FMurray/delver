@@ -1586,6 +1586,8 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "tracing-tree",
+ "ureq",
  "uuid",
 ]
 
@@ -1658,6 +1660,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.14",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -7670,6 +7673,8 @@ dependencies = [
  "nu-ansi-term 0.46.0",
  "once_cell",
  "regex",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",

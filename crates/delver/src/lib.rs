@@ -6,6 +6,9 @@
 //! JSON shapes (D-012). Keep both shells thin: routing/IO here, business
 //! logic in `delver-core` / `delver-store`.
 
+pub mod otel;
+pub mod trace;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -56,6 +59,12 @@ pub fn build_embedder(flag: Option<&str>) -> Result<Option<Arc<dyn Embedder>>> {
         Some(endpoint) => {
             let embedder = DatabricksEmbedder::new(&endpoint)
                 .with_context(|| format!("configuring embedding endpoint {endpoint:?}"))?;
+            // The endpoint NAME is template/CLI configuration; the bearer
+            // token stays in the environment and is never logged (D-027).
+            tracing::info!(
+                endpoint = %endpoint,
+                "embedder configured (Databricks serving endpoint; token from env, never logged)"
+            );
             Ok(Some(Arc::new(embedder) as Arc<dyn Embedder>))
         }
     }
@@ -401,6 +410,7 @@ pub fn run_template_on_corpus(
     let docs = store.documents_matching(corpus_id, filter.as_ref())?;
     let mut by_doc = serde_json::Map::new();
     for doc in docs {
+        let _span = tracing::info_span!("corpus_doc", doc = %doc).entered();
         let (outputs, diagnostics) =
             run_template_on_doc_with_diagnostics(store, doc, template_str, tokenizer, embedder.clone())
                 .with_context(|| format!("running template on document {doc}"))?;

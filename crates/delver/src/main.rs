@@ -11,12 +11,13 @@ use anyhow::Result;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
+use delver::trace::TraceArgs;
 use delver::{
     build_embedder, connect_store, infer_partitions_from_path, ingest_file, load_tokenizer,
     parse_key_value, print_match_warnings, run_template_on_corpus,
     run_template_on_doc_with_diagnostics, search_store, IngestEngine,
 };
-use delver_core::logging::{init_debug_logging, DebugDataStore};
+use delver_core::logging::DebugDataStore;
 use delver_core::process_pdf_with_diagnostics;
 use delver_store::DocumentId;
 use tokenizers::Tokenizer;
@@ -83,6 +84,9 @@ struct ProcessArgs {
     /// matches; falls back to $DELVER_EMBED_ENDPOINT
     #[clap(long)]
     embed_endpoint: Option<String>,
+
+    #[clap(flatten)]
+    trace: TraceArgs,
 }
 
 #[derive(Args, Debug)]
@@ -119,6 +123,9 @@ struct IndexArgs {
     /// Postgres URL (default: $DATABASE_URL, then the local dev database)
     #[clap(long)]
     db: Option<String>,
+
+    #[clap(flatten)]
+    trace: TraceArgs,
 }
 
 /// CLI surface of [`IngestEngine`] (kebab-case values).
@@ -181,6 +188,9 @@ struct QueryArgs {
     /// matches; falls back to $DELVER_EMBED_ENDPOINT
     #[clap(long)]
     embed_endpoint: Option<String>,
+
+    #[clap(flatten)]
+    trace: TraceArgs,
 }
 
 #[derive(Args, Debug)]
@@ -207,6 +217,9 @@ struct SearchArgs {
     /// Postgres URL (default: $DATABASE_URL, then the local dev database)
     #[clap(long)]
     db: Option<String>,
+
+    #[clap(flatten)]
+    trace: TraceArgs,
 }
 
 fn main() -> Result<()> {
@@ -232,8 +245,17 @@ fn run_process(args: ProcessArgs) -> Result<()> {
     // Initialize debug data store
     let debug_store = DebugDataStore::default();
 
-    // Initialize tracing with debug layer
-    let _guard = init_debug_logging(debug_store.clone());
+    // Tracing-off path is the historical init_debug_logging verbatim; trace
+    // flags COMPOSE the same debug-capture layer with the trace layers
+    // (D-017/D-027).
+    let _guard = delver::trace::init(&args.trace, "process", Some(debug_store.clone()))?;
+    let _root = tracing::info_span!(
+        "cli.process",
+        pdf = %args.pdf_path.display(),
+        template = %args.template.display(),
+        tokenizer_model = %args.tokenizer_model,
+    )
+    .entered();
 
     // Process PDF and launch viewer as before
     let pdf_bytes = fs::read(&args.pdf_path)?;
@@ -252,6 +274,18 @@ fn run_process(args: ProcessArgs) -> Result<()> {
 }
 
 fn run_index(args: IndexArgs) -> Result<()> {
+    let _guard = delver::trace::init(&args.trace, "index", None)?;
+    let _root = tracing::info_span!(
+        "cli.index",
+        pdf = %args.pdf_path.display(),
+        corpus = %args.corpus,
+        uri = args.uri.as_deref(),
+        parse_version = args.parse_version,
+        engine = ?args.engine,
+        partition_flags = ?args.partition,
+    )
+    .entered();
+
     let store = connect_store(args.db.as_deref())?;
     // Inferred path partitions first, explicit --partition flags after:
     // partitions_json keeps the last duplicate, so explicit wins (D-023).
@@ -273,6 +307,19 @@ fn run_index(args: IndexArgs) -> Result<()> {
 }
 
 fn run_query(args: QueryArgs) -> Result<()> {
+    let _guard = delver::trace::init(&args.trace, "query", None)?;
+    let _root = tracing::info_span!(
+        "cli.query",
+        template = %args.template.display(),
+        doc = args.doc.map(tracing::field::display),
+        pdf = args.pdf.as_ref().map(|p| tracing::field::display(p.display())),
+        corpus = args.corpus.as_deref(),
+        r#where = ?args.r#where,
+        tokenizer_model = %args.tokenizer_model,
+        embed_endpoint = args.embed_endpoint.as_deref(),
+    )
+    .entered();
+
     let template_str = fs::read_to_string(&args.template)?;
     let tokenizer = load_tokenizer(&args.tokenizer_model);
     let embedder = build_embedder(args.embed_endpoint.as_deref())?;
@@ -326,6 +373,17 @@ fn run_query(args: QueryArgs) -> Result<()> {
 }
 
 fn run_search(args: SearchArgs) -> Result<()> {
+    let _guard = delver::trace::init(&args.trace, "search", None)?;
+    let _root = tracing::info_span!(
+        "cli.search",
+        query = %args.query,
+        corpus = %args.corpus,
+        doc = args.doc.map(tracing::field::display),
+        r#where = ?args.r#where,
+        limit = args.limit,
+    )
+    .entered();
+
     let store = connect_store(args.db.as_deref())?;
     let partitions = args
         .r#where
